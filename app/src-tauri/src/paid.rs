@@ -716,8 +716,27 @@ pub async fn paid_bind_oauth_poll(
     }))
 }
 
+/// POST /v1/unbind —— 通知服务端把当前登录态作废（尽力而为：失败不报错，本地退出照常进行）。
+async fn unbind_remote(base: &str, token: &str) -> Result<()> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()?
+        .post(format!("{}/v1/unbind", base.trim_end_matches('/')))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn paid_unbind(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // 2026-10-15：退出登录改成**两端都退** —— 先在服务端把令牌作废（否则泄露的令牌能一直用到过期），
+    // 再清本地。网络失败不阻塞退出：用户点了「退出登录」就必须退得出去。
+    if let Ok((base, token)) = with_ctx(&state, |c| Ok((c.base.clone(), c.token().map(|t| t.to_string())))) {
+        if let Some(t) = token {
+            let _ = unbind_remote(&base, &t).await;
+        }
+    }
     with_ctx(&state, |c| {
         c.clear_session();
         Ok(())

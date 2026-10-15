@@ -52,4 +52,22 @@ tar -czf "$OUT" -C "$TMP" .
 # 4) 只留最近 KEEP 份
 ls -1t "$DEST"/wf-auth-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
 
+# 5) 证书到期体检（2026-10-15 加）：每天顺手看一眼，剩不到 21 天就在日志里喊、并落一份告警文件。
+#    为什么放在这：证书一过期，全 App 的 HTTPS 直接挂 —— 这件事必须有「每天有人看一眼」的兜底。
+#    注意：`certbot renew --dry-run` 走的是 staging 端点，这台机器到 staging 不稳，dry-run 失败
+#    **不代表**生产续期有问题；要验证真实续期路径就用上面告警里那条 certonly 命令。
+CERT="/etc/letsencrypt/live/api.hobjl-shop.top/fullchain.pem"
+if [ -f "$CERT" ]; then
+  END="$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | cut -d= -f2)"
+  if [ -n "$END" ]; then
+    LEFT=$(( ( $(date -d "$END" +%s) - $(date +%s) ) / 86400 ))
+    if [ "$LEFT" -lt 21 ]; then
+      echo "[backup] ⚠️ 证书只剩 ${LEFT} 天（${END}）—— 立刻跑：certbot certonly --cert-name api.hobjl-shop.top --nginx -d api.hobjl-shop.top --force-renewal && systemctl reload nginx" >&2
+      echo "$(date '+%F %T') 证书只剩 ${LEFT} 天（${END}）" >> "$DEST/CERT-EXPIRY-ALERT.txt"
+    else
+      echo "[backup] 证书还有 ${LEFT} 天（${END}）"
+    fi
+  fi
+fi
+
 echo "[backup] $(date '+%F %T') → $OUT（$(du -h "$OUT" | cut -f1)，共保留 $(ls -1 "$DEST"/wf-auth-*.tar.gz | wc -l) 份）"

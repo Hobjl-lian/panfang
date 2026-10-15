@@ -55,8 +55,37 @@ pub fn info(step: &str, code: &str, message: &str, device_model: Option<&str>) {
     report_kind("info", step, code, message, device_model)
 }
 
+/// 上报前把可能混进来的密钥长串洗掉（≥32 位连续 [A-Za-z0-9_-] → [已隐藏]）。
+/// 服务端入库前还会再洗一遍（那道对所有旧版本都生效）；这里先洗，是为了本地 logcat
+/// 与「反馈」页复制出来的文本里也不留令牌。2026-10-15 加。
+fn scrub_secretish(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            run.push(ch);
+            continue;
+        }
+        if run.len() >= 32 {
+            out.push_str("[已隐藏]");
+        } else {
+            out.push_str(&run);
+        }
+        run.clear();
+        out.push(ch);
+    }
+    if run.len() >= 32 {
+        out.push_str("[已隐藏]");
+    } else {
+        out.push_str(&run);
+    }
+    out
+}
+
 pub fn report_kind(kind: &str, step: &str, code: &str, message: &str, device_model: Option<&str>) {
     let ts = unix_now();
+    let scrubbed = scrub_secretish(message);
+    let message: &str = &scrubbed;
     // 1) console 永远有（logcat / app.log 是排障第一现场）
     log::warn!("[diag] {step} {code}: {message}");
     // 2) 内存里留一份（反馈页复制用；不落盘，重启即清空）

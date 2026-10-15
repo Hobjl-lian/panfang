@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::db::now;
-use crate::state::{client_ip, require_client, user_agent, ApiError, ApiResult, AppState};
+use crate::state::{bearer, client_ip, require_client, user_agent, ApiError, ApiResult, AppState};
 
 // ---------------------------------------------------------------- 兑换码（已下线）
 // 兑换码这条路已废弃：App 与管理页都不再用它。接口一并删除（曾经的 /v1/redeem 没有任何开关
@@ -1095,6 +1095,53 @@ fn clip(s: Option<&str>, max: usize) -> Option<String> {
     Some(t.chars().take(max).collect())
 }
 
+/// 上报文本里**可能是密钥**的高熵长串先洗掉：我们的令牌/密钥都是 base64url 或十六进制、
+/// 长度 ≥32 的连续串（43 位令牌、64 位 KEK/sha256）→ 一律替换成 [已隐藏]。
+/// 订单号是 27 位纯数字、设备指纹是 64 位十六进制（这个会被洗掉，可接受）。
+/// 2026-10-15 加：App 会把服务端返回的原始错误文本一起上报，万一哪条错误里带了令牌就落到库里了。
+fn push_run(out: &mut String, run: &mut String) {
+    if run.len() >= 32 {
+        out.push_str("[已隐藏]");
+    } else {
+        out.push_str(run);
+    }
+    run.clear();
+}
+
+fn scrub_secretish(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            run.push(ch);
+        } else {
+            push_run(&mut out, &mut run);
+            out.push(ch);
+        }
+    }
+    push_run(&mut out, &mut run);
+    out
+}
+
+/// POST /v1/unbind —— App「退出登录」时调用：把当前登录态在**服务端**立即作废。
+///
+/// 令牌是 bearer（默认 30 天），以前只在本地清掉 → 泄露的令牌能一直用到过期。
+/// 这里做成**幂等**：令牌无效/已过期也返回 ok（退出登录不该因为令牌过期而报错）。
+pub async fn unbind(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let Some(token) = bearer(&headers) else {
+        return Ok(Json(json!({ "ok": true, "revoked": 0 })));
+    };
+    let th = crate::crypto::token_hash(&token);
+    let n = {
+        let conn = state.conn();
+        conn.execute("DELETE FROM tokens WHERE token_hash = ?1", [&th])?
+    };
+    if n > 0 {
+        println!("[unbind] 客户端主动退出登录：已作废 1 个登录态");
+    }
+    Ok(Json(json!({ "ok": true, "revoked": n })))
+}
+
 /// POST /v1/events —— App 上报「哪一步失败了」。
 ///
 /// 为什么**不**强制登录：最早的一批失败（扫不到设备、蓝牙权限没给、绑定失败）都发生在拿到
@@ -1116,6 +1163,9 @@ pub async fn report_events(
             let Some(step) = clip(Some(e.step.as_str()), 40) else {
                 continue;
             };
+            // 上报文本先洗掉可能混进来的密钥长串（服务端这道对所有版本都生效）
+            let code = e.code.as_deref().map(scrub_secretish);
+            let msg = e.message.as_deref().map(scrub_secretish);
             let ok = conn
                 .execute(
                     "INSERT INTO client_events(ts, kind, step, code, message, device_model,
@@ -1125,8 +1175,8 @@ pub async fn report_events(
                         ts,
                         clip(e.kind.as_deref(), 16).unwrap_or_else(|| "fail".to_string()),
                         step,
-                        clip(e.code.as_deref(), 80),
-                        clip(e.message.as_deref(), 500),
+                        clip(code.as_deref(), 80),
+                        clip(msg.as_deref(), 500),
                         clip(e.device_model.as_deref(), 60),
                         clip(e.device_fp.as_deref(), 80),
                         clip(e.app_version.as_deref(), 20),
@@ -1142,4 +1192,27 @@ pub async fn report_events(
         }
     }
     Json(json!({ "ok": true, "stored": stored }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_masks_long_secretish_runs_only() {
+        // 43 位令牌（crypto::new_token 的形态）必须被洗掉
+        let tok = "SB2o_1ZhbiGnqaBpeTg2uxmhLHt-cwc2RNxVl1Q_lUU";
+        assert_eq!(
+            scrub_secretish(&format!("授权失败 token={tok} 请联系我们")),
+            "授权失败 token=[已隐藏] 请联系我们"
+        );
+        // 40 位 hex（≥32 → 应当被洗掉。这里刻意不用 64 位，免得公开仓库的密钥体检把测试夹具当真值）
+        assert!(scrub_secretish("k=5f3d1c9b0e6a48d7b2c5e9a10f4d8c3b7e6a1f0d").contains("[已隐藏]"));
+        // 订单号（27 位纯数字）与中文说明不能被动
+        assert_eq!(
+            scrub_secretish("订单 202610070148365297524823631 还没绑定账号"),
+            "订单 202610070148365297524823631 还没绑定账号"
+        );
+        assert_eq!(scrub_secretish("蓝牙未开启，请先打开蓝牙"), "蓝牙未开启，请先打开蓝牙");
+    }
 }

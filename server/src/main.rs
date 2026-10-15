@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/afdian/callback", get(api_client::afdian_oauth_callback))
         .route("/afdian/dev-authorize", get(api_client::afdian_dev_authorize))
         .route("/me", get(api_client::me))
+        .route("/unbind", post(api_client::unbind))
         .route("/activate", post(api_client::activate))
         .route("/manifest", get(api_client::manifest))
         .route("/download", post(api_client::download))
