@@ -4,15 +4,36 @@
 //! 本机跑通：`cargo run`（默认 127.0.0.1:8787，管理页 http://127.0.0.1:8787/）
 
 use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use wf_auth_server::{afdian, api_admin, api_client, crypto, db, state::AppState};
 use std::sync::{Arc, Mutex};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 const ADMIN_HTML: &str = include_str!("../static/admin.html");
 const PRIVACY_HTML: &str = include_str!("../static/privacy.html");
 const TERMS_HTML: &str = include_str!("../static/terms.html");
+
+/// 定期清理过期数据：未完成的绑定会话（成功的保留作审计留痕）与早已过期的登录态。
+/// 2026-10-15 加：此前这两张表只增不减，是「刷库」隐患（未登录接口也能建行）。
+fn cleanup_expired(state: &AppState) {
+    let now = db::now();
+    let conn = state.conn();
+    if let Ok(n) = conn.execute(
+        "DELETE FROM afdian_oauth WHERE status <> 'ok' AND expires_at < ?1",
+        [now - 86_400],
+    ) {
+        if n > 0 {
+            println!("[cleanup] 清掉 {n} 条过期绑定会话");
+        }
+    }
+    if let Ok(n) = conn.execute("DELETE FROM tokens WHERE expires_at < ?1", [now - 90 * 86_400]) {
+        if n > 0 {
+            println!("[cleanup] 清掉 {n} 条过期登录态");
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -164,22 +185,31 @@ async fn main() -> anyhow::Result<()> {
         .nest("/admin", admin_routes)
         // 一次请求可能带多个包（同一设备拆成两个独立表盘）→ 上限按「单包 64MB × 3」留余量
         .layer(DefaultBodyLimit::max(192 * 1024 * 1024))
+        // CORS：只允许**我们自己的**站点跨域（2026-10-15 从「任意来源」收紧）。
+        // 目前没有任何跨域调用方（管理页与 App 都是同源/原生请求），这里是给将来的网页端留的口子。
         .layer(
             CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
+                .allow_origin([
+                    HeaderValue::from_static("https://api.hobjl-shop.top"),
+                    HeaderValue::from_static("https://hobjl-shop.top"),
+                    HeaderValue::from_static("https://www.hobjl-shop.top"),
+                ])
+                .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                .allow_headers(tower_http::cors::Any),
         )
         .layer(axum::middleware::from_fn(log_requests))
         .with_state(state);
 
-    // 后台订单同步：配了爱发电令牌才跑，每 10 分钟一轮（幂等）
+    // 后台维护（每 10 分钟一轮）：
+    //   1) 清过期数据（未完成的绑定会话、早已过期的登录态）—— 以前从不清理，是「刷库」隐患；
+    //   2) 配了爱发电令牌就顺手做一轮订单对账（幂等）。
     {
         let st = bg_state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
             loop {
                 tick.tick().await;
+                cleanup_expired(&st);
                 let configured = std::env::var("WF_AFDIAN_TOKEN")
                     .map(|v| !v.trim().is_empty())
                     .unwrap_or(false);

@@ -240,7 +240,8 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const esc = s => String(s??'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// 转义 HTML 特殊字符；**单引号也转**——值有时被拼进单引号包裹的 onclick 里（2026-10-15 补）
+const esc = s => String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const token = () => localStorage.getItem('wf_admin_token') || '';
 let STATE = { products: [], groups: [] };
 let LAST_UPLOAD = '';

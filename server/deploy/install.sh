@@ -68,6 +68,16 @@ else
 fi
 
 # 5) systemd
+# 5.4) 专用运行用户（2026-10-15 起：服务不再以 root 跑；数据目录 750 / 文件 640）
+if ! id -u wf >/dev/null 2>&1; then
+  echo "==> 创建专用运行用户 wf（系统用户、不可登录）"
+  useradd --system --no-create-home --shell /usr/sbin/nologin wf
+fi
+chown -R wf:wf "$DATA_DIR"
+find "$DATA_DIR" -type d -exec chmod 750 {} \;
+find "$DATA_DIR" -type f -exec chmod 640 {} \;
+echo "==> 数据目录属主：$(stat -c '%U:%G %a' "$DATA_DIR")"
+
 install -m 0644 "$SRC_DIR/deploy/wf-auth.service" /etc/systemd/system/wf-auth.service
 systemctl daemon-reload
 systemctl enable wf-auth

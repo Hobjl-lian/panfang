@@ -12,7 +12,17 @@ RestartSec=3
 # 只监听本机，由 Nginx 反代并做 TLS
 Environment=WF_BIND=127.0.0.1:8787
 WorkingDirectory=/var/lib/wf-auth
-User=root
+# 2026-10-15 起改用专用系统用户（此前是 root）：数据目录 750、文件 640，
+# 同机其他进程读不到订单库与密文；env 文件由 systemd（root）读取后注入，服务本身不碰它。
+User=wf
+Group=wf
+# 新建文件默认 640（不给 group/other 读）
+UMask=0027
+# 再上一层保险：禁止提权与写系统目录
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
 LimitNOFILE=65536
 
 [Install]
