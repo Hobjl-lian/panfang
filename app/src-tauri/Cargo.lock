@@ -6557,7 +6557,7 @@ dependencies = [
 
 [[package]]
 name = "wf_installer"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "account",
  "aes-gcm",
