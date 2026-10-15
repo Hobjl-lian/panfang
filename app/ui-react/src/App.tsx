@@ -4622,7 +4622,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.19"} · 开源许可与开发者
+                              盘坊 v{appVersion ?? "0.3.20"} · 开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -4650,7 +4650,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 · 版本 {appVersion ?? "0.3.19"}
+                      盘坊 · 版本 {appVersion ?? "0.3.20"}
                     </p>
                   </div>
                 </div>
@@ -5987,7 +5987,7 @@ export default function App() {
                     盘坊
                   </h2>
                   <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.19"}
+                    v{appVersion ?? "0.3.20"}
                   </span>
                 </div>
 
@@ -6031,7 +6031,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.19"}`}
+                            : `当前版本 v${appVersion ?? "0.3.20"}`}
                         </p>
                       </div>
                     </div>
