@@ -1,0 +1,60 @@
+[package]
+name = "wf_installer"
+version = "0.3.17"
+description = "小米 Vela 设备表盘安装工具（个人/私域使用）"
+edition = "2024"
+default-run = "wf_installer"
+
+[lib]
+name = "wf_installer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tauri = { version = "2.11.3", features = ["rustls-tls"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+reqwest = { version = "0.12.22", features = ["json", "rustls-tls", "cookies"], default-features = false }
+reqwest_cookie_store = "0.8.0"
+url = "2.5.8"
+base64 = "0.22.1"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+md-5 = "0.10.6"
+rc4 = "0.1.0"
+cipher = "0.4"
+rand = "0.8.5"
+aes-gcm = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+hex = "0.4"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+
+corelib = { path = "../../repos/AstroBox-NG/src-tauri/modules/core", default-features = false }
+pb = { path = "../../repos/AstroBox-NG/src-tauri/modules/pb" }
+account = { path = "../../repos/AstroBox-NG/src-tauri/modules/account" }
+bluetooth = { path = "../../repos/AstroBox-NG/src-tauri/modules/bluetooth" }
+inappbrowser = { path = "../../repos/AstroBox-NG/src-tauri/plugins/inappbrowser" }
+# App 自更新用：检查未知来源授权 + 调系统安装器（我们自己的插件，源码在本仓 plugins/apkinstaller）
+apkinstaller = { path = "plugins/apkinstaller" }
+# 连接保活：前台服务钉住进程（防后台冻结）+ 常驻静默通知（源码在本仓 plugins/connkeep）
+connkeep = { path = "plugins/connkeep" }
+# 直接依赖，确保 tauri CLI 的安卓插件扫描能发现它（它是 bluetooth 的二级依赖）
+btclassic-spp = { path = "../../repos/AstroBox-NG/src-tauri/plugins/btclassic-spp" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+
+[profile.release]
+strip = true
+lto = false

@@ -1,0 +1,1145 @@
+//! 客户端接口（契约 §1）。App 用：绑定 / 我的授权 / 换设备 / 版本清单 / 下载。
+
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use rusqlite::{params, OptionalExtension};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::db::now;
+use crate::state::{client_ip, require_client, user_agent, ApiError, ApiResult, AppState};
+
+// ---------------------------------------------------------------- 兑换码（已下线）
+// 兑换码这条路已废弃：App 与管理页都不再用它。接口一并删除（曾经的 /v1/redeem 没有任何开关
+// 保护，留着就是白拿资源的口子）。数据库里的 codes 表保留（不做破坏性迁移），但不再读写。
+
+fn display_of(mi_uid: &str) -> String {
+    // 只回显后 4 位，避免完整账号出现在日志/响应里
+    let s: String = mi_uid.chars().rev().take(4).collect();
+    s.chars().rev().collect()
+}
+
+/// 有效授权状态：`subjects.all_access=1` 的主体对**任何**产品都视作 `active`
+/// （永久全资源，含以后新增的产品，不用逐个 grant）；否则读 licenses 表的逐产品授权。
+/// 返回 `None` = 从未授权过。调用方据此区分「没有授权」与「授权被回收」。
+fn subject_all_access(conn: &rusqlite::Connection, subject_id: &str) -> ApiResult<bool> {
+    let v: i64 = conn
+        .query_row(
+            "SELECT COALESCE(all_access,0) FROM subjects WHERE id=?1",
+            [subject_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(v == 1)
+}
+
+fn license_status(
+    conn: &rusqlite::Connection,
+    subject_id: &str,
+    product_id: &str,
+) -> ApiResult<Option<String>> {
+    if subject_all_access(conn, subject_id)? {
+        return Ok(Some("active".to_string()));
+    }
+    Ok(conn
+        .query_row(
+            "SELECT status FROM licenses WHERE subject_id=?1 AND product_id=?2",
+            params![subject_id, product_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// 该 subject 名下所有「有效授权」的产品 + 变体 + 最新版本。
+fn subject_products(state: &AppState, subject_id: &str) -> ApiResult<Vec<Value>> {
+    let conn = state.conn();
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.name, p.cover_url,
+                (SELECT COUNT(*) FROM activations a
+                  WHERE a.subject_id=?1 AND a.product_id=p.id AND a.status='active')
+         FROM products p
+         WHERE p.status='on'
+           AND (EXISTS(SELECT 1 FROM subjects s WHERE s.id=?1 AND s.all_access=1)
+                OR EXISTS(SELECT 1 FROM licenses l
+                          WHERE l.subject_id=?1 AND l.product_id=p.id AND l.status='active'))",
+    )?;
+    let products: Vec<(String, String, Option<String>, i64)> = stmt
+        .query_map([subject_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut out = Vec::new();
+    for (pid, name, cover, used) in products {
+        // 只返回「已有包体」的设备行（App 列表里点进去必须能装）
+        let rows: Vec<(String, String, String, Option<i64>, Option<i64>, Option<String>)> = {
+            let mut vstmt = conn.prepare(
+                "SELECT v.id, v.name, v.device_models, v.screen_w, v.screen_h,
+                        (SELECT version FROM versions x WHERE x.variant_id=v.id AND x.is_latest=1 LIMIT 1)
+                 FROM variants v WHERE v.product_id=?1
+                   AND EXISTS (SELECT 1 FROM versions x JOIN files f ON f.version_id=x.id WHERE x.variant_id=v.id)
+                 ORDER BY v.created_at",
+            )?;
+            let it = vstmt.query_map([&pid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+            it.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut variants: Vec<Value> = Vec::new();
+        for (vid, vname, models, sw, sh, latest_ver) in rows {
+            // 最新版本的**内容指纹**：按文件顺序（sort_order, id）把各包 sha256_plain 连起来再 sha256。
+            // App 用它判「可更新」——版本号是人工填的字符串，管理页「强制替换」可以在不改版本号的情况下换内容。
+            let shas: Vec<String> = {
+                let mut sstmt = conn.prepare(
+                    "SELECT f.sha256_plain FROM files f JOIN versions x ON f.version_id=x.id
+                      WHERE x.variant_id=?1 AND x.is_latest=1 ORDER BY f.sort_order, f.id",
+                )?;
+                let it = sstmt.query_map([&vid], |r| r.get::<_, String>(0))?;
+                it.filter_map(|r| r.ok()).collect()
+            };
+            let latest_sha = if shas.is_empty() {
+                Value::Null
+            } else {
+                json!(crate::crypto::sha256_hex(shas.join("|").as_bytes()))
+            };
+            variants.push(json!({
+                "variant_id": vid,
+                "name": vname,
+                "device_models": serde_json::from_str::<Value>(&models).unwrap_or(json!([])),
+                "screen": [sw, sh],
+                "latest_version": latest_ver,
+                "latest_sha": latest_sha,
+            }));
+        }
+        out.push(json!({
+            "product_id": pid,
+            "name": name,
+            "cover_url": cover,
+            "variants": variants,
+            "activations_used": used,
+            "activation_limit": state.device_limit,
+        }));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- 绑定（爱发电 / 开发模式）
+
+/// GET /v1/bind/mode —— App 决定绑定页怎么显示：oauth（已配置爱发电）/ dev（联调用）/ none
+pub async fn bind_mode() -> ApiResult<Json<Value>> {
+    let oauth = crate::afdian::oauth_cfg().is_some();
+    // 走统一的到期判断（只设 WF_DEV_BIND=1 没有到期时间＝关闭），否则这里会绕过 fail-closed
+    let dev = crate::afdian::dev_mode();
+    let mode = if oauth { "oauth" } else if dev { "dev" } else { "none" };
+    Ok(Json(json!({ "mode": mode, "shop_url": std::env::var("WF_SHOP_URL").ok() })))
+}
+
+/// 找（或建）某个小米账号的授权主体
+fn subject_ensure(conn: &rusqlite::Connection, mi_uid: &str) -> ApiResult<String> {
+    match conn
+        .query_row("SELECT id FROM subjects WHERE mi_user_id = ?1", [mi_uid], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?
+    {
+        Some(id) => Ok(id),
+        None => {
+            let id = crate::db::new_id("s_");
+            conn.execute(
+                "INSERT INTO subjects(id, mi_user_id, created_at) VALUES(?1, ?2, ?3)",
+                params![id, mi_uid, now()],
+            )?;
+            Ok(id)
+        }
+    }
+}
+
+/// 「永久全资源」主体的登录态有效期：10 年（实际等同长期有效）。
+///
+/// 为什么要区别对待：普通买家走爱发电 OAuth 换登录态（30 天后可重绑，clientID 就绪后自助）。
+/// 而开发者本人是 all_access，本来就不依赖爱发电；若也用 30 天 TTL，token 一过期 App 就
+/// 卡在绑定页进不去「我的表盘」。注意 token 泄露＝该账号被冒用，但该账号本来就全资源，
+/// 风险面不比「联调开关大开」更大。
+const OWNER_TOKEN_TTL: i64 = 10 * 365 * 24 * 3600;
+
+/// 给某个主体签发登录态（App 侧用它调 /v1/me、/v1/manifest、/v1/download）
+fn issue_token(state: &AppState, conn: &rusqlite::Connection, subject_id: &str) -> ApiResult<(String, i64)> {
+    let token = crate::crypto::new_token();
+    let ttl = if subject_all_access(conn, subject_id)? {
+        OWNER_TOKEN_TTL
+    } else {
+        state.token_ttl
+    };
+    let expires_at = now() + ttl;
+    conn.execute(
+        "INSERT INTO tokens(token_hash, subject_id, expires_at, created_at) VALUES(?1, ?2, ?3, ?4)",
+        params![crate::crypto::token_hash(&token), subject_id, expires_at, now()],
+    )?;
+    Ok((token, expires_at))
+}
+
+// ---------------------------------------------------------------- 爱发电 OAuth 关联授权
+
+#[derive(Deserialize)]
+pub struct OauthStart {
+    pub mi_user_id: String,
+    pub device_fp: Option<String>,
+    pub device_pubkey: Option<String>,
+    pub device_name: Option<String>,
+}
+
+/// POST /v1/afdian/oauth/start —— App 发起绑定：登记一次会话，返回让用户去授权的地址。
+/// 用户授权后爱发电把浏览器带回 `/v1/afdian/callback`，App 用 `state` 轮询 `/v1/afdian/oauth/poll` 取结果。
+pub async fn afdian_oauth_start(
+    State(state): State<AppState>,
+    Json(body): Json<OauthStart>,
+) -> ApiResult<Json<Value>> {
+    let Some(cfg) = crate::afdian::oauth_cfg() else {
+        return Err(ApiError::not_found("绑定功能暂不可用"));
+    };
+    let mi_uid = body.mi_user_id.trim().to_string();
+    if mi_uid.is_empty() {
+        return Err(ApiError::bad_request("请先用小米账号登录"));
+    }
+    if let Some(pk) = body.device_pubkey.as_deref().filter(|s| !s.is_empty()) {
+        let raw = crate::crypto::b64d(pk).map_err(|_| ApiError::bad_request("device_pubkey 不是合法 base64"))?;
+        if raw.len() != 32 {
+            return Err(ApiError::bad_request("device_pubkey 必须是 32 字节"));
+        }
+    }
+    let st = crate::crypto::new_token();
+    let expires_at = now() + crate::afdian::OAUTH_TTL;
+    {
+        let conn = state.conn();
+        let subject_id = subject_ensure(&conn, &mi_uid)?;
+        conn.execute(
+            "INSERT INTO afdian_oauth(state, subject_id, mi_user_id, device_fp, device_pubkey, device_name,
+                                      status, expires_at, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+            params![
+                st,
+                subject_id,
+                mi_uid,
+                body.device_fp.unwrap_or_default(),
+                body.device_pubkey.unwrap_or_default(),
+                body.device_name.unwrap_or_default(),
+                expires_at,
+                now()
+            ],
+        )?;
+    }
+    Ok(Json(json!({
+        "state": st,
+        "url": crate::afdian::authorize_url(&cfg, &st),
+        "expires_at": expires_at,
+    })))
+}
+
+/// GET /v1/afdian/dev-authorize —— **仅联调**（WF_DEV_BIND=1）：模拟爱发电的授权页。
+/// 真的授权页在爱发电域名下、要等审批；这一页让「打开授权页 → 回调 → App 轮询」整条链路现在就能点着测。
+pub async fn afdian_dev_authorize(Query(q): Query<OauthPoll>) -> Response {
+    if !crate::afdian::dev_mode() {
+        return (StatusCode::NOT_FOUND, "该接口未启用").into_response();
+    }
+    let state = q.state;
+    let tpl = r##"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>模拟爱发电授权</title></head>
+<body style="margin:0;font-family:-apple-system,'PingFang SC',sans-serif;background:#F5F6F9;
+display:flex;align-items:center;justify-content:center;min-height:100vh">
+<form method="get" action="/v1/afdian/callback" style="background:#fff;border-radius:24px;padding:32px 26px;
+max-width:340px;width:100%;box-shadow:0 1px 3px rgba(0,0,0,.04)">
+  <h1 style="font-size:20px;margin:0 0 6px;color:#000">模拟爱发电授权</h1>
+  <p style="font-size:13px;color:rgba(0,0,0,.45);margin:0 0 18px;line-height:1.6">
+    联调专用页（不是爱发电官方页）。随便填一个「爱发电用户 ID」，点下面按钮就当作你已授权。</p>
+  <input name="uid" value="devtest" style="width:100%;box-sizing:border-box;height:44px;border-radius:14px;
+    border:1px solid rgba(0,0,0,.1);padding:0 14px;font-size:15px"/>
+  <input type="hidden" name="state" value="%STATE%"/>
+  <input type="hidden" name="code" id="code" value=""/>
+  <button type="submit" style="margin-top:16px;width:100%;height:48px;border:0;border-radius:999px;
+    background:#4361EE;color:#fff;font-size:16px;font-weight:700" onclick="
+      document.getElementById('code').value='dev:'+document.querySelector('[name=uid]').value">授权并返回 App</button>
+</form>
+<script>
+  // 提交前把 uid 拼成 code=dev:<uid>（服务端联调模式下认这个前缀）
+  document.querySelector('form').addEventListener('submit', function(){
+    document.getElementById('code').value='dev:'+document.querySelector('[name=uid]').value;
+  });
+</script>
+</body></html>"##;
+    axum::response::Html(tpl.replace("%STATE%", &state)).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct OauthCb {
+    pub code: Option<String>,
+    pub state: Option<String>,
+}
+
+/// GET /v1/afdian/callback —— 用户在浏览器里授权完，爱发电跳到这里。
+/// 拿 code 换身份 → 建立绑定 → 把这个买家的历史订单一次性补上 → 给 App 备好登录态。
+pub async fn afdian_oauth_callback(
+    State(state): State<AppState>,
+    Query(q): Query<OauthCb>,
+) -> ApiResult<Response> {
+    let page = |title: &str, body: &str| {
+        axum::response::Html(format!(
+            r##"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title></head>
+<body style="margin:0;font-family:-apple-system,'PingFang SC',sans-serif;background:#F5F6F9;
+display:flex;align-items:center;justify-content:center;min-height:100vh">
+<div style="background:#fff;border-radius:24px;padding:36px 28px;max-width:340px;text-align:center;
+box-shadow:0 1px 3px rgba(0,0,0,.04)">
+<div style="width:56px;height:56px;border-radius:16px;background:#4361EE;margin:0 auto 20px;
+display:flex;align-items:center;justify-content:center">
+<svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="#fff" stroke-width="2"
+stroke-linecap="round" stroke-linejoin="round"><path d="M12 20s-7-4.35-7-9a4 4 0 0 1 7-2.65A4 4 0 0 1 19 11c0 4.65-7 9-7 9z"/></svg>
+</div>
+<h1 style="font-size:20px;margin:0 0 8px;color:#000">{title}</h1>
+<p style="font-size:14px;line-height:1.6;color:rgba(0,0,0,.45);margin:0">{body}</p>
+</div></body></html>"##
+        ))
+    };
+    let Some(st) = q.state.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(page("授权没走完", "请回到盘坊 App 重新点一次「用爱发电账号登录」。").into_response());
+    };
+    let Some(code) = q.code.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(page("授权没走完", "请回到盘坊 App 重新点一次「用爱发电账号登录」。").into_response());
+    };
+
+    // 1) 校验会话（读操作单独一段，别持锁去调会抢锁的辅助函数）
+    let row: Option<(String, String, i64, String)> = {
+        let conn = state.conn();
+        conn.query_row(
+            "SELECT subject_id, mi_user_id, expires_at, status FROM afdian_oauth WHERE state = ?1",
+            [st],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(ApiError::from)?
+    };
+    let Some((subject_id, mi_uid, expires_at, status)) = row else {
+        return Ok(page("授权链接已失效", "请回到盘坊 App 重新点一次「用爱发电账号登录」。").into_response());
+    };
+    if status != "pending" {
+        return Ok(page("已授权过了", "可以直接回到盘坊 App；没反应就重新发起一次绑定。").into_response());
+    }
+    if now() > expires_at {
+        mark_oauth_error(&state, st, "授权超时，请回到 App 重新发起");
+        return Ok(page("授权超时", "请回到盘坊 App 重新点一次「用爱发电账号登录」。").into_response());
+    }
+
+    // 2) code → 爱发电 user_id（联调模式支持 code=dev:<uid> 直接模拟）
+    let afdian_uid = match crate::afdian::dev_code_uid(code) {
+        Some(uid) => uid,
+        None => {
+            let Some(cfg) = crate::afdian::oauth_cfg() else {
+                return Ok(page("绑定功能暂不可用", "请稍后再试。").into_response());
+            };
+            match crate::afdian::exchange_code(&cfg, code).await {
+                Ok(uid) => uid,
+                Err(e) => {
+                    eprintln!("[afdian] OAuth 换身份失败：{e:?}");
+                    mark_oauth_error(&state, st, &format!("{e}"));
+                    return Ok(page("授权没成功", "请回到盘坊 App 重试；一直在失败就联系我们。").into_response());
+                }
+            }
+        }
+    };
+
+    // 3) 绑定 + 补发历史订单（各自内部抢锁，调用时上面不能持有 guard）
+    let bound_subject = match crate::afdian::bind_afdian(&state, &afdian_uid, &mi_uid) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("[afdian] 建绑定失败：{e:?}");
+            mark_oauth_error(&state, st, "绑定失败，请回到 App 重试");
+            return Ok(page("授权没成功", "请回到盘坊 App 重试；一直在失败就联系我们。").into_response());
+        }
+    };
+    let resent = crate::afdian::sync_after_bind(&state, &afdian_uid).unwrap_or(0);
+    println!(
+        "[afdian] OAuth 绑定成功：爱发电 {} ↔ 小米账号 {}（补发 {resent} 笔订单）",
+        afdian_uid, mi_uid
+    );
+
+    // 4) 备好登录态给 App 取走
+    let minted = {
+        let conn = state.conn();
+        let t = issue_token(&state, &conn, &bound_subject).ok();
+        if t.is_none() {
+            return Ok(page("授权没成功", "请回到盘坊 App 重试；一直在失败就联系我们。").into_response());
+        }
+        t.unwrap()
+    };
+    {
+        let conn = state.conn();
+        let _ = conn.execute(
+            "UPDATE afdian_oauth SET status='ok', afdian_user_id=?2, license_token=?3, done_at=?4 WHERE state=?1",
+            params![st, afdian_uid, minted.0, now()],
+        );
+        // subject_id 只是防止并发换绑时错位的兜底，这里再确认一次它没变
+        let _ = bound_subject;
+    }
+    Ok(page("授权成功", "回到盘坊 App，你的已购表盘会自动同步过来。").into_response())
+}
+
+fn mark_oauth_error(state: &AppState, st: &str, msg: &str) {
+    let conn = state.conn();
+    let _ = conn.execute(
+        "UPDATE afdian_oauth SET status='error', message=?2, done_at=?3 WHERE state=?1",
+        params![st, msg, now()],
+    );
+}
+
+#[derive(Deserialize)]
+pub struct OauthPoll {
+    pub state: String,
+}
+
+/// GET /v1/afdian/oauth/poll?state=… —— App 轮询：pending / ok（带登录态）/ error
+pub async fn afdian_oauth_poll(
+    State(state): State<AppState>,
+    Query(q): Query<OauthPoll>,
+) -> ApiResult<Json<Value>> {
+    let row: Option<(String, Option<String>, Option<String>, i64, String)> = {
+        let conn = state.conn();
+        conn.query_row(
+            "SELECT status, afdian_user_id, license_token, expires_at, mi_user_id
+             FROM afdian_oauth WHERE state = ?1",
+            [&q.state],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?
+    };
+    let Some((status, afdian_uid, token, expires_at, mi_uid)) = row else {
+        return Err(ApiError::not_found("这次绑定已失效，请重新发起"));
+    };
+    if status == "pending" && now() > expires_at {
+        mark_oauth_error(&state, &q.state, "授权超时，请回到 App 重新发起");
+        return Err(ApiError::bad_request("授权超时，请重新发起"));
+    }
+    match status.as_str() {
+        "ok" => {
+            let uid = afdian_uid.unwrap_or_default();
+            Ok(Json(json!({
+                "status": "ok",
+                "bound": true,
+                "afdian_user_id": uid,
+                "display": display_of(&uid),
+                "mi_user_id": mi_uid,
+                "license_token": token.unwrap_or_default(),
+                "expires_at": expires_at,
+            })))
+        }
+        "error" => Ok(Json(json!({
+            "status": "error",
+            "message": "授权没成功，请重试",
+        }))),
+        _ => Ok(Json(json!({ "status": "pending" }))),
+    }
+}
+
+/// POST /v1/bind/dev —— **仅供联调**：不做爱发电校验，直接给这个小米账号签发登录态。
+/// 仅在服务端设置 `WF_DEV_BIND=1` 时可用；上线前必须关闭。
+pub async fn bind_dev(
+    State(state): State<AppState>,
+    Json(body): Json<DevBind>,
+) -> ApiResult<Json<Value>> {
+    if !crate::afdian::dev_mode() {
+        return Err(ApiError::not_found("该接口未启用"));
+    }
+    let mi_uid = body.mi_user_id.trim().to_string();
+    if mi_uid.is_empty() {
+        return Err(ApiError::bad_request("缺少 mi_user_id"));
+    }
+    if let Some(pk) = body.device_pubkey.as_deref().filter(|s| !s.is_empty()) {
+        let raw = crate::crypto::b64d(pk).map_err(|_| ApiError::bad_request("device_pubkey 不是合法 base64"))?;
+        if raw.len() != 32 {
+            return Err(ApiError::bad_request("device_pubkey 必须是 32 字节"));
+        }
+    }
+    let conn = state.conn();
+    let subject_id = subject_ensure(&conn, &mi_uid)?;
+    // 联调模式：顺手把「所有资源」都开通给这个账号（方便端到端试装；上线前关掉 WF_DEV_BIND 即失效）
+    let granted: i64 = conn.execute(
+        "INSERT INTO licenses(subject_id, product_id, source, status, created_at)
+         SELECT ?1, id, 'dev', 'active', ?2 FROM products WHERE status = 'on'
+         ON CONFLICT(subject_id, product_id) DO NOTHING",
+        params![subject_id, now()],
+    )? as i64;
+    if granted > 0 {
+        println!("[wf-auth] 联调绑定：给 {mi_uid} 开通了 {granted} 个资源");
+    }
+
+    let (token, expires_at) = issue_token(&state, &conn, &subject_id)?;
+    drop(conn);
+    let products = subject_products(&state, &subject_id)?;
+    Ok(Json(json!({
+        "license_token": token,
+        "expires_at": expires_at,
+        "subject": { "mi_user_id": mi_uid, "display": display_of(&mi_uid) },
+        "products": products,
+        "dev": true,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct DevBind {
+    pub mi_user_id: String,
+    pub device_fp: Option<String>,
+    pub device_pubkey: Option<String>,
+    pub device_name: Option<String>,
+}
+
+// ---------------------------------------------------------------- 我的授权 / 换设备
+
+pub async fn me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let auth = require_client(&state, &headers)?;
+    let products = subject_products(&state, &auth.subject_id)?;
+    let mi_uid: String = {
+        let conn = state.conn();
+        conn.query_row("SELECT mi_user_id FROM subjects WHERE id=?1", [&auth.subject_id], |r| {
+            r.get(0)
+        })
+        .unwrap_or_default()
+    };
+    let activations: Vec<Value> = {
+        let conn = state.conn();
+        let mut stmt = conn.prepare(
+            "SELECT product_id, device_fp, device_name, status, created_at, last_seen_at
+             FROM activations WHERE subject_id=?1 ORDER BY id DESC",
+        )?;
+        let v: Vec<Value> = stmt
+            .query_map([&auth.subject_id], |r| {
+                Ok(json!({
+                    "product_id": r.get::<_, String>(0)?,
+                    "device_fp": r.get::<_, String>(1)?,
+                    "device_name": r.get::<_, Option<String>>(2)?,
+                    "status": r.get::<_, String>(3)?,
+                    "activated_at": r.get::<_, i64>(4)?,
+                    "last_seen_at": r.get::<_, Option<i64>>(5)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    };
+    Ok(Json(json!({
+        "subject": { "mi_user_id": mi_uid, "display": display_of(&mi_uid) },
+        "products": products,
+        "activations": activations,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct Activate {
+    pub product_id: String,
+    pub device_fp: String,
+    pub device_pubkey: String,
+    pub device_name: Option<String>,
+}
+
+pub async fn activate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Activate>,
+) -> ApiResult<Json<Value>> {
+    let auth = require_client(&state, &headers)?;
+    let raw = crate::crypto::b64d(&body.device_pubkey)
+        .map_err(|_| ApiError::bad_request("device_pubkey 不是合法 base64"))?;
+    if raw.len() != 32 {
+        return Err(ApiError::bad_request("device_pubkey 必须是 32 字节"));
+    }
+    let conn = state.conn();
+    let lic = license_status(&conn, &auth.subject_id, &body.product_id)?;
+    match lic.as_deref() {
+        None => return Err(ApiError::forbidden("license_revoked", "没有该产品的授权")),
+        Some("revoked") => {
+            return Err(ApiError::forbidden("license_revoked", "该授权已被回收"))
+        }
+        _ => {}
+    }
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM activations WHERE subject_id=?1 AND product_id=?2 AND device_fp=?3",
+            params![auth.subject_id, body.product_id, body.device_fp],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let used: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM activations WHERE subject_id=?1 AND product_id=?2 AND status='active'",
+        params![auth.subject_id, body.product_id],
+        |r| r.get(0),
+    )?;
+    if exists.is_none() && used >= state.device_limit {
+        return Err(ApiError::forbidden(
+            "device_limit",
+            format!("已有 {} 台设备装了这份表盘（上限 {} 台）。换手机或重装后需要清掉旧设备记录，请联系开发者处理", state.device_limit, state.device_limit),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO activations(subject_id, product_id, device_fp, device_pubkey, device_name,
+             status, created_at, last_seen_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)
+         ON CONFLICT(subject_id, product_id, device_fp)
+         DO UPDATE SET device_pubkey=excluded.device_pubkey, device_name=excluded.device_name,
+                       status='active', last_seen_at=excluded.last_seen_at",
+        params![
+            auth.subject_id,
+            body.product_id,
+            body.device_fp,
+            body.device_pubkey,
+            body.device_name,
+            now()
+        ],
+    )?;
+    let used_after: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM activations WHERE subject_id=?1 AND product_id=?2 AND status='active'",
+        params![auth.subject_id, body.product_id],
+        |r| r.get(0),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "activations_used": used_after,
+        "activation_limit": state.device_limit,
+    })))
+}
+
+// ---------------------------------------------------------------- 版本清单
+
+#[derive(Deserialize)]
+pub struct ManifestQuery {
+    pub product_id: String,
+    pub variant_id: String,
+}
+
+pub async fn manifest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ManifestQuery>,
+) -> ApiResult<Json<Value>> {
+    let auth = require_client(&state, &headers)?;
+    let conn = state.conn();
+    let lic = license_status(&conn, &auth.subject_id, &q.product_id)?;
+    match lic.as_deref() {
+        None => return Err(ApiError::forbidden("license_revoked", "没有该产品的授权")),
+        Some("revoked") => {
+            return Err(ApiError::forbidden("license_revoked", "该授权已被回收"))
+        }
+        _ => {}
+    }
+    let pstatus: Option<String> = conn
+        .query_row("SELECT status FROM products WHERE id=?1", [&q.product_id], |r| r.get(0))
+        .optional()?;
+    if pstatus.as_deref() != Some("on") {
+        return Err(ApiError::forbidden("product_offline", "该表盘已下架"));
+    }
+
+    let mut vstmt = conn.prepare(
+        "SELECT id, version, notes, is_latest, created_at FROM versions
+         WHERE variant_id=?1 ORDER BY id DESC",
+    )?;
+    let versions: Vec<Value> = vstmt
+        .query_map([&q.variant_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "version": r.get::<_, String>(1)?,
+                "notes": r.get::<_, Option<String>>(2)?,
+                "is_latest": r.get::<_, i64>(3)? != 0,
+                "released_at": r.get::<_, i64>(4)?,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut out = Vec::new();
+    for v in versions {
+        let vid = v["id"].as_i64().unwrap_or(0);
+        let mut fstmt = conn.prepare(
+            // 一个版本可以有多个包（同一设备因内存限制拆成两个独立表盘）：按 sort_order 定序，App 依次安装
+            "SELECT id, file_name, size, sha256_plain, sha256_cipher FROM files
+             WHERE version_id=?1 ORDER BY sort_order, id",
+        )?;
+        let files: Vec<Value> = fstmt
+            .query_map([vid], |r| {
+                Ok(json!({
+                    "file_id": r.get::<_, String>(0)?,
+                    "file_name": r.get::<_, String>(1)?,
+                    "size": r.get::<_, i64>(2)?,
+                    "sha256_plain": r.get::<_, String>(3)?,
+                    "sha256_cipher": r.get::<_, String>(4)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        out.push(json!({
+            "version": v["version"],
+            "notes": v["notes"],
+            "is_latest": v["is_latest"],
+            "released_at": v["released_at"],
+            "files": files,
+        }));
+    }
+    let latest = out
+        .iter()
+        .find(|v| v["is_latest"] == json!(true))
+        .map(|v| v["version"].clone());
+    Ok(Json(json!({
+        "product_id": q.product_id,
+        "variant_id": q.variant_id,
+        "latest_version": latest,
+        "versions": out,
+    })))
+}
+
+// ---------------------------------------------------------------- 下载
+
+#[derive(Deserialize)]
+pub struct DownloadReq {
+    pub file_id: String,
+    /// 目标设备指纹（多设备时必填；单设备可省略）
+    pub device_fp: Option<String>,
+    /// 设备公钥（首次下载时用于自动激活）
+    pub device_pubkey: Option<String>,
+    pub device_name: Option<String>,
+}
+
+pub async fn download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DownloadReq>,
+) -> ApiResult<Json<Value>> {
+    let auth = require_client(&state, &headers)?;
+    let conn = state.conn();
+
+    // 文件 → 版本 → 变体 → 产品
+    let row: Option<(String, String, i64, String, String, Vec<u8>, Vec<u8>, String)> = conn
+        .query_row(
+            "SELECT f.file_name, f.sha256_plain, f.size, v.version, va.product_id,
+                    f.file_nonce, f.cek_wrapped, f.storage_path
+             FROM files f
+             JOIN versions v ON v.id = f.version_id
+             JOIN variants va ON va.id = v.variant_id
+             WHERE f.id = ?1",
+            [&body.file_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (file_name, sha_plain, size, version, product_id, _file_nonce, cek_wrapped, storage_path) =
+        row.ok_or_else(|| ApiError::not_found("文件不存在"))?;
+
+    // 授权
+    let lic = license_status(&conn, &auth.subject_id, &product_id)?;
+    match lic.as_deref() {
+        None => return Err(ApiError::forbidden("license_revoked", "没有该产品的授权")),
+        Some("revoked") => {
+            return Err(ApiError::forbidden("license_revoked", "该授权已被回收"))
+        }
+        _ => {}
+    }
+
+    // 目标设备的公钥
+    let dev: Option<(String, String)> = match body.device_fp.as_deref().filter(|s| !s.is_empty()) {
+        Some(fp) => conn
+            .query_row(
+                "SELECT device_fp, device_pubkey FROM activations
+                 WHERE subject_id=?1 AND product_id=?2 AND device_fp=?3 AND status='active'",
+                params![auth.subject_id, product_id, fp],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?,
+        None => conn
+            .query_row(
+                "SELECT device_fp, device_pubkey FROM activations
+                 WHERE subject_id=?1 AND product_id=?2 AND status='active'
+                 ORDER BY last_seen_at DESC LIMIT 1",
+                params![auth.subject_id, product_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?,
+    };
+    // 没有该产品的激活记录 → 限额内自动激活（App 无需单独的「激活」步骤）
+    let (device_fp, device_pubkey) = match dev {
+        Some(v) => v,
+        None => {
+            let fp = body
+                .device_fp
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ApiError::bad_request("缺少 device_fp"))?;
+            let pk = body
+                .device_pubkey
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ApiError::bad_request("首次下载需要 device_pubkey"))?;
+            let raw = crate::crypto::b64d(&pk)?;
+            if raw.len() != 32 {
+                return Err(ApiError::bad_request("device_pubkey 必须是 32 字节"));
+            }
+            let used: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM activations WHERE subject_id=?1 AND product_id=?2 AND status='active'",
+                params![auth.subject_id, product_id],
+                |r| r.get(0),
+            )?;
+            if used >= state.device_limit {
+                return Err(ApiError::forbidden(
+                    "device_limit",
+                    format!("已有 {} 台设备装了这份表盘（上限 {} 台）。换手机或重装后需要清掉旧设备记录，请联系开发者处理", state.device_limit, state.device_limit),
+                ));
+            }
+            conn.execute(
+                // 必须 UPSERT：这台设备以前装过（后来被解绑/吊销过）时，表里还留着同一
+                // (subject, product, device_fp) 的行，裸 INSERT 会撞 UNIQUE 约束报 500，
+                // 用户就卡死在「重装也装不上」——解绑后重新安装正是要走到这里。
+                "INSERT INTO activations(subject_id, product_id, device_fp, device_pubkey, device_name,
+                     status, created_at, last_seen_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)
+                 ON CONFLICT(subject_id, product_id, device_fp)
+                 DO UPDATE SET device_pubkey=excluded.device_pubkey, device_name=excluded.device_name,
+                               status='active', last_seen_at=excluded.last_seen_at",
+                params![auth.subject_id, product_id, fp, pk, body.device_name, now()],
+            )?;
+            (fp, pk)
+        }
+    };
+
+    let dev_pub_raw = crate::crypto::b64d(&device_pubkey)?;
+    if dev_pub_raw.len() != 32 {
+        return Err(ApiError::internal("设备公钥损坏"));
+    }
+    let mut dev_pub = [0u8; 32];
+    dev_pub.copy_from_slice(&dev_pub_raw);
+
+    // KEK 解出 CEK → 用设备公钥重新包裹（每次下载新临时密钥对）
+    let cek_wrap_nonce: Vec<u8> = conn.query_row(
+        "SELECT cek_wrap_nonce FROM files WHERE id=?1",
+        [&body.file_id],
+        |r| r.get(0),
+    )?;
+    let cek = crate::crypto::unwrap_cek(&state.kek, &cek_wrapped, &cek_wrap_nonce)?;
+    let wrap = crate::crypto::wrap_cek_for_device(&cek, &dev_pub)?;
+
+    // 直链（5 分钟签名）
+    let exp = now() + 300;
+    let uid = crate::db::new_id("u_");
+    let sig = crate::crypto::sign_download(&state.url_secret, &body.file_id, exp, &uid);
+    let url = format!(
+        "{}/dl/{}?exp={}&uid={}&sig={}",
+        state.public_base.trim_end_matches('/'),
+        body.file_id,
+        exp,
+        uid,
+        sig
+    );
+
+    let file_nonce: Vec<u8> = conn.query_row(
+        "SELECT file_nonce FROM files WHERE id=?1",
+        [&body.file_id],
+        |r| r.get(0),
+    )?;
+
+    conn.execute(
+        "UPDATE activations SET last_seen_at=?1 WHERE subject_id=?2 AND product_id=?3 AND device_fp=?4",
+        params![now(), auth.subject_id, product_id, device_fp],
+    )?;
+    conn.execute(
+        "INSERT INTO download_logs(file_id, subject_id, device_fp, ts, ip, ua)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            body.file_id,
+            auth.subject_id,
+            device_fp,
+            now(),
+            client_ip(&headers),
+            user_agent(&headers)
+        ],
+    )?;
+
+    Ok(Json(json!({
+        "url": url,
+        "expires_at": exp,
+        "file": {
+            "file_id": body.file_id,
+            "file_name": file_name,
+            "version": version,
+            "size": size,
+            "sha256_plain": sha_plain,
+        },
+        "alg": "AES-256-GCM",
+        "file_nonce": crate::crypto::b64(&file_nonce),
+        "key_wrap": {
+            "alg": "X25519-HKDF-SHA256-A256GCM",
+            "epk": crate::crypto::b64(&wrap.epk),
+            "salt": crate::crypto::b64(&wrap.salt),
+            "wrap_nonce": crate::crypto::b64(&wrap.wrap_nonce),
+            "cipher": crate::crypto::b64(&wrap.cipher),
+        }
+    })))
+}
+
+// ---------------------------------------------------------------- 直链下载（签名）
+
+#[derive(Deserialize)]
+pub struct DlQuery {
+    pub exp: i64,
+    pub uid: String,
+    pub sig: String,
+}
+
+pub async fn download_link(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+    Query(q): Query<DlQuery>,
+) -> Response {
+    if q.exp < now() {
+        return ApiError::new(StatusCode::GONE, "bad_request", "下载链接已过期").into_response();
+    }
+    if !crate::crypto::verify_download(&state.url_secret, &file_id, q.exp, &q.uid, &q.sig) {
+        return ApiError::forbidden("bad_request", "下载签名无效").into_response();
+    }
+    let path: Option<String> = {
+        let conn = state.conn();
+        conn.query_row("SELECT storage_path FROM files WHERE id=?1", [&file_id], |r| r.get(0))
+            .optional()
+            .unwrap_or(None)
+    };
+    let Some(path) = path else {
+        return ApiError::not_found("文件不存在").into_response();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (
+                    header::CACHE_CONTROL,
+                    "private, max-age=0, no-store".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => ApiError::internal(format!("读取密文失败: {e}")).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------- App 自更新（客户端本体）
+
+/// GET /v1/app/latest —— App 启动/手动「检查更新」时问一句。
+///
+/// 不需要登录：装什么东西都还没影子的时候也可能要更新（老版本登录态失效就得先升级）。
+/// 客户端本体免费分发，这条和下面的 `/app/<file>` 都是公开接口。
+pub async fn app_latest(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let row: Option<(i64, String, Option<String>, String, String, i64, i64, i64)> = {
+        let conn = state.conn();
+        conn.query_row(
+            "SELECT version_code, version_name, notes, file_name, sha256, size, min_version_code, created_at
+             FROM app_releases WHERE is_current=1 ORDER BY id DESC LIMIT 1",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                    r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+                ))
+            },
+        )
+        .optional()?
+    };
+    let Some((code, name, notes, file, sha, size, min_code, created)) = row else {
+        return Err(ApiError::not_found("还没有发布过 App 版本"));
+    };
+    Ok(Json(json!({
+        "version_code": code,
+        "version_name": name,
+        "notes": notes.unwrap_or_default(),
+        "url": format!("{}/app/{}", state.public_base.trim_end_matches('/'), file),
+        "sha256": sha,
+        "size": size,
+        "min_version_code": min_code,
+        "published_at": created,
+    })))
+}
+
+/// 对外文件名只允许这些字符：它同时是 URL 段与库内查询键，不给路径穿越留缝。
+fn safe_app_file(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 120
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// GET /app/latest.apk —— 永久链接：302 到当前版本。
+/// 爱发电商品详情、自动回复里贴这一条就永不过期。
+pub async fn app_latest_apk(State(state): State<AppState>) -> Response {
+    let file: Option<String> = {
+        let conn = state.conn();
+        conn.query_row(
+            "SELECT file_name FROM app_releases WHERE is_current=1 ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+    };
+    match file {
+        Some(f) if safe_app_file(&f) => (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, format!("/app/{f}")),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+        )
+            .into_response(),
+        _ => ApiError::not_found("还没有发布过 App 版本").into_response(),
+    }
+}
+
+/// GET /app/<file> —— 直发 APK 文件（按库里的文件名精确查，不拼路径）。
+pub async fn app_file(State(state): State<AppState>, Path(file): Path<String>) -> Response {
+    if !safe_app_file(&file) {
+        return ApiError::not_found("文件不存在").into_response();
+    }
+    let path: Option<String> = {
+        let conn = state.conn();
+        conn.query_row(
+            "SELECT storage_path FROM app_releases WHERE file_name=?1 ORDER BY id DESC LIMIT 1",
+            [&file],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+    };
+    let Some(path) = path else {
+        return ApiError::not_found("文件不存在").into_response();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    "application/vnd.android.package-archive".to_string(),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{file}\""),
+                ),
+                // 文件名里带版本号 → 同一个 URL 的内容永远不变，可以放心长缓存
+                (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => ApiError::internal(format!("读取 APK 失败: {e}")).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------- 客户端诊断上报（失败打点）
+
+/// 一次上报最多收几笔（App 正常只发 1~3 笔；这是防灌垃圾的上限）
+const EVENT_BATCH_MAX: usize = 50;
+
+#[derive(Deserialize)]
+pub struct EventItem {
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub step: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub device_model: Option<String>,
+    #[serde(default)]
+    pub device_fp: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct EventBatch {
+    pub events: Vec<EventItem>,
+}
+
+/// 字段一律截断后入库：这些是给排障看的线索，不是数据仓库，也防有人往里灌长文本。
+fn clip(s: Option<&str>, max: usize) -> Option<String> {
+    let t = s?.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(t.chars().take(max).collect())
+}
+
+/// POST /v1/events —— App 上报「哪一步失败了」。
+///
+/// 为什么**不**强制登录：最早的一批失败（扫不到设备、蓝牙权限没给、绑定失败）都发生在拿到
+/// `license_token` 之前，要求令牌等于把这些信号全丢掉。所以：能认到人就记 subject_id，
+/// 认不到也照收；字段截断、超量丢弃，且**永远返回 200**——上报本身绝不能变成 App 里新的失败点。
+pub async fn report_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<EventBatch>,
+) -> Json<Value> {
+    let subject = require_client(&state, &headers).ok().map(|a| a.subject_id);
+    let ip = client_ip(&headers);
+    let ua = user_agent(&headers);
+    let ts = now();
+    let mut stored = 0usize;
+    {
+        let conn = state.conn();
+        for e in body.events.iter().take(EVENT_BATCH_MAX) {
+            let Some(step) = clip(Some(e.step.as_str()), 40) else {
+                continue;
+            };
+            let ok = conn
+                .execute(
+                    "INSERT INTO client_events(ts, kind, step, code, message, device_model,
+                         device_fp, app_version, subject_id, ip, ua)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                    params![
+                        ts,
+                        clip(e.kind.as_deref(), 16).unwrap_or_else(|| "fail".to_string()),
+                        step,
+                        clip(e.code.as_deref(), 80),
+                        clip(e.message.as_deref(), 500),
+                        clip(e.device_model.as_deref(), 60),
+                        clip(e.device_fp.as_deref(), 80),
+                        clip(e.app_version.as_deref(), 20),
+                        subject.as_deref(),
+                        clip(Some(ip.as_str()), 60),
+                        clip(Some(ua.as_str()), 120),
+                    ],
+                )
+                .is_ok();
+            if ok {
+                stored += 1;
+            }
+        }
+    }
+    Json(json!({ "ok": true, "stored": stored }))
+}

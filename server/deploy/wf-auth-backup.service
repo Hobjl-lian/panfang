@@ -1,0 +1,6 @@
+[Unit]
+Description=盘坊授权服务备份（wf.db + cipher + 密钥环境文件）
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wf-auth-backup.sh

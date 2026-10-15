@@ -1,0 +1,16 @@
+# 构建产物与依赖
+node_modules/
+dist/
+target/
+app/src-tauri/gen/android/app/build/
+app/src-tauri/gen/android/.gradle/
+*.log
+
+# 上游依赖按 scripts/init-upstream.sh 放到这里（不在本仓库里）
+repos/
+
+# 本机数据（授权服务）
+server/data/
+*.db
+*.db-shm
+*.db-wal

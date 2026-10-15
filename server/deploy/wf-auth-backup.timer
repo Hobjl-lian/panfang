@@ -1,0 +1,10 @@
+[Unit]
+Description=每天 04:30 备份盘坊授权服务（漏跑会在开机后补一次）
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

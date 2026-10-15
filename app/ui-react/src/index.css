@@ -1,0 +1,93 @@
+/* 离线：不加载 Google Fonts（App 不联网），字体走系统字体栈 */
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Plus Jakarta Sans', 'Noto Sans SC', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #121316;
+  color: #16181D;
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior: none;
+}
+
+/* 隐藏滚动条 */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* 页面切换微动效 (View Transition / Fade Scale)
+   注意：动画结束后不再用 forwards 保留 transform —— 保留的 transform 会让该容器成为
+   定位包含块/层叠上下文，导致「⋯」菜单那层全屏遮罩（fixed/absolute 整屏）被裁剪或压到卡片下面。
+   末帧与基础样式完全一致（opacity 1 / 无位移），去掉 forwards 视觉上无差别。 */
+@keyframes pageEnter {
+  0% {
+    opacity: 0;
+    transform: scale(0.985) translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.page-enter-anim {
+  animation: pageEnter 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* —— 系统安全区 ——
+   App 在安卓上是全屏（MainActivity 调了 enableEdgeToEdge），顶部要让开系统状态栏、
+   底部固定栏要让开手势条。env(safe-area-inset-*) 在多数安卓 WebView 上只反映刘海/挖孔
+   （普通机型为 0），所以每个都带最小兜底值，取不到 env() 时也不会贴住系统栏。 */
+
+/* 各页顶部内边距（替代原 pt-12/13/14/16：那些是为了给「假 iOS 状态栏」让位，已删） */
+.safe-top {
+  padding-top: max(28px, calc(env(safe-area-inset-top, 0px) + 8px));
+}
+
+/* 顶栏空条（照设计稿「顶栏」节点：400×44，实心 #F5F6F9，无内容无边框）。
+   App 边缘全屏，WebView 顶到状态栏底下，这条就是状态栏区域的底色；
+   标题/胶囊一律不放进条里（在各自页面内容流的 56px 起点处），
+   滚动时内容从这条底下穿过并被盖住。
+   用 fixed 而不是 sticky：条不属于任何滚动容器的内容，纯覆盖层。 */
+.top-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 25;
+  height: 44px;
+  background: #F5F6F9;
+}
+
+/* 一级页（首页/管理/设置）内容起点：44px 顶栏条 + 12px 间隙 = 56px（设计稿口径） */
+.safe-top-tab {
+  padding-top: 56px;
+}
+
+/* 底部 Tab 栏（第四轮：再往下沉一点——手势区只避让 70%，视觉上离手势条更近，
+   但不至于被压住；4px 是基础留缝） */
+.safe-bottom {
+  padding-bottom: calc(4px + env(safe-area-inset-bottom, 0px) * 0.7);
+}
+
+/* 编辑页底部固定操作栏（第三轮：10px + 手势条安全区） */
+.safe-bottom-bar {
+  padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+}
+
+/* 裁剪页底部控制面板（第三轮：14px + 手势条安全区） */
+.safe-bottom-panel {
+  padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+}
+
+/* 顶栏 / 底栏一律不透明纯色（见 App.tsx：状态栏条 #F5F6F9、底部 Tab 栏与固定操作栏 #FFF） */

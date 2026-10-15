@@ -1,0 +1,16 @@
+[package]
+name = "apkinstaller"
+version = "0.1.0"
+description = "安装已下载的 APK（盘坊自更新用：未知来源授权检查 + 调系统安装器）"
+edition = "2021"
+rust-version = "1.77.2"
+exclude = ["/android"]
+links = "apkinstaller"
+
+[dependencies]
+tauri = { version = "2.11.3", features = ["rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }

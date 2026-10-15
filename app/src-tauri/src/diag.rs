@@ -1,0 +1,139 @@
+//! 失败打点：把「哪一步失败了、什么码、什么机型」送到自己的服务器。
+//!
+//! 为什么要有它：管理页原来只看得到**成功**（激活数、下载数、订单），买家装不上时
+//! 卖家这边什么都收不到——那是整条付费链路上唯一完全瞎的一环。
+//!
+//! 边界（与既定原则一致）：
+//!   · 界面上仍然只给一句操作指引，技术细节进 console；这里只是把同一份细节**也**送给开发者；
+//!   · 上报绝不能变成新的失败点：节流、短超时、失败静默丢弃、不重试、不冒泡；
+//!   · 不采集与排障无关的东西（没有账号密码、没有表盘内容、没有照片）。
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
+
+/// 「反馈」页要复制给开发者的最近几条
+const RECENT_MAX: usize = 30;
+/// 同一 (step, code) 的最小上报间隔（秒）：重试循环不会灌爆服务器
+const THROTTLE_SECS: i64 = 30;
+
+static DIR: OnceLock<PathBuf> = OnceLock::new();
+static RECENT: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
+static LAST_SENT: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 启动时登记数据目录（命令行诊断信息也在付费模块的 ctx 里取 base/token）。
+pub fn init(dir: PathBuf) {
+    let _ = DIR.set(dir);
+}
+
+fn recent_buf() -> &'static Mutex<Vec<Value>> {
+    RECENT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 最近几条打点（新的在前）——「反馈」页原样复制给开发者。
+pub fn recent() -> Vec<Value> {
+    recent_buf().lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+/// 上报一次失败（界面上那句「操作指引」之外的细节走这里）。
+pub fn report(step: &str, code: &str, message: &str, device_model: Option<&str>) {
+    report_kind("fail", step, code, message, device_model)
+}
+
+/// 上报一条信息（不是失败，但值得知道，如「留档已升级为密文」）。
+pub fn info(step: &str, code: &str, message: &str, device_model: Option<&str>) {
+    report_kind("info", step, code, message, device_model)
+}
+
+pub fn report_kind(kind: &str, step: &str, code: &str, message: &str, device_model: Option<&str>) {
+    let ts = unix_now();
+    // 1) console 永远有（logcat / app.log 是排障第一现场）
+    log::warn!("[diag] {step} {code}: {message}");
+    // 2) 内存里留一份（反馈页复制用；不落盘，重启即清空）
+    let entry = json!({
+        "ts": ts,
+        "kind": kind,
+        "step": step,
+        "code": code,
+        "message": message,
+        "device_model": device_model,
+    });
+    if let Ok(mut buf) = recent_buf().lock() {
+        buf.insert(0, entry);
+        buf.truncate(RECENT_MAX);
+    }
+    // 3) 节流后发给服务器
+    if !throttled(ts, step, code) {
+        return;
+    }
+    let Some((base, token)) = transport() else { return };
+    let body = json!({ "events": [ {
+        "kind": kind,
+        "step": step,
+        "code": code,
+        "message": message,
+        "device_model": device_model,
+        "app_version": env!("CARGO_PKG_VERSION"),
+    } ] })
+    .to_string();
+
+    // 后台发，绝不阻塞调用方（连手环的操作都在这条路径上，慢一点都不行）
+    tauri::async_runtime::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .user_agent(concat!("Panfang/", env!("CARGO_PKG_VERSION"), " (watchface-installer)"))
+            .timeout(std::time::Duration::from_secs(6))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut req = client
+            .post(format!("{}/v1/events", base.trim_end_matches('/')))
+            .header("content-type", "application/json")
+            .body(body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let _ = req.send().await; // 失败就算了：上报本身不该有任何存在感
+    });
+}
+
+/// 同一 (step, code) 在节流窗口内只上报一次；顺带清掉过期条目，避免 map 无限增长。
+fn throttled(ts: i64, step: &str, code: &str) -> bool {
+    let key = format!("{step}|{code}");
+    let m = LAST_SENT.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut g) = m.lock() else { return true };
+    if let Some(last) = g.get(&key) {
+        if ts - *last < THROTTLE_SECS {
+            return false;
+        }
+    }
+    if g.len() > 200 {
+        g.retain(|_, v| ts - *v < THROTTLE_SECS);
+    }
+    g.insert(key, ts);
+    true
+}
+
+/// 从付费模块的上下文里取「服务器地址 + 登录态」（没登录也要能上报）。
+///
+/// 注意：`paid::ctx` 收的是**付费目录**（`paid_dir`），它与付费模块共用同一个进程级上下文；
+/// 少传一层 `paid/` 会让谁先调用谁定音、留档与登录态全解不开（2026-10-08 真机踩过）。
+fn transport() -> Option<(String, Option<String>)> {
+    let dir = DIR.get()?;
+    let m = crate::paid::ctx(&crate::paid::paid_dir(dir));
+    let g = m.lock(); // 付费模块用的是 parking_lot（无 poisoning），直接拿 guard
+    let c = g.as_ref()?;
+    let token = c.token().map(|s| s.to_string());
+    Some((c.base.clone(), token))
+}

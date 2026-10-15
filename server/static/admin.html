@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>盘坊 · 管理后台</title>
+<style>
+  /* ===== token：一套 sans + 一套 mono；字重只有 400/500/600，不用 700 ===== */
+  :root{
+    --primary:#3D5AF1;
+    --primary-weak:rgba(61,90,241,.09);
+    --bg:#F4F5F7;
+    --panel:#FFFFFF;
+    --ink:#17191E;
+    --ink-2:rgba(23,25,30,.62);
+    --ink-3:rgba(23,25,30,.42);
+    --line:rgba(23,25,30,.09);
+    --ok:#157F3D;
+    --danger:#C7332B;
+  }
+  *{box-sizing:border-box}
+  html{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);min-height:100%;
+    font:14px/1.55 "PingFang SC","Microsoft YaHei","Noto Sans SC",system-ui,-apple-system,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* 字阶（只有这 6 级）：页标题 20 / 区块 15 / 正文 14 / 次要 13 / 微标签 12 / 数据 mono 12.5 */
+  .page-title{font-size:20px;font-weight:600;letter-spacing:-.01em;line-height:1.3;margin:0}
+  .panel-title{font-size:15px;font-weight:600;margin:0}
+  .lead{font-size:14px}
+  .meta{font-size:13px;color:var(--ink-2)}
+  .micro{font-size:12px;font-weight:500;color:var(--ink-3)}
+  .mono{font-family:ui-monospace,"SF Mono",Consolas,"Cascadia Mono",monospace;
+        font-size:12.5px;font-variant-numeric:tabular-nums}
+  .num{font-variant-numeric:tabular-nums}
+  .sp{flex:1}
+  a{color:var(--primary)}
+
+  /* ===== 侧栏：功能入口 ===== */
+  /* 侧栏固定：position:fixed 钉在视口左侧，内容滚动不带走它 */
+  .sidebar{
+    position:fixed;left:0;top:0;bottom:0;width:212px;z-index:7;overflow-y:auto;
+    background:var(--panel);border-right:1px solid var(--line);
+    padding:18px 14px;display:flex;flex-direction:column;
+  }
+  .brand{display:flex;align-items:center;gap:10px;padding:2px 8px 20px;text-decoration:none;color:var(--ink)}
+  .brand-mark{width:28px;height:28px;border-radius:8px;background:var(--primary);color:#fff;
+              display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600;flex:0 0 auto}
+  .brand-name{font-size:15px;font-weight:600;line-height:1.25}
+  .brand-sub{font-size:11px;color:var(--ink-3);line-height:1.3}
+  .nav{display:flex;flex-direction:column;gap:2px}
+  .nav-item{
+    display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:8px;
+    font-size:13.5px;font-weight:500;color:var(--ink-2);text-decoration:none;
+    transition:background .12s ease,color .12s ease;
+  }
+  .nav-item:hover{background:var(--bg);color:var(--ink)}
+  .nav-item.active{background:var(--primary-weak);color:var(--primary)}
+  .ic{width:15px;height:15px;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:1.5;
+      stroke-linecap:round;stroke-linejoin:round}
+
+  /* ===== 顶栏 ===== */
+  .frame{margin-left:212px;min-width:0;min-height:100vh;display:flex;flex-direction:column}
+  .topbar{
+    height:52px;flex:0 0 52px;display:flex;align-items:center;gap:14px;padding:0 28px;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;
+  }
+  .stat{padding:0 12px;border-left:1px solid var(--line);font-size:13px;color:var(--ink-2);
+        font-variant-numeric:tabular-nums}
+  .stat:first-child{border-left:0;padding-left:0}
+  .diag-line{font-size:13px;font-weight:500;color:var(--danger);text-decoration:none}
+  .diag-line:hover{text-decoration:underline}
+
+  main{max-width:1120px;width:100%;margin:0 auto;padding:26px 28px 72px}
+
+  /* ===== 页头 ===== */
+  .page-head{display:flex;align-items:flex-end;gap:16px;margin:0 0 18px}
+  .page-desc{margin:6px 0 0;font-size:13px;color:var(--ink-2);line-height:1.6;max-width:640px}
+  .crumb{font-size:13px;color:var(--ink-2);text-decoration:none;display:inline-block;margin-bottom:2px}
+  .crumb:hover{color:var(--primary)}
+  .page-meta{font-size:13px;font-weight:400;color:var(--ink-3);margin-left:10px}
+
+  /* ===== 面板：白底发丝线，无阴影 ===== */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius,12px);
+         padding:20px 22px;margin-bottom:16px}
+  .panel-head{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+  .panel-hint{font-size:13px;color:var(--ink-2);line-height:1.65;margin:-6px 0 14px}
+  .panel-hint.tight{margin:10px 0 0}
+
+  /* ===== 表格 ===== */
+  .tbl{width:100%;border-collapse:collapse;font-size:13.5px}
+  .tbl th{font-size:12px;font-weight:500;color:var(--ink-3);text-align:left;
+          padding:0 12px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
+  .tbl td{padding:13px 12px;border-top:1px solid var(--line);vertical-align:top}
+  .tbl tbody tr:first-child td{border-top:0}
+  .tbl tbody tr:hover{background:#FAFBFD}
+  .tbl .col-actions{text-align:right;white-space:nowrap}
+  .tbl .col-actions .btn{margin-left:6px}
+  .tbl .cell-name{width:23%}
+  .row-name{font-size:14px;font-weight:600;line-height:1.45}
+  .pack-line{margin-top:5px;display:flex;align-items:baseline;gap:8px}
+
+  /* ===== 表单 ===== */
+  .form-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
+  input,select,textarea{
+    font:inherit;font-size:13.5px;border:1px solid var(--line);background:var(--panel);
+    border-radius:8px;padding:8px 11px;color:var(--ink);outline:none;
+  }
+  input::placeholder{color:var(--ink-3)}
+  input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-weak)}
+  input[type=file]{padding:6px 8px}
+  .check{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--ink-2);cursor:pointer}
+  .check input{width:15px;height:15px;padding:0;accent-color:var(--primary)}
+
+  /* ===== 按钮 ===== */
+  .btn{
+    font:inherit;font-size:13px;font-weight:500;border:0;cursor:pointer;border-radius:8px;
+    padding:7px 14px;transition:background .12s ease,color .12s ease;
+  }
+  .btn-primary{background:var(--primary);color:#fff}
+  .btn-primary:hover{background:#3450D8}
+  .btn-ghost{background:var(--bg);color:var(--ink)}
+  .btn-ghost:hover{background:#E9EBEF}
+  .btn-sm{padding:5px 10px;font-size:12.5px}
+  .btn-danger{background:transparent;color:var(--danger);padding:5px 10px;font-size:12.5px}
+  .btn-danger:hover{background:rgba(199,51,43,.07)}
+  .btn-link{background:transparent;color:var(--primary);padding:4px 6px;font-size:12.5px;font-weight:500}
+  .btn-link:hover{text-decoration:underline}
+  .btn:focus-visible,.nav-item:focus-visible,a:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+
+  /* ===== 角标 ===== */
+  .badge{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:6px;
+         background:var(--bg);color:var(--ink-2);font-size:12px;font-weight:500;white-space:nowrap}
+  .badge-ok{background:rgba(21,127,61,.10);color:var(--ok)}
+  .badge-err{background:rgba(199,51,43,.09);color:var(--danger)}
+  .badge-primary{background:var(--primary-weak);color:var(--primary)}
+
+  /* ===== 资源卡片墙 ===== */
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(252px,1fr));gap:14px}
+  .res-card{
+    position:relative;display:block;background:var(--panel);border:1px solid var(--line);
+    border-radius:var(--radius,12px);padding:16px 18px;cursor:pointer;color:var(--ink);
+    text-decoration:none;transition:border-color .12s ease;
+  }
+  .res-card:hover{border-color:rgba(61,90,241,.45)}
+  .res-name{font-size:15px;font-weight:600;line-height:1.4;padding-right:64px}
+  .res-card .meta{margin-top:5px}
+  .res-foot{margin-top:13px}
+  /* 排序箭头默认隐身，鼠标移到卡片上才出现 */
+  .card-move{position:absolute;top:12px;right:12px;display:flex;gap:4px;opacity:0;transition:opacity .12s ease}
+  .res-card:hover .card-move{opacity:1}
+  .btn-move{
+    border:0;background:var(--bg);color:var(--ink-2);width:26px;height:26px;border-radius:7px;
+    font-size:10px;line-height:1;cursor:pointer;padding:0;
+  }
+  .btn-move:hover:not(:disabled){background:var(--primary-weak);color:var(--primary)}
+  .btn-move:disabled{opacity:.3;cursor:default}
+
+  /* ===== 拖拽区 ===== */
+  .drop{
+    border:1.5px dashed rgba(23,25,30,.18);border-radius:var(--radius,12px);padding:26px;text-align:center;
+    background:#FBFCFD;cursor:pointer;transition:border-color .12s ease,background .12s ease;
+  }
+  .drop.hot{border-color:var(--primary);background:#F6F8FF}
+  .drop .main{font-size:14px;font-weight:600;padding:0;margin:0}
+
+  /* ===== 联调模式警示条 ===== */
+  .dev-banner{
+    display:flex;gap:10px;padding:11px 16px;border-radius:10px;background:var(--danger);color:#fff;
+    font-size:13px;font-weight:500;line-height:1.65;
+  }
+
+  /* ===== toast / 弹层 ===== */
+  .toast{
+    position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(8px);
+    background:#17191E;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:500;
+    opacity:0;transition:opacity .2s ease,transform .2s ease;max-width:70vw;z-index:50;
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .modal{position:fixed;inset:0;background:rgba(23,25,30,.42);display:flex;align-items:center;
+         justify-content:center;z-index:40}
+  .modal .box{background:#fff;border-radius:14px;padding:24px;width:min(460px,92vw)}
+  .modal-title{font-size:16px;font-weight:600;margin:0 0 16px}
+  details summary{cursor:pointer;color:var(--ink-2);font-size:13px;list-style:none}
+  details summary::-webkit-details-marker{display:none}
+
+  /* ===== 响应式：窄屏侧栏变顶栏 ===== */
+  @media (max-width: 960px){
+    .sidebar{position:sticky;top:0;left:auto;bottom:auto;z-index:6;width:auto;height:auto;
+             flex-direction:row;align-items:center;overflow-x:auto;overflow-y:hidden;
+             border-right:0;border-bottom:1px solid var(--line);padding:10px 14px}
+    .frame{margin-left:0}
+    .brand{padding:0 14px 0 4px}
+    .nav{flex-direction:row}
+    main{padding:20px 16px 64px}
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{transition:none!important;animation:none!important}
+  }
+</style>
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="#/">
+    <span class="brand-mark">盘</span>
+    <span><span class="brand-name">盘坊</span><br/><span class="brand-sub">管理后台</span></span>
+  </a>
+  <nav class="nav" id="nav">
+    <a class="nav-item" data-route="#/" href="#/">
+      <svg class="ic" viewBox="0 0 16 16"><rect x="1.5" y="1.5" width="5.2" height="5.2" rx="1.3"/><rect x="9.3" y="1.5" width="5.2" height="5.2" rx="1.3"/><rect x="1.5" y="9.3" width="5.2" height="5.2" rx="1.3"/><rect x="9.3" y="9.3" width="5.2" height="5.2" rx="1.3"/></svg>
+      资源</a>
+    <a class="nav-item" data-route="#/devices" href="#/devices">
+      <svg class="ic" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.3"/><path d="M6.1 4.8 6.3 1.6h3.4l.2 3.2M6.1 11.2l.2 3.2h3.4l.2-3.2"/></svg>
+      设备组</a>
+    <a class="nav-item" data-route="#/afdian" href="#/afdian">
+      <svg class="ic" viewBox="0 0 16 16"><path d="M6.6 9.4 9.4 6.6"/><path d="M7.2 4.4 8.9 2.7a2.3 2.3 0 0 1 3.2 3.2l-1.7 1.7"/><path d="M8.8 11.6 7.1 13.3a2.3 2.3 0 0 1-3.2-3.2l1.7-1.7"/></svg>
+      爱发电</a>
+    <a class="nav-item" data-route="#/events" href="#/events">
+      <svg class="ic" viewBox="0 0 16 16"><path d="M1.5 8h2.8L6 4.2 8.4 11.8 10.4 8h4.1"/></svg>
+      客户端诊断</a>
+    <a class="nav-item" data-route="#/app" href="#/app">
+      <svg class="ic" viewBox="0 0 16 16"><path d="M8 10.6V2.2M5 5.2 8 2.2l3 3"/><path d="M2.5 9.8v3.9h11V9.8"/></svg>
+      App 发版</a>
+  </nav>
+</aside>
+<div class="frame">
+  <header class="topbar">
+    <span id="statLine"></span>
+    <a class="diag-line" id="diagLine" href="#/events" style="display:none"></a>
+    <span class="sp"></span>
+    <input id="token" type="password" placeholder="管理令牌" style="width:180px"/>
+    <button class="btn btn-ghost btn-sm" onclick="saveToken()">连接</button>
+  </header>
+  <main id="app">
+    <div id="devBanner"></div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s??'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const token = () => localStorage.getItem('wf_admin_token') || '';
+let STATE = { products: [], groups: [] };
+let LAST_UPLOAD = '';
+let LAST_UPLOAD_OWNER = '';
+
+function toast(msg, bad){ const t=$('toast'); t.textContent=msg; t.style.background = bad? '#C7332B':'#17191E'; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), 2400); }
+function saveToken(){ localStorage.setItem('wf_admin_token', $('token').value.trim()); toast('已连接'); loadAll(); }
+function fmtSize(n){ return n>1048576 ? (n/1048576).toFixed(2)+' MB' : Math.round(n/1024)+' KB'; }
+
+async function api(path, opts={}){
+  const isForm = opts.body instanceof FormData;
+  const ctl = new AbortController();
+  const timer = setTimeout(()=>ctl.abort(), 90000);
+  let r;
+  try{
+    r = await fetch(path, Object.assign({signal: ctl.signal, headers:Object.assign({'Authorization':'Bearer '+token()}, isForm?{}:{'Content-Type':'application/json'})}, opts));
+  }catch(e){
+    clearTimeout(timer);
+    throw new Error(e.name==='AbortError' ? '请求超时，请重试' : ('网络错误：'+(e.message||e)));
+  }
+  clearTimeout(timer);
+  const txt = await r.text(); let data=null;
+  try{ data = txt? JSON.parse(txt): null; }catch(e){ data={message:txt}; }
+  if(!r.ok){ const err = new Error((data&&(data.message||data.error))||('HTTP '+r.status)); err.code=data&&data.error; throw err; }
+  return data;
+}
+
+// ---------- 路由
+function go(hash){ location.hash = hash; }
+/** 侧栏高亮：资源详情归到「资源」下 */
+function setNav(){
+  const h = location.hash || '#/';
+  const match = r => r === h || (r === '#/' && h.startsWith('#/p/')) || (r === '#/devices' && h === '#/settings');
+  document.querySelectorAll('.nav-item').forEach(el=>{
+    if(match(el.getAttribute('data-route'))) el.classList.add('active');
+    else el.classList.remove('active');
+  });
+}
+async function render(){
+  setNav();
+  if(!token()){
+    $('app').innerHTML = `<div class="panel"><div class="panel-title">先连接</div>
+      <div class="panel-hint tight">在右上角填入管理令牌。</div></div>`;
+    return;
+  }
+  const h = location.hash || '#/';
+  try{
+    if(h.startsWith('#/p/')) return renderDetail(h.slice(4));
+    if(h==='#/devices' || h==='#/settings') return renderDeviceGroups();
+    if(h==='#/afdian') return renderAfdian();
+    if(h==='#/events') return renderEvents();
+    if(h==='#/app') return renderAppPage();
+    return renderCards();
+  }catch(e){ $('app').innerHTML = `<div class="panel"><div class="panel-title" style="color:var(--danger)">出错了</div><div class="panel-hint tight">${esc(e.message)}</div></div>`; }
+}
+window.addEventListener('hashchange', render);
+
+// ---------- 首页
+/** 资源卡片模板（排序箭头 hover 显现；只此一份，别再复制） */
+function cardHtml(p, i, total){
+  return `<a class="res-card" href="#/p/${esc(p.id)}">
+    <div class="card-move">
+      <button class="btn-move" title="前移" ${i===0? 'disabled':''}
+              onclick="event.preventDefault();event.stopPropagation();moveProduct(${i},-1)">◀</button>
+      <button class="btn-move" title="后移" ${i===total-1? 'disabled':''}
+              onclick="event.preventDefault();event.stopPropagation();moveProduct(${i},1)">▶</button>
+    </div>
+    <div class="res-name">${esc(p.name)}</div>
+    <div class="meta">${p.deviceCount}/${p.variantCount} 个设备已传包体 · 已购 ${p.buyers} 人</div>
+    <div class="res-foot">${
+      p.latestVersion
+        ? `<span class="badge badge-primary">最新 ${esc(p.latestVersion)}</span>`
+        : `<span class="badge">还没有包体</span>`}</div>
+  </a>`;
+}
+
+async function renderCards(){
+  const d = await api('/admin/products');
+  STATE.products = d.products;
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">资源</h1>
+        <p class="page-desc">表盘商品列表；点卡片进详情上传包体、配购买链接。右上角箭头可以调整展示顺序。</p></div>
+      <span class="sp"></span>
+      <button class="btn btn-primary" onclick="openNewResource()">新建资源</button>
+    </div>
+    <div class="cards">${STATE.products.map((p,i)=>cardHtml(p,i,STATE.products.length)).join('') || '<span class="meta">还没有资源</span>'}</div>`;
+  loadStats();
+}
+
+/** 用内存里的顺序重画卡片墙（不重新拉数据，保证点击后立刻响应） */
+function renderCardsFromState(){
+  const grid = document.querySelector('.cards');
+  if(grid) grid.innerHTML = STATE.products.map((p,i)=>cardHtml(p,i,STATE.products.length)).join('');
+}
+
+/** 卡片排序：本地先换位即时反馈，再把新顺序写回服务端 */
+async function moveProduct(index, dir){
+  const list = STATE.products.slice();
+  const to = index + dir;
+  if(to < 0 || to >= list.length) return;
+  [list[index], list[to]] = [list[to], list[index]];
+  STATE.products = list;
+  renderCardsFromState();
+  try{ await api('/admin/products/reorder',{method:'POST',body:JSON.stringify({ids:list.map(p=>p.id)})}); }
+  catch(e){ toast('排序保存失败：'+e.message, true); }
+}
+
+function openNewResource(){
+  document.body.insertAdjacentHTML('beforeend', `<div class="modal" id="m"><div class="box">
+    <div class="modal-title">新建资源</div>
+    <input id="np-name" placeholder="资源名称" style="width:100%"/>
+    <div class="form-row" style="justify-content:flex-end;margin-top:20px">
+      <button class="btn btn-ghost" onclick="document.getElementById('m').remove()">取消</button>
+      <button class="btn btn-primary" onclick="createResource()">创建</button>
+    </div></div></div>`);
+  setTimeout(()=>{ const el=$('np-name'); if(el) el.focus(); }, 30);
+}
+async function createResource(){
+  const name = $('np-name').value.trim();
+  if(!name) return toast('请填资源名称', true);
+  try{
+    const d = await api('/admin/products',{method:'POST',body:JSON.stringify({name, device_group_ids:[]})});
+    document.getElementById('m').remove(); toast('已创建'); go('#/p/'+d.productId);
+  }catch(e){ toast(e.message, true); }
+}
+
+// ---------- 资源详情
+/** 设备行的「包体」单元格：单包 / 多包（同版本、按文件名依次安装） */
+function packagesCell(v){
+  const pkg = v.package;
+  const packs = (v.packages && v.packages.length) ? v.packages : (pkg ? [pkg] : []);
+  if(!packs.length) return '<span class="badge badge-err">未上传</span>';
+  if(packs.length === 1){
+    return `<div class="mono">${esc(packs[0].fileName)}</div>
+            <div class="micro" style="margin-top:3px">${fmtSize(packs[0].size)} · ${esc(pkg&&pkg.canvas||'')}</div>`;
+  }
+  const tot = packs.reduce((s,x)=>s+(x.size||0),0);
+  return `<div><span class="badge badge-primary">${packs.length} 个包</span>
+            <span class="micro" style="margin-left:6px">共 ${fmtSize(tot)} · 按顺序依次安装</span></div>` +
+    packs.map((x,i)=>`<div class="pack-line"><span class="mono">${i+1}. ${esc(x.fileName)}</span>
+        <span class="micro">${fmtSize(x.size)}</span></div>`).join('');
+}
+
+/** 设备行的「购买链接」单元格：一条或多条爱发电链接 */
+function linksCell(v, productId){
+  const link = v.afdian || {};
+  const links = link.links && link.links.length ? link.links : (link.planId? [link] : []);
+  const sharedMax = Math.max(0, ...links.map(l=>l.shared||0));
+  const shared = sharedMax > 1 ? `<span class="badge">共用 ${sharedMax} 处</span>` : '';
+  const editBtn = `<button class="btn btn-link" onclick="editLink('${esc(v.id)}','${esc(productId)}')">改链接</button>`;
+  if(!links.length){
+    return `<div><span class="badge badge-err">未配购买链接</span>
+              <button class="btn btn-ghost btn-sm" style="margin-left:6px"
+                onclick="editLink('${esc(v.id)}','${esc(productId)}')">配置</button></div>
+            <div id="lk-${esc(v.id)}"></div>`;
+  }
+  return `<div class="mono" style="color:var(--ink-2)">${esc(links[0].planId.slice(0,14))}…</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:3px">
+            ${links.length>1? `<span class="badge badge-primary">${links.length} 条链接</span>` : ''}
+            ${shared}${editBtn}</div>
+          <div id="lk-${esc(v.id)}"></div>`;
+}
+
+async function renderDetail(id){
+  if(!LAST_UPLOAD_OWNER || LAST_UPLOAD_OWNER !== id) LAST_UPLOAD = '';
+  const p = await api('/admin/products/'+encodeURIComponent(id));
+  const rows = p.variants.map(v=>`<tr>
+      <td class="cell-name">
+        <div class="row-name">${esc(v.name)}</div>
+        <div class="micro" style="margin-top:3px">${(v.deviceModels||[]).map(esc).join('、')}</div>
+      </td>
+      <td>${packagesCell(v)}</td>
+      <td>${v.package? `<span class="mono">${esc(v.package.version)}</span>` : '<span class="micro">—</span>'}</td>
+      <td>${linksCell(v, p.id)}</td>
+      <td class="col-actions">
+        <button class="btn btn-ghost btn-sm" onclick="uploadRow('${esc(v.id)}','${esc(p.id)}')">上传包体</button>
+        <button class="btn btn-danger" onclick="delVariant('${esc(v.id)}','${esc(v.name)}','${esc(p.id)}')">删除</button>
+      </td>
+    </tr>`).join('');
+  // 没配购买链接的设备行：买家买了也拿不到权限（上线前必须清零）
+  const noLink = p.variants.filter(v=>{
+    const l = v.afdian || {};
+    return !((l.links && l.links.length) || l.planId);
+  }).length;
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div>
+        <a class="crumb" href="#/">‹ 资源</a>
+        <h1 class="page-title">${esc(p.name)}<span class="page-meta num">已购 ${p.buyers} 人</span></h1>
+      </div>
+      <span class="sp"></span>
+      <button class="btn btn-danger" onclick="delResource('${esc(p.id)}','${esc(p.name)}')">删除资源</button>
+    </div>
+    <div class="panel">
+      <div class="drop" id="drop"><div class="main">把 .bin 拖到这里</div>
+        <div class="meta" style="margin-top:6px">可多选或拖整个文件夹，自动识别设备与版本；
+          <b style="font-weight:600">同一设备的多个包请一起拖进来</b>——会存成同一版本，买家那边按文件名顺序依次安装</div></div>
+      <input type="file" id="files" multiple accept=".bin" style="display:none"/>
+      <div id="up-result">${LAST_UPLOAD}</div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">设备行</h2>
+        ${noLink? `<span class="badge badge-err">${noLink} 行没配购买链接</span>`:''}
+        <span class="sp"></span>
+        <button class="btn btn-ghost btn-sm" onclick="openAddDevice('${esc(p.id)}')">添加设备</button>
+      </div>
+      ${noLink? '<div class="panel-hint" style="margin:-6px 0 12px">标红的设备行没有购买链接 —— 买对应规格的买家绑定了也拿不到权限。</div>':''}
+      <table class="tbl">
+        <thead><tr>
+          <th class="cell-name">设备行</th><th style="width:32%">包体</th><th style="width:9%">版本</th>
+          <th style="width:21%">购买链接</th><th class="col-actions" style="width:15%">操作</th>
+        </tr></thead>
+        <tbody>${rows || '<tr><td colspan="5"><span class="meta">拖入包体后自动生成设备行</span></td></tr>'}</tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">手动开通 / 吊销</h2></div>
+      <div class="form-row">
+        <input id="grant-uid" placeholder="小米账号 ID" style="width:280px"/>
+        <button class="btn btn-ghost" onclick="grantTo('${esc(p.id)}')">开通</button>
+        <button class="btn btn-danger" onclick="revokeTo('${esc(p.id)}')">吊销</button>
+      </div>
+      <div class="panel-hint tight">收权只能手动：爱发电订单接口只回成功订单，订单被撤销/异常时不会自动同步过来</div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">已激活设备</h2>
+        <span class="sp"></span>
+        <span class="meta" style="margin-right:6px">用户换手机/重装撞上「2 台」上限时，在这里解绑旧设备</span>
+        <button class="btn btn-ghost btn-sm" onclick="loadActivations('${esc(p.id)}')">查看</button>
+      </div>
+      <div id="acts"><span class="meta">点「查看」列出装了这份表盘的设备（含设备名与最近使用时间）</span></div>
+    </div>`;
+  const drop = $('drop'); const fileInput = $('files');
+  drop.onclick = ()=> fileInput.click();
+  fileInput.onchange = e => batchUpload(p.id, [...e.target.files]);
+  ['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('hot')}));
+  ['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('hot')}));
+  drop.addEventListener('drop', async e=>{
+    const files=[]; const items=[...e.dataTransfer.items||[]];
+    const walk = async (entry, prefix)=>{
+      if(entry.isFile){ files.push(await new Promise(res=>entry.file(f=>{f._rel=prefix+f.name;res(f)}, ()=>res(null)))); }
+      else if(entry.isDirectory){ const r=entry.createReader(); const es=await new Promise(res=>r.readEntries(res,()=>res([])));
+        for(const en of es) await walk(en, prefix+entry.name+'/'); }
+    };
+    for(const it of items){ const en=it.webkitGetAsEntry&&it.webkitGetAsEntry(); if(en) await walk(en,''); }
+    if(!files.length) files.push(...[...e.dataTransfer.files]);
+    batchUpload(p.id, files.filter(Boolean));
+  });
+}
+
+/** 上传**一批**包到某个设备行（一次请求可带多个 file）；成功返回响应，失败抛可读错误。 */
+async function uploadBatch(productId, files, variantId, force){
+  const fd = new FormData();
+  for(const f of files){
+    fd.append('file', f, f.name);
+    fd.append('path_hint', f._rel || f.webkitRelativePath || f.name);
+  }
+  fd.append('product_id', productId);
+  if(variantId) fd.append('variant_id', variantId);
+  if(force) fd.append('force','true');
+  return await api('/admin/versions/upload',{method:'POST',body:fd});
+}
+
+/** 上传一批；撞上版本规则时问一句再强制重传 */
+async function uploadBatchAsk(productId, files, variantId){
+  try{
+    return await uploadBatch(productId, files, variantId, false);
+  }catch(e){
+    if(e.code === 'version_not_newer' && variantId && confirm(e.message + '，确认强制替换吗？')){
+      return await uploadBatch(productId, files, variantId, true);
+    }
+    throw e;
+  }
+}
+
+/** 上传一个文件；成功返回 true（信息写进 file._msg），失败返回可读文案。 */
+async function uploadOne(productId, file, variantId, force){
+  try{
+    const d = await uploadBatch(productId, [file], variantId, force);
+    file._msg = `${d.variantName}${d.createdRow? ' · 新设备':''} · ${d.replacedVersion? d.replacedVersion+' → ':''}${d.version}`;
+    return true;
+  }catch(e){
+    if(e.code === 'version_not_newer' && variantId){
+      if(confirm(e.message + '，确认强制替换吗？')) return uploadOne(productId, file, variantId, true);
+    }
+    return e.message || String(e);
+  }
+}
+
+async function batchUpload(productId, files){
+  const box = $('up-result');
+  const draw = (lines, note) => {
+    if(!box) return;
+    box.innerHTML = `<div class="meta" style="margin-top:12px">${esc(note)}</div>` +
+      lines.map(l=>`<div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+        <span class="badge ${l.ok? 'badge-ok':'badge-err'}">${l.ok? '已归位':'失败'}</span>
+        <span class="mono">${esc(l.name)}</span>
+        <span class="meta">${esc(l.msg||'')}</span></div>`).join('');
+  };
+  try{
+    const bins = files.filter(f=>f && typeof f.name==='string' && f.name.toLowerCase().endsWith('.bin'));
+    if(!bins.length){ toast('没有 .bin 文件', true); return; }
+    const lines = [];
+    draw(lines, `正在识别 ${bins.length} 个文件…`);
+
+    // 1) 先空跑识别（只识别不写库），按「归到哪个设备行」分组：
+    //    同一设备行的多个包 = 一批（同一个版本，按文件名顺序依次安装）
+    const groups = new Map();
+    for(const f of bins){
+      try{
+        const fd = new FormData();
+        fd.append('file', f, f.name);
+        fd.append('path_hint', f._rel || f.webkitRelativePath || f.name);
+        fd.append('product_id', productId);
+        const d = await api('/admin/inspect',{method:'POST',body:fd});
+        const det = d.detection || {};
+        const key = det.variantId || (det.deviceGroupId? 'g:'+det.deviceGroupId : 'unknown:'+f.name);
+        if(!groups.has(key)) groups.set(key, { variantId: det.variantId||'', label: det.variantName || det.deviceGroupName || '未知设备', files: [] });
+        groups.get(key).files.push(f);
+      }catch(e){
+        lines.push({ name: f.name, ok: false, msg: '识别失败：' + (e && (e.message||e)) });
+      }
+    }
+    draw(lines, `识别完成：${groups.size} 个设备行，开始上传…`);
+
+    // 2) 每行一次请求（多包同版本）
+    let ok = 0, fail = 0;
+    for(const [, g] of groups){
+      const label = g.label + (g.files.length > 1 ? `（${g.files.length} 个包）` : '');
+      try{
+        const d = await uploadBatchAsk(productId, g.files, g.variantId);
+        const names = (d.files||[]).map(x=>x.fileName).join(' → ');
+        lines.push({ name: label, ok: true,
+          msg: `${d.createdRow? '新设备 · ':''}${d.replacedVersion? d.replacedVersion+' → ':''}${d.version}` +
+               (g.files.length>1? ` · 顺序 ${names}` : '') });
+        ok += g.files.length;
+      }catch(e){
+        lines.push({ name: label, ok: false, msg: (e && (e.message||e)) || String(e) });
+        fail += g.files.length;
+      }
+      draw(lines, `上传中 ${ok+fail}/${bins.length}…`);
+    }
+    draw(lines, `完成：成功 ${ok}，失败 ${fail}`);
+    toast(`上传完成：成功 ${ok}，失败 ${fail}`, fail > 0);
+    LAST_UPLOAD_OWNER = productId;
+    LAST_UPLOAD = box ? box.innerHTML : '';
+    render();
+  }catch(e){
+    draw([], '出错了：' + (e && (e.message||String(e))));
+    toast('上传出错了', true);
+  }
+}
+
+function uploadRow(variantId, productId){
+  const inp = document.createElement('input');
+  inp.type='file'; inp.accept='.bin';
+  inp.onchange = async ()=>{ const f=inp.files[0]; if(!f) return; await uploadOne(productId, f, variantId, false); render(); };
+  inp.click();
+}
+
+async function editLink(variantId, productId){
+  const box = $('lk-'+variantId);
+  if(!box) return;
+  if(box.innerHTML){ box.innerHTML=''; return; }
+  // 从当前资源里取这条设备行已配的链接
+  const p = await api('/admin/products/'+encodeURIComponent(productId));
+  const v = (p.variants||[]).find(x=>x.id===variantId) || {};
+  const af = v.afdian || {};
+  const links = af.links && af.links.length ? af.links : (af.planId? [{planId:af.planId, sku:af.sku}] : []);
+  const list = links.map(l=>`<div class="form-row" style="margin:4px 0;gap:8px">
+      <span class="mono" style="flex:1;color:var(--ink-2)">${esc(l.planId)}${l.sku? ' · 规格 '+esc(l.sku):''}</span>
+      <button class="btn btn-link" style="color:var(--danger)" onclick="delLink('${esc(variantId)}','${esc(l.planId)}','${esc(l.sku||'')}')">删除</button>
+    </div>`).join('');
+  box.innerHTML = `<div style="margin-top:8px">
+      ${list || '<div class="meta">还没有配链接</div>'}
+      <input id="lu-${variantId}" placeholder="再贴一条 https://afdian.com/item/…" style="width:100%;margin-top:6px"/>
+      <div class="form-row" style="margin-top:8px">
+        <button class="btn btn-primary btn-sm" onclick="saveLink('${variantId}')">添加</button>
+        <button class="btn btn-ghost btn-sm" onclick="saveLink('${variantId}', true)">全部清除</button>
+      </div>
+      <div class="micro" style="margin-top:6px;line-height:1.6">同一个包体可以挂多条链接（例：手环9 Pro 与 10 Pro 分成两个商品卖）</div>
+    </div>`;
+}
+async function delLink(variantId, planId, sku){
+  try{
+    await api('/admin/variants/afdian/remove',{method:'POST',body:JSON.stringify({variant_id:variantId, plan_id:planId, sku: sku||null})});
+    toast('已删除该链接');
+    render();
+  }catch(e){ toast(e.message, true); }
+}
+async function saveLink(variantId, clear){
+  const url = clear? '' : ($('lu-'+variantId).value.trim());
+  if(!clear && !url) return toast('先贴一条爱发电商品链接', true);
+  try{
+    const d = await api('/admin/variants/afdian',{method:'POST',body:JSON.stringify({variant_id:variantId, url})});
+    toast(clear? '已清除该行全部链接' : `已添加（共 ${(d.links||[]).length} 条）`);
+    render();
+  }catch(e){ toast(e.message, true); }
+}
+
+/** 手动吊销某个小米账号在本资源的授权（售后收权用） */
+async function revokeTo(productId){
+  const uid = $('grant-uid').value.trim();
+  if(!uid) return toast('请填小米账号 ID', true);
+  if(!confirm(`确认吊销 ${uid} 对「${productId}」的授权？`)) return;
+  try{
+    const d = await api('/admin/revoke',{method:'POST',body:JSON.stringify({product_id:productId, mi_user_id:uid})});
+    toast(`已吊销 ${d.revoked ?? 0} 条授权`);
+    render();
+  }catch(e){ toast(e.message, true); }
+}
+async function grantTo(productId){
+  const uid = $('grant-uid').value.trim();
+  if(!uid) return toast('请填小米账号 ID', true);
+  try{
+    const d = await api('/admin/grant',{method:'POST',body:JSON.stringify({mi_user_id:uid, product_id:productId})});
+    toast(`已开通（该账号现有 ${d.owned.length} 个资源）`);
+    $('grant-uid').value='';
+  }catch(e){ toast(e.message, true); }
+}
+
+/** 列出装了这份表盘的设备（售后用：谁在用哪几台、最近什么时候用过） */
+async function loadActivations(productId){
+  const box = $('acts'); if(!box) return;
+  box.innerHTML = '<span class="meta">读取中…</span>';
+  try{
+    const d = await api('/admin/activations?product_id='+encodeURIComponent(productId));
+    const list = d.activations || [];
+    if(!list.length){ box.innerHTML = '<span class="meta">还没有设备装过这份表盘</span>'; return; }
+    box.innerHTML = `<table class="tbl">
+      <thead><tr><th>小米账号</th><th>设备</th><th>设备指纹</th><th>最近使用</th><th>状态</th><th class="col-actions">操作</th></tr></thead>
+      <tbody>${list.map(a=>{
+        const t = a.lastSeenAt? new Date(a.lastSeenAt*1000).toLocaleString('zh-CN') : '—';
+        const active = a.status === 'active';
+        return `<tr>
+          <td><span class="mono">${esc(a.miUserId)}</span></td>
+          <td>${esc(a.deviceName || '未知设备')}</td>
+          <td><span class="mono" style="color:var(--ink-2)">${esc(String(a.deviceFp).slice(0,18))}…</span></td>
+          <td class="num">${t}</td>
+          <td>${active ? '<span class="badge badge-primary">在用</span>' : '<span class="badge">已解绑</span>'}</td>
+          <td class="col-actions">${active
+            ? `<button class="btn btn-danger" onclick="unbindDevice('${esc(productId)}','${esc(a.deviceFp)}')">解绑</button>`
+            : ''}</td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+  }catch(e){ box.innerHTML = `<span class="meta" style="color:var(--danger)">${esc(e.message)}</span>`; }
+}
+
+/** 解绑单台设备（换手机/重装后释放名额；这台设备下次重新下载会自动再激活） */
+async function unbindDevice(productId, deviceFp){
+  if(!confirm('解绑这台设备？\n\n它会释放一个设备名额；这台设备下次重新安装时会自动重新激活。')) return;
+  try{
+    const d = await api('/admin/revoke',{method:'POST',body:JSON.stringify({product_id:productId, device_fp:deviceFp})});
+    toast(`已解绑 ${d.revoked ?? 0} 条`);
+    loadActivations(productId);
+  }catch(e){ toast(e.message, true); }
+}
+
+async function delVariant(variantId, name, productId){
+  if(!confirm(`删除设备「${name}」及其包体？`)) return;
+  try{ await api('/admin/variants/'+encodeURIComponent(variantId),{method:'DELETE'}); toast('已删除'); render(); }
+  catch(e){ toast(e.message, true); }
+}
+async function delResource(id, name){
+  if(!confirm(`删除资源「${name}」？已购用户将无法再下载。`)) return;
+  try{ await api('/admin/products/'+encodeURIComponent(id),{method:'DELETE'}); toast('已删除'); go('#/'); }
+  catch(e){ toast(e.message, true); }
+}
+function openAddDevice(productId){
+  const used = new Set((STATE.products.find(p=>p.id===productId)?.variants||[]).map(v=>v.deviceGroupId));
+  const list = STATE.groups.filter(g=>!used.has(g.id));
+  const body = list.length
+    ? list.map(g=>`<div class="form-row" style="padding:10px 0;justify-content:space-between">
+        <span class="lead" style="flex:1">${esc(g.name)}</span>
+        <button class="btn btn-ghost btn-sm" onclick="addDevice('${esc(productId)}','${esc(g.id)}')">添加</button></div>`).join('')
+    : '<div class="meta">所有设备都已添加</div>';
+  document.body.insertAdjacentHTML('beforeend', `<div class="modal" id="m"><div class="box">
+    <div class="modal-title">添加设备</div>
+    <div>${body}</div>
+    <div class="form-row" style="justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="document.getElementById('m').remove()">关闭</button></div></div></div>`);
+}
+async function addDevice(productId, groupId){
+  try{ await api('/admin/variants',{method:'POST',body:JSON.stringify({product_id:productId, device_group_id:groupId})});
+    document.getElementById('m').remove(); toast('已添加'); render(); }
+  catch(e){ toast(e.message, true); }
+}
+
+// ---------- 设备组
+async function renderDeviceGroups(){
+  const g = await api('/admin/device-groups');
+  STATE.groups = g.deviceGroups;
+  const rows = g.deviceGroups.map(x=>`<tr>
+      <td style="width:230px"><input value="${esc(x.name)}" id="gn-${esc(x.id)}" style="width:100%"/></td>
+      <td><input value="${esc((x.models||[]).join('、'))}" id="gm-${esc(x.id)}" style="width:100%"/></td>
+      <td class="col-actions"><button class="btn btn-ghost btn-sm" onclick="saveGroup('${esc(x.id)}')">保存</button></td>
+    </tr>`).join('');
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">设备组</h1>
+        <p class="page-desc">同一组必须是同一块屏，型号用「、」分隔。上传包体时按这里的型号自动归到设备行。</p></div>
+      <span class="sp"></span>
+      <button class="btn btn-ghost" onclick="addGroup()">新增设备组</button>
+    </div>
+    <div class="panel">
+      <table class="tbl">
+        <thead><tr><th>组名</th><th>包含型号</th><th class="col-actions"></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="3"><span class="meta">还没有设备组</span></td></tr>'}</tbody>
+      </table>
+    </div>`;
+}
+
+// ---------- 爱发电
+async function renderAfdian(){
+  setTimeout(()=>{ void loadAfdian(); void afdianSpecReport(); }, 0);
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">爱发电</h1>
+        <p class="page-desc">订单同步、账号绑定与规格名体检。买家付款后由这里开通授权。</p></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">订单同步</h2>
+        <span class="sp"></span>
+        <button class="btn btn-ghost btn-sm" onclick="afdianBackfill()">拉全部历史订单</button>
+        <button class="btn btn-ghost btn-sm" onclick="afdianSync()">同步订单</button>
+      </div>
+      <div class="meta" id="af-backfill"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">账号绑定</h2></div>
+      <div class="form-row">
+        <input id="af-uid" placeholder="爱发电用户 ID" style="flex:1;max-width:320px"/>
+        <input id="af-mi" placeholder="小米账号 ID" style="width:190px"/>
+        <button class="btn btn-ghost" onclick="afdianBind()">建立绑定</button>
+      </div>
+      <div class="panel-hint tight">绑定后可「补发」该买家此前的成功订单；OAuth 接好后这步自动完成</div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">联调：模拟订单</h2></div>
+      <div class="panel-hint" style="margin:-6px 0 12px">先在资源详情里给对应设备行配好购买链接。</div>
+      <div class="form-row">
+        <select id="af-plan" style="flex:1;max-width:360px"></select>
+        <input id="af-mi2" placeholder="小米账号（可选）" style="width:180px"/>
+        <button class="btn btn-ghost" onclick="afdianSim(2)">模拟成功单</button>
+        <button class="btn btn-ghost" onclick="afdianSim(3)">模拟撤单</button>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">最近订单</h2></div>
+      <div id="af-orders"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">规格名体检</h2>
+        <span class="sp"></span>
+        <button class="btn btn-ghost btn-sm" onclick="afdianSpecReport()">检查</button>
+      </div>
+      <div class="panel-hint" style="margin:-6px 0 12px">老用户迁移前看一眼：✗ 的规格名意味着那批买家绑定了也拿不到权限</div>
+      <div id="af-spec"></div>
+    </div>`;
+}
+
+// ---------- 客户端诊断
+async function renderEvents(){
+  setTimeout(()=>void loadEvents(), 0);
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">客户端诊断</h1>
+        <p class="page-desc">App 里「哪一步失败了、什么机型、什么错误码」。买家那边只看到一句操作指引，细节只到这里。</p></div>
+      <span class="sp"></span>
+      <div class="form-row" style="margin:0">
+        <select id="ev-days" onchange="loadEvents()">
+          <option value="7">近 7 天</option>
+          <option value="30">近 30 天</option>
+          <option value="1">近 24 小时</option>
+        </select>
+        <button class="btn btn-ghost" onclick="loadEvents()">刷新</button>
+      </div>
+    </div>
+    <div class="panel"><div id="ev-box"></div></div>`;
+}
+
+// ---------- App 发版
+async function renderAppPage(){
+  setTimeout(()=>void loadAppReleases(), 0);
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">App 发版</h1>
+        <p class="page-desc">客户端本体的更新通道：App 里「设置 → 关于应用 → 检查更新」读的就是这里设为当前的版本。
+          永久链接 <span class="mono">/app/latest.apk</span>（302 到当前版，贴爱发电商品详情/自动回复永不过期）。</p></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">版本列表</h2>
+        <span class="sp"></span>
+        <span class="meta" id="app-rel-state"></span>
+      </div>
+      <div id="app-rel-list"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">发布新版本</h2></div>
+      <div class="panel-hint" style="margin:-6px 0 12px">上传签名后的 APK；版本号从文件名自动填，请核对 versionCode 与包内一致。</div>
+      <div class="form-row">
+        <input type="file" id="app-apk" accept=".apk" onchange="appFillVersion()"/>
+        <input id="app-ver" placeholder="0.3.7" style="width:96px"/>
+        <input id="app-code" placeholder="3007" style="width:96px"/>
+        <button class="btn btn-primary" onclick="publishAppRelease()">发布</button>
+      </div>
+      <div class="form-row">
+        <input id="app-notes" placeholder="更新说明（App 的更新提示里给买家看的一两句话）" style="flex:1;min-width:260px"/>
+        <label class="check"><input type="checkbox" id="app-force"/> 同号覆盖</label>
+      </div>
+    </div>`;
+}
+
+/** App 发版：列表 + 发布 + 切当前（客户端本体的更新通道） */
+async function loadAppReleases(){
+  const box = $('app-rel-list');
+  if(!box) return;
+  try{
+    const d = await api('/admin/app/releases');
+    const rel = d.releases||[];
+    box.innerHTML = rel.length ? `<table class="tbl">
+      <thead><tr><th>版本</th><th>versionCode</th><th>大小</th><th>更新说明</th><th>状态</th><th></th><th class="col-actions"></th></tr></thead>
+      <tbody>${rel.map(r=>`<tr>
+        <td><span class="mono">${esc(r.versionName)}</span></td>
+        <td><span class="mono num">${r.versionCode}</span></td>
+        <td><span class="mono num">${fmtSize(r.size)}</span></td>
+        <td class="meta" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.notes||'')}</td>
+        <td>${r.isCurrent? '<span class="badge badge-ok">当前版本</span>' : ''}</td>
+        <td>${r.isCurrent? '' : `<button class="btn btn-ghost btn-sm" onclick="setAppCurrent(${r.id})">设为当前</button>`}</td>
+        <td class="col-actions">
+          <a class="btn btn-link" href="/app/${encodeURIComponent(r.fileName)}" target="_blank">下载</a>
+          ${r.isCurrent? '' : `<button class="btn btn-danger" onclick="delAppRelease(${r.id},'${esc(r.versionName)}')">删除</button>`}</td>
+      </tr>`).join('')}</tbody></table>` : '<span class="meta">还没有发布过版本</span>';
+    const cur = rel.find(r=>r.isCurrent);
+    const st = $('app-rel-state');
+    if(st) st.textContent = cur ? `当前 ${cur.versionName} · sha256 ${cur.sha256.slice(0,8)}…` : '';
+  }catch(e){ box.innerHTML = `<div class="meta">发版列表读取失败：${esc(e.message)}</div>`; }
+}
+function appFillVersion(){
+  const inp = $('app-apk'); const f = inp && inp.files[0];
+  if(!f) return;
+  const m = f.name.match(/(\d+\.\d+\.\d+)/);
+  if(m){
+    $('app-ver').value = m[1];
+    const p = m[1].split('.').map(Number);
+    $('app-code').value = p[0]*1000000 + p[1]*1000 + p[2];
+  }
+}
+async function publishAppRelease(){
+  const inp = $('app-apk'); const f = inp && inp.files[0];
+  if(!f) return toast('先选一个 APK 文件', true);
+  const ver = $('app-ver').value.trim(), code = $('app-code').value.trim();
+  if(!ver || !code) return toast('版本号与 versionCode 都要填', true);
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('version_name', ver);
+  fd.append('version_code', code);
+  fd.append('notes', $('app-notes').value.trim());
+  if($('app-force').checked) fd.append('force', '1');
+  toast('上传中（约 ' + fmtSize(f.size) + '）…');
+  try{
+    const r = await api('/admin/app/releases', {method:'POST', body: fd});
+    toast('已发布 ' + r.versionName);
+    inp.value = ''; $('app-notes').value = ''; $('app-force').checked = false;
+    loadAppReleases();
+  }catch(e){ toast('发布失败：'+e.message, true); }
+}
+async function setAppCurrent(id){
+  try{ await api('/admin/app/releases/'+id+'/current', {method:'POST'}); toast('已切换'); loadAppReleases(); }
+  catch(e){ toast(e.message, true); }
+}
+async function delAppRelease(id, ver){
+  if(!confirm('删除版本 ' + ver + '（连同服务器上的安装包）？')) return;
+  try{ await api('/admin/app/releases/'+id, {method:'DELETE'}); toast('已删除'); loadAppReleases(); }
+  catch(e){ toast(e.message, true); }
+}
+
+/** 爱发电：订单列表 + 绑定 + 模拟订单（联调用） */
+async function loadAfdian(){
+  const box = $('af-orders');
+  if(box){
+    try{
+      const d = await api('/admin/afdian/orders');
+      const orders = d.orders||[];
+      box.innerHTML = orders.length
+        ? `<table class="tbl">
+            <thead><tr><th>订单号</th><th>小米账号</th><th>规格</th><th>状态</th><th>开通</th></tr></thead>
+            <tbody>${orders.slice(0,8).map(o=>`<tr>
+              <td><span class="mono">${esc(o.outTradeNo)}</span></td>
+              <td><span class="mono">${esc(o.miUserId||'未绑定')}</span></td>
+              <td class="meta" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(o.skuName||o.planId||'')}</td>
+              <td>${o.status===2? '<span class="badge badge-ok">已付款</span>' : '<span class="badge badge-err">非成功</span>'}</td>
+              <td>${o.grantedAt? '<span class="badge badge-primary">已开通</span>':'<span class="badge">未开通</span>'}</td>
+            </tr>`).join('')}</tbody></table>
+            <div class="micro" style="margin-top:8px">显示最近 8 条（共 ${orders.length} 条）</div>`
+        : '<span class="meta">还没有订单记录</span>';
+    }catch(e){ box.innerHTML = `<div class="meta">订单读取失败：${esc(e.message)}</div>`; }
+  }
+  // 购买链接下拉（模拟订单用）
+  const sel = $('af-plan');
+  if(sel && STATE.products.length){
+    sel.innerHTML = STATE.products.flatMap(p=>p.variants
+      .filter(v=>(v.afdian||{}).planId)
+      .map(v=>`<option value="${esc(v.afdian.planId)}" data-sku="${esc(v.afdian.sku||'')}">${esc(p.name)} · ${esc(v.name)}</option>`)
+    ).join('') || '<option value="">（还没有配过购买链接）</option>';
+  }
+}
+/** 全量拉取历史订单（后台跑）：点一次 → 轮询进度 → 完了报数 */
+async function afdianBackfill(){
+  const box = $('af-backfill');
+  try{
+    const d = await api('/admin/afdian/sync',{method:'POST',body:JSON.stringify({pages:0})});
+    if(d.backfill === 'already_running'){ box.textContent = '已经在拉了，等它跑完…'; }
+    else { box.textContent = '正在后台拉取全部历史订单…'; }
+    pollBackfill(0);
+  }catch(e){ toast(e.message, true); }
+}
+function pollBackfill(n){
+  const box = $('af-backfill');
+  const tick = async ()=>{
+    try{
+      const d = await api('/admin/afdian/sync-status');
+      if(d.running){ box.textContent = '正在拉取…（订单多时要几分钟，可去忙别的）'; return setTimeout(tick, 4000); }
+      const last = d.last || {};
+      box.textContent = last.ok
+        ? `上次全量拉取：${last.orders} 单，新开通 ${(last.summary&&last.summary.new_grants||[]).length}，未绑定 ${(last.summary&&last.summary.unbound)||0}`
+        : (last.error ? `上次全量拉取失败：${last.error}` : '还没有跑过全量拉取');
+      toast('全量拉取完成');
+      loadAfdian();
+    }catch(e){ box.textContent = ''; }
+  };
+  setTimeout(tick, 1500);
+}
+/** 规格名体检：哪些订单里的规格名认不出对应设备行 */
+async function afdianSpecReport(){
+  const box = $('af-spec');
+  try{
+    const d = await api('/admin/afdian/spec-report');
+    const rows = d.rows || [];
+    if(!rows.length){ box.innerHTML = '<div class="meta">还没有配任何购买链接</div>'; return; }
+    box.innerHTML = rows.map(r=>{
+      const specs = (r.specs||[]).map(sp=>
+        `<div style="margin:4px 0;display:flex;align-items:baseline;gap:8px">
+           <span class="badge ${sp.ok? 'badge-ok':'badge-err'}">${sp.ok?'✓':'✗'}</span>
+           <span class="mono">${esc(sp.name)}</span>
+           <span class="meta">${sp.ok? '→ '+ (sp.to||[]).map(esc).join(' / ') : '没有对应的设备行（这批买家会被跳过）'}</span>
+         </div>`
+      ).join('') || '<div class="meta">这个商品还没有已付款订单</div>';
+      return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">
+        <div style="display:flex;gap:10px;align-items:center">
+          <span class="mono" style="flex:1;color:var(--ink-2)">${esc(r.planId)}</span>
+          <span class="meta num">${r.buyers} 位买家</span>
+        </div>
+        <div class="micro" style="margin-top:3px">已配到：${(r.rows||[]).map(esc).join(' / ') || '无'}</div>
+        <div style="margin-top:6px">${specs}</div>
+      </div>`;
+    }).join('');
+  }catch(e){ box.innerHTML = `<div class="meta">体检失败：${esc(e.message)}</div>`; }
+}
+
+async function afdianSync(){
+  try{
+    const d = await api('/admin/afdian/sync',{method:'POST',body:JSON.stringify({pages:2})});
+    const s = d.summary||{};
+    toast(`同步完成：拉取 ${d.orders} 单，新开通 ${(s.new_grants||[]).length}，收回 ${(s.revoked||[]).length}`);
+    loadAfdian();
+  }catch(e){ toast(e.message, true); }
+}
+async function afdianBind(){
+  const afdian = $('af-uid').value.trim(), mi = $('af-mi').value.trim();
+  if(!afdian || !mi) return toast('爱发电用户 ID 与小米账号都要填', true);
+  try{
+    const d = await api('/admin/afdian/bind',{method:'POST',body:JSON.stringify({afdian_user_id:afdian, mi_user_id:mi})});
+    toast(`已绑定，补处理 ${d.resentOrders||0} 笔历史订单`);
+    loadAfdian();
+  }catch(e){ toast(e.message, true); }
+}
+async function afdianSim(status){
+  const sel = $('af-plan');
+  const plan = sel ? sel.value : '';
+  if(!plan) return toast('先给某个设备行配购买链接', true);
+  const sku = sel.selectedOptions[0]?.dataset?.sku || null;
+  const body = {afdian_user_id:$('af-uid').value.trim()||null, plan_id:plan, sku,
+                status, mi_user_id:$('af-mi2').value.trim()||null};
+  try{
+    const d = await api('/admin/afdian/simulate',{method:'POST',body:JSON.stringify(body)});
+    const s = d.summary||{};
+    toast(`模拟订单 → 新开通 ${(s.new_grants||[]).length}，收回 ${(s.revoked||[]).length}，未绑定 ${s.unbound||0}`);
+    if(d.hint) console.info('[afdian]', d.hint);
+    loadAfdian();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function saveGroup(id){
+  const name = $('gn-'+id).value.trim();
+  const models = $('gm-'+id).value.split(/[、,，]/).map(s=>s.trim()).filter(Boolean);
+  try{ await api('/admin/device-groups',{method:'POST',body:JSON.stringify({id, name, models})}); toast('已保存'); }
+  catch(e){ toast(e.message, true); }
+}
+function addGroup(){
+  const id = prompt('设备组 id（英文，如 rw7）'); if(!id) return;
+  const name = prompt('组名（如 红米手表7）'); if(!name) return;
+  const models = (prompt('包含型号，用「、」分隔')||'').split(/[、,，]/).map(s=>s.trim()).filter(Boolean);
+  api('/admin/device-groups',{method:'POST',body:JSON.stringify({id, name, models})})
+    .then(()=>{ toast('已新增'); render(); }).catch(e=>toast(e.message,true));
+}
+
+async function loadStats(){
+  try{ const s = await api('/admin/stats');
+    $('statLine').innerHTML = `<span class="stat">${s.resources} 个资源</span><span class="stat">${s.packages} 个包体</span><span class="stat">${s.activeLicenses} 个授权</span>`;
+    renderDevBanner(s.devBind);
+    renderDiagLine(s.failEvents7d|0);
+  }catch(e){}
+}
+
+/** 失败打点提示：>0 就在顶栏亮一条（以前这类信号在 App 里就断了，卖家看不到） */
+function renderDiagLine(n){
+  const el = $('diagLine'); if(!el) return;
+  if(n > 0){ el.style.display=''; el.textContent = `近 7 天 ${n} 条客户端失败 ›`; }
+  else { el.style.display='none'; }
+}
+
+function fmtTs(ts){
+  if(!ts) return '';
+  const d = new Date(ts*1000), p = n=>String(n).padStart(2,'0');
+  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 客户端诊断：App 上报的失败打点（按步骤+错误码聚合，再给最近几条原文） */
+async function loadEvents(){
+  const box = $('ev-box'); if(!box) return;
+  const days = ($('ev-days')||{}).value || 7;
+  box.innerHTML = '<div class="meta">读取中…</div>';
+  try{
+    const d = await api(`/admin/events?days=${encodeURIComponent(days)}&limit=20`);
+    if(!d.total){ box.innerHTML = `<div class="meta">近 ${days} 天没有失败上报 👍</div>`; return; }
+    const agg = `<table class="tbl">
+      <thead><tr><th style="width:110px">步骤</th><th style="width:140px">错误码</th><th style="width:70px">次数</th><th>详情</th><th style="width:120px">最近一次</th></tr></thead>
+      <tbody>${(d.byStep||[]).map(x=>`<tr>
+        <td><span class="mono">${esc(x.step)}</span></td>
+        <td><span class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(x.code||'—')}</span></td>
+        <td><span class="num">${x.count} 次</span></td>
+        <td class="meta">${esc([x.deviceModel, x.appVersion?('v'+x.appVersion):'', x.message].filter(Boolean).join(' · '))}</td>
+        <td class="meta num">${fmtTs(x.lastTs)}</td>
+      </tr>`).join('')}</tbody></table>`;
+    const recent = (d.recent||[]).map(x=>
+      `<div class="meta num" style="padding:3px 0">${fmtTs(x.ts)} · ${esc(x.step)} · ${esc(x.code||'—')} · ${esc([x.deviceModel, x.message].filter(Boolean).join(' · '))}</div>`).join('');
+    box.innerHTML = `<div class="meta" style="margin-bottom:10px">近 ${days} 天共 ${d.total} 条；按次数排序，先修第一条</div>
+      ${agg}
+      <details style="margin-top:12px"><summary>最近 ${(d.recent||[]).length} 条原文</summary><div style="margin-top:6px">${recent}</div></details>`;
+  }catch(e){ box.innerHTML = `<div class="meta">读取失败：${esc(e.message)}</div>`; }
+}
+
+/** 联调模式警示条：开着时任何人调 /v1/bind/dev 都能免费拿到全部资源（发布阻断项，最容易被忘） */
+function renderDevBanner(d){
+  const box = $('devBanner'); if(!box) return;
+  box.innerHTML = (d && d.on)
+    ? `<div class="dev-banner" style="margin-bottom:16px">⚠️ 联调模式开启中（${esc(d.until_text || '未设到期时间')} 自动关闭）——
+        这段时间任何人调用绑定接口都能免费拿到全部资源，不要在这个状态下把 App 发给陌生人。</div>`
+    : '';
+}
+async function loadAll(){
+  if(!token()) return render();
+  loadStats();
+  try{ const g = await api('/admin/device-groups'); STATE.groups = g.deviceGroups; }catch(e){}
+  const d = await api('/admin/products').catch(()=>null);
+  if(d) STATE.products = d.products;
+  render();
+}
+window.addEventListener('load', ()=>{ $('token').value = token(); loadAll(); });
+</script>
+</body>
+</html>

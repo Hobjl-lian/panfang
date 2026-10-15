@@ -1,0 +1,19 @@
+[Unit]
+Description=盘坊授权服务 (wf-auth-server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/wf-auth.env
+ExecStart=/usr/local/bin/wf-auth-server
+Restart=always
+RestartSec=3
+# 只监听本机，由 Nginx 反代并做 TLS
+Environment=WF_BIND=127.0.0.1:8787
+WorkingDirectory=/var/lib/wf-auth
+User=root
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
