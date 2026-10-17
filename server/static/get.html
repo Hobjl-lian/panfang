@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>下载盘坊 · 安卓表盘安装工具</title>
+<meta name="description" content="盘坊（Panfang）安卓版下载：把已购买的小米手环表盘安装到手环上。非官方第三方工具。"/>
+<style>
+  :root{
+    --ink:#0C0D0E;--sub:rgba(12,13,14,.62);--line:rgba(12,13,14,.10);
+    --blue:#4361EE;--bg:#F5F6F9;--card:#fff;--tip:#FFF8E8;--tip-line:rgba(180,120,0,.18);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{--ink:#F2F3F5;--sub:rgba(242,243,245,.62);--line:rgba(255,255,255,.12);
+          --bg:#111214;--card:#191A1C;--tip:#241F13;--tip-line:rgba(220,160,60,.25);}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.7 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+       -webkit-font-smoothing:antialiased}
+  main{max-width:640px;margin:0 auto;padding:32px 20px 56px}
+  h1{font-size:26px;line-height:1.3;letter-spacing:-.02em;margin:0 0 6px;font-weight:600}
+  h2{font-size:17px;margin:32px 0 10px;font-weight:600}
+  p,li{color:var(--ink)}
+  .sub{color:var(--sub)}
+  .lead{color:var(--sub);font-size:15px;margin:0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:18px 0}
+  .dl{display:flex;align-items:center;justify-content:space-between;gap:14px;
+      background:var(--blue);color:#fff;text-decoration:none;border-radius:10px;
+      padding:14px 18px;margin:20px 0 10px;font-weight:600;font-size:16px}
+  .dl:hover{filter:brightness(1.06)}
+  .dl small{display:block;font-weight:400;font-size:12px;opacity:.85;margin-top:2px}
+  .dl .arrow{font-size:20px;line-height:1}
+  .meta{color:var(--sub);font-size:13px;margin:0}
+  .tip{background:var(--tip);border:1px solid var(--tip-line);border-radius:10px;
+       padding:12px 14px;margin:16px 0;font-size:14px;color:var(--ink)}
+  .tip b{font-weight:600}
+  ul{padding-left:20px;margin:8px 0}
+  li{margin:4px 0}
+  ol.steps{list-style:none;padding:0;margin:0;counter-reset:step}
+  ol.steps li{counter-increment:step;position:relative;padding:0 0 0 38px;margin:0 0 16px}
+  ol.steps li:last-child{margin-bottom:0}
+  ol.steps li::before{content:counter(step);position:absolute;left:0;top:1px;
+      width:24px;height:24px;border-radius:7px;background:var(--blue);color:#fff;
+      font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:center}
+  ol.steps b{font-weight:600}
+  ol.steps span{display:block;color:var(--sub);font-size:14px;margin-top:2px}
+  details{border-top:1px solid var(--line);padding:12px 0}
+  details:first-of-type{border-top:0;padding-top:2px}
+  details summary{cursor:pointer;font-weight:600;font-size:15px;list-style:none}
+  details summary::-webkit-details-marker{display:none}
+  details summary::after{content:"+";float:right;color:var(--sub);font-weight:400}
+  details[open] summary::after{content:"−"}
+  details p{margin:8px 0 2px;color:var(--sub);font-size:14px}
+  code{background:rgba(127,127,127,.14);border-radius:4px;padding:1px 5px;font-size:13px}
+  a{color:var(--blue);text-decoration:none}
+  a:hover{text-decoration:underline}
+  footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--line);
+         color:var(--sub);font-size:13px;line-height:1.9}
+  footer .links{margin-bottom:6px}
+</style>
+</head>
+<body>
+<main>
+  <h1>下载盘坊</h1>
+  <p class="lead">在安卓手机上安装你已购买的小米手环 / 红米手表表盘。<br/>非官方第三方工具，与小米公司无关。</p>
+
+  <a class="dl" href="/app/latest.apk">
+    <span>下载安卓版
+      <small>v{{VERSION}} · {{SIZE_MB}} MB · 更新于 {{UPDATED_AT}}</small>
+    </span>
+    <span class="arrow">↓</span>
+  </a>
+  <p class="meta">下载后按系统提示安装。App 内「设置 → 关于应用」可以检查后续更新。</p>
+  {{NOTES_BLOCK}}
+
+  <div class="tip">
+    <b>在微信 / QQ 里打开本页？</b> 请点右上角「…」→「在浏览器打开」再下载，否则安装包会被拦截。
+  </div>
+
+  <h2>第一次用：4 步上手</h2>
+  <ol class="steps">
+    <li><b>用小米账号登录</b>
+      <span>只用于读取你账号下的手环列表。密码不会保存，也不会发到我们的服务器（直连小米登录）。</span></li>
+    <li><b>让手环进入「连接新手机」</b>
+      <span>手环上打开：设置 → 系统（部分版本为系统操作）→ 连接新手机，然后回到 App 点连接。</span></li>
+    <li><b>登录爱发电账号</b>
+      <span>设置 → 爱发电账号 → 登录。登录后，「我的表盘」会列出你买过的表盘。</span></li>
+    <li><b>安装已购表盘</b>
+      <span>首页 →「安装已购表盘」→ 勾选要装的包体 → 安装。装好后可以在管理页设为当前表盘。</span></li>
+  </ol>
+
+  <h2>系统要求</h2>
+  <ul>
+    <li>Android 7.0 及以上，<b>64 位（arm64）</b>机型；32 位老手机无法安装。</li>
+    <li>系统 WebView 版本 <b>111 及以上</b>。太低时 App 会给出更新提示（在应用商店更新「Android System WebView」即可）。</li>
+    <li>支持：小米手环 9 / 10 / 11、小米手环 9 Pro / 10 Pro、红米手表 5 / 6。以「我的表盘」里显示的可用表盘为准。</li>
+    <li><b>iPhone / iPad 暂不支持</b>：iOS 不开放手环的传输通道。</li>
+  </ul>
+
+  <h2>常见问题</h2>
+
+  <details>
+    <summary>点下载没反应，或提示「已阻止下载」</summary>
+    <p>多数是微信 / QQ 内置浏览器拦截了安装包。点右上角「…」→「在浏览器打开」，再用手机浏览器下载。</p>
+  </details>
+
+  <details>
+    <summary>安装时提示「未知来源」「未备案」或「风险应用」</summary>
+    <p>本 App 是个人开发的第三方工具，没有上架应用商店，出现这类提示属正常。在系统弹窗里选择「继续安装」/「仍要安装」即可。安装包来自本域名，下载链接是固定地址。</p>
+  </details>
+
+  <details>
+    <summary>小米手机提示「纯净模式」拦截</summary>
+    <p>在系统设置中关闭「纯净模式」，或在拦截弹窗里选择「单次授权安装」。装完后可以再打开纯净模式。</p>
+  </details>
+
+  <details>
+    <summary>连不上手环</summary>
+    <p>最常见的原因是手环没有进入「连接新手机」模式。手环上打开：设置 → 系统（部分版本为系统操作）→ 连接新手机，保持在该界面，再回 App 连接。连不上时 App 里也有「看怎么连」的分步帮助。</p>
+  </details>
+
+  <details>
+    <summary>为什么必须登录小米账号？安全吗</summary>
+    <p>手环列表存在小米账号里，登录后才能读到你自己的设备。账号密码只在本机用于直连小米登录接口换取登录态，<b>不会被保存</b>，也不会经过我们的服务器。登录凭证保存在手机的应用私有目录，退出登录即清除。</p>
+  </details>
+
+  <details>
+    <summary>装完手环上没有变化</summary>
+    <p>先点亮手环屏幕确认。如果还是旧表盘，打开 App 管理页，对刚装好的表盘点「设为当前」。</p>
+  </details>
+
+  <details>
+    <summary>换手机了怎么办</summary>
+    <p>同一份表盘最多可在 2 台设备上使用。换机后如果提示设备数已满，请私信我解绑旧设备，再在新手机上安装。</p>
+  </details>
+
+  <details>
+    <summary>买错了 / 装不上能退款吗</summary>
+    <p>表盘属于数字化商品，付款走爱发电，<b>不支持退款</b>。如果是装不上，请私信我说明机型和报错，我会协助排查。</p>
+  </details>
+
+  <footer>
+    <div class="links"><a href="/privacy">隐私政策</a> · <a href="/terms">用户协议</a></div>
+    <div><a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener nofollow">粤ICP备2026135374号-1</a></div>
+    <div><a href="https://beian.mps.gov.cn/#/query/webSearch?code=44060602003591" target="_blank" rel="noopener nofollow">粤公网安备44060602003591号</a></div>
+  </footer>
+</main>
+</body>
+</html>

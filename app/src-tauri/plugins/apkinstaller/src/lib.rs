@@ -38,6 +38,12 @@ pub struct ApkInstaller<R: Runtime> {
     handle: PluginHandle<R>,
 }
 
+/// 安卓：真正调到 Kotlin 侧。
+///
+/// ⚠️ `run_mobile_plugin` 只在 mobile 目标上存在 —— 桌面构建必须走下面那套空实现，
+/// 否则 `cargo test`/`cargo build`（Windows 主机）直接编译不过，而 binface 回归
+/// 与单元测试都要在主机上编这个 crate。
+#[cfg(target_os = "android")]
 impl<R: Runtime> ApkInstaller<R> {
     /// 自己的 versionCode（拿不到算 0）+ 未知来源授权状态。
     pub fn status(&self) -> Result<ApkStatus, String> {
@@ -73,6 +79,23 @@ impl<R: Runtime> ApkInstaller<R> {
         self.handle
             .run_mobile_plugin::<()>("install", InstallArg { path })
             .map_err(|e| e.to_string())
+    }
+}
+
+/// 桌面：编译通过、调用即报错（系统安装器只在安卓上有意义）。
+#[cfg(not(target_os = "android"))]
+impl<R: Runtime> ApkInstaller<R> {
+    pub fn status(&self) -> Result<ApkStatus, String> {
+        Ok(ApkStatus::default())
+    }
+    pub fn open_install_settings(&self) -> Result<(), String> {
+        Err("应用内安装仅安卓可用".into())
+    }
+    pub fn internal_cache_dir(&self) -> Result<String, String> {
+        Err("应用内安装仅安卓可用".into())
+    }
+    pub fn install(&self, _path: &str) -> Result<(), String> {
+        Err("应用内安装仅安卓可用".into())
     }
 }
 

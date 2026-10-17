@@ -253,6 +253,137 @@ fn main() {
                 Err(e) => { eprintln!("推导失败: {e:#}"); std::process::exit(1); }
             }
         }
+        "generator" => {
+            // binface generator <bin> <config.json> <out.png> [photos(逗号分隔)] [色号] [params.json]
+            //
+            // 按后台方案离线合成成品壁纸（与 App 内同一条代码路径）：
+            //   · 用 <bin> 校验「方案 vs 表盘」是否精确对应（画布尺寸必须一致）
+            //   · 素材（相框 PNG）按 config.json 里的相对路径、相对 config.json 所在目录找
+            //   · [色号] 取 frame.colors[].i 对应的那张素材（缺省第一个）
+            //   · [params.json] 是 GenParams 的数组（与 photos 一一对应），不传用配置默认值
+            let cfg_path = args.get(3).cloned().unwrap_or_else(|| "config.json".into());
+            let out = args.get(4).cloned().unwrap_or_else(|| "generator.png".into());
+            let cfg_raw = match std::fs::read_to_string(&cfg_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("配置读取失败 {cfg_path}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let cfg: wf_installer_lib::wallpaper_gen::GenConfig = match serde_json::from_str(&cfg_raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("配置解析失败: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = cfg.check() {
+                eprintln!("配置不合法: {e:#}");
+                std::process::exit(1);
+            }
+            // 方案 vs 表盘：画布尺寸必须与 .bin 的模型一致（9 Pro 不能套 10 的方案）
+            let model = match wf_installer_lib::watchface_render::derive_model(&data, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("推导失败: {e:#}");
+                    std::process::exit(1);
+                }
+            };
+            if model.width != cfg.canvas.w || model.height != cfg.canvas.h {
+                eprintln!(
+                    "方案与表盘不对应：表盘画布 {}x{}，方案画布 {}x{}",
+                    model.width, model.height, cfg.canvas.w, cfg.canvas.h
+                );
+                std::process::exit(1);
+            }
+            if model.photo_album == false {
+                eprintln!("提示：这个 .bin 没被判成照片表盘（画布对得上就继续）");
+            }
+
+            // 照片
+            let photo_paths: Vec<PathBuf> = args
+                .get(5)
+                .map(|s| {
+                    s.split(',')
+                        .map(|t| t.trim())
+                        .filter(|t| !t.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut decoded: Vec<Option<(Vec<u8>, u32, u32)>> = Vec::new();
+            for p in &photo_paths {
+                match image::open(p) {
+                    Ok(im) => {
+                        let rgba = im.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        println!("照片 {} → {}x{}", p.display(), w, h);
+                        decoded.push(Some((rgba.into_raw(), w, h)));
+                    }
+                    Err(e) => {
+                        eprintln!("照片打不开 {}: {e}", p.display());
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            // 参数
+            let params: Vec<wf_installer_lib::wallpaper_gen::GenParams> = args
+                .get(7)
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| serde_json::from_str::<Vec<_>>(&s).ok())
+                .unwrap_or_default();
+
+            // 素材
+            let cfg_dir = PathBuf::from(&cfg_path)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let color_i: Option<i64> = args.get(6).and_then(|s| s.trim().parse().ok());
+            let mut frame_asset: Option<(Vec<u8>, u32, u32)> = None;
+            if let Some(c) = cfg.color(color_i) {
+                let p = cfg_dir.join(&c.src);
+                match image::open(&p) {
+                    Ok(im) => {
+                        let rgba = im.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        println!("相框素材 {} → {}x{}", p.display(), w, h);
+                        if w != cfg.canvas.w || h != cfg.canvas.h {
+                            println!("  ⚠ 素材尺寸与画布不一致，会按居中贴上");
+                        }
+                        frame_asset = Some((rgba.into_raw(), w, h));
+                    }
+                    Err(e) => {
+                        eprintln!("相框素材打不开 {}: {e}", p.display());
+                        std::process::exit(1);
+                    }
+                }
+            } else if cfg.frame.is_some() {
+                eprintln!("方案里有相框，但 colors 为空（或色号不存在）");
+                std::process::exit(1);
+            }
+
+            let inputs: Vec<wf_installer_lib::wallpaper_gen::PhotoInput> = (0..cfg.photo_count())
+                .map(|i| wf_installer_lib::wallpaper_gen::PhotoInput {
+                    rgba: decoded.get(i).and_then(|d| d.as_ref()).map(|(d, w, h)| (d.as_slice(), *w, *h)),
+                    params: params.get(i).cloned().unwrap_or_default(),
+                })
+                .collect();
+            let frame_ref = frame_asset.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h));
+            match wf_installer_lib::wallpaper_gen::compose(&cfg, &inputs, frame_ref) {
+                Ok((rgba, w, h)) => {
+                    let img = image::RgbaImage::from_raw(w, h, rgba).unwrap();
+                    img.save_with_format(&out, image::ImageFormat::Png)
+                        .map_err(|e| format!("保存失败: {e}"))
+                        .unwrap();
+                    println!("已生成壁纸 {w}x{h} → {out}");
+                }
+                Err(e) => {
+                    eprintln!("生成失败: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
         other => {
             eprintln!("未知命令: {other}");
             std::process::exit(2);

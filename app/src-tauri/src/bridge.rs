@@ -522,15 +522,29 @@ pub(crate) async fn install_file_bytes_id(
     let result = install_future.await;
     drop(progress_tx);
     let _ = forward.await;
+    let mut resolved_id = watchface_id;
     if result.is_ok() {
-        if let (Some(bytes), Some(id)) = (archive_copy, watchface_id.as_deref()) {
+        // 表盘 id 是设备往返解析出来的，偶发失败不该让「装成功」变成「失败」：
+        // 装完再补两次（留档与「设为当前」都靠它；都没有就只是少这两步，安装结果不受影响）
+        if resolved_id.is_none() {
+            if let Some(bytes) = archive_copy.as_ref() {
+                for _ in 0..2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Some(id) = resolve_watchface_id(addr, bytes).await {
+                        resolved_id = Some(id);
+                        break;
+                    }
+                }
+            }
+        }
+        if let (Some(bytes), Some(id)) = (archive_copy, resolved_id.as_deref()) {
             if let Err(e) = archive_watchface(app, addr, id, &bytes, &ext) {
                 log::warn!("[install] 留档失败: {e:#}");
             }
         }
     }
     result
-        .map(|_: ()| watchface_id)
+        .map(|_: ()| resolved_id)
         .map_err(|e| format!("{e}"))
 }
 
@@ -1224,6 +1238,16 @@ pub async fn watchface_apply_edit(
             log::info!("[edit] 设备要求 PNG(6)，原样上传 {} 字节", png.len());
             png
         } else {
+            // 旧版本存下的相册里可能有未缩过的手机原图（新选图已缩到 2560）：
+            // 解码前先挡超大图，否则一张 4000 万像素就 ~160MB，低内存手机上会被系统杀掉。
+            let dims = image::ImageReader::new(std::io::Cursor::new(&png))
+                .with_guessed_format()
+                .map_err(|e| format!("壁纸 #{i} 解析失败: {e}"))?
+                .into_dimensions()
+                .map_err(|e| format!("壁纸 #{i} 解析失败: {e}"))?;
+            if dims.0 as u64 * dims.1 as u64 > 24_000_000 {
+                return Err(format!("壁纸 #{i} 分辨率太高，请换一张照片"));
+            }
             let img =
                 image::load_from_memory(&png).map_err(|e| format!("壁纸 #{i} PNG 解析失败: {e}"))?;
             let rgba = img.to_rgba8();

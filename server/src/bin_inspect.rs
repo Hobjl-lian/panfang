@@ -49,6 +49,14 @@ pub struct BinInfo {
     pub canvas: Option<(u32, u32)>,
     /// 由画布尺寸给出的设备族提示（用于自动匹配设备变体）
     pub device_hints: Vec<String>,
+    /// **是不是照片表盘**（能在手环上换成用户自己拍的照片的那种）。
+    ///
+    /// 判据 = 任一亮屏样式的 `backImageId` **高字节为 `0x82`**（可替换的照片容器）；
+    /// 息屏样式与普通静态背景都是 `0x80`。与 App 端同一个判据
+    /// （`app/src-tauri/src/watchface_render.rs` 的 `photo_album`，全语料 15/15 对上 AstroBox
+    /// 反编译出的 `watchfaceType`）。**这是内容判据，不看表盘名字** —— 名字里没有
+    /// 「照片表盘」的（如《OS27模块》）照样能判出来。
+    pub photo_album: bool,
     /// 内容哈希（sha256 hex）
     pub sha256: String,
     pub size: u64,
@@ -223,6 +231,10 @@ pub fn inspect(data: &[u8]) -> Result<BinInfo> {
     let shift = (data[0x18] as usize) + (data[0x1D] as usize);
     let styles = walk_styles(data, style_count, shift);
     let canvas = canvas_of(data, &styles);
+    // 照片表盘：任一亮屏样式的 backImageId 高字节 0x82（息屏/普通背景都是 0x80）
+    let photo_album = styles
+        .iter()
+        .any(|s| ((s.back_image_id >> 24) & 0xFF) == 0x82);
 
     Ok(BinInfo {
         fmt_version: format!("0x{fmt_version_raw:08X}"),
@@ -234,6 +246,7 @@ pub fn inspect(data: &[u8]) -> Result<BinInfo> {
         name: cstr64(data, 0x68),
         canvas,
         device_hints: device_hints(canvas),
+        photo_album,
         sha256: crate::crypto::sha256_hex(data),
         size: data.len() as u64,
     })

@@ -31,6 +31,10 @@ TOML
 fi
 
 # 1) Rust 工具链（如果没有就装）
+#    非交互 SSH 不会 source .bashrc：先把已有的 .cargo/env 加进 PATH，否则
+#    `command -v cargo` 找不到 → 误判成没装 → 重新下载 rustup，网络一抖就失败（exit 28）。
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env" 2>/dev/null || true
 if ! command -v cargo >/dev/null 2>&1; then
   echo "==> 安装 Rust 工具链"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -76,6 +80,13 @@ fi
 chown -R wf:wf "$DATA_DIR"
 find "$DATA_DIR" -type d -exec chmod 750 {} \;
 find "$DATA_DIR" -type f -exec chmod 640 {} \;
+# App 安装包由 nginx 直接静态分发（见 nginx-api.conf 的 /app/）：
+# 数据根目录要可穿越（751），app/ 目录 755、文件 644；cipher/ 仍保持 750/640（密文只给服务用户读）。
+chmod 751 "$DATA_DIR"
+if [ -d "$DATA_DIR/app" ]; then
+  find "$DATA_DIR/app" -type d -exec chmod 755 {} \;
+  find "$DATA_DIR/app" -type f -exec chmod 644 {} \;
+fi
 echo "==> 数据目录属主：$(stat -c '%U:%G %a' "$DATA_DIR")"
 
 install -m 0644 "$SRC_DIR/deploy/wf-auth.service" /etc/systemd/system/wf-auth.service

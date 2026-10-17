@@ -297,6 +297,130 @@ export function cropToTransform(
   };
 }
 
+// --------------------------------------------------------------- 壁纸生成器
+// 形状与 Rust `wallpaper_gen` 一一对应（服务端下发的方案 → 界面按它长控件）。
+
+/** 一个可调量的范围与默认值（`adjustable: false` = 界面上不出这个控件） */
+export interface GenNumCtl {
+  default: number;
+  min: number;
+  max: number;
+  step: number;
+  adjustable: boolean;
+}
+export interface GenBoolCtl {
+  default: boolean;
+  adjustable: boolean;
+}
+/** 一张照片的六个基础功能 */
+export interface GenControls {
+  scale: GenNumCtl;
+  rotation: GenNumCtl;
+  darken: GenNumCtl;
+  blur: GenNumCtl;
+  flipX: GenBoolCtl;
+  flipY: GenBoolCtl;
+}
+/** 相框窗口：位置是未旋转时的左上角，`rot` 绕窗口中心（框内照片跟着一起倾斜） */
+export interface GenWindow {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  radius: number;
+  rot: number;
+}
+export interface GenColorEntry {
+  i: number;
+  name: string;
+  swatch: string;
+  src: string;
+}
+export interface GenFrame {
+  window?: GenWindow | null;
+  colors: GenColorEntry[];
+}
+export interface GenPhoto {
+  id: string;
+  label: string;
+  /** canvas = 铺整张画布（底图）；frame = 放进相框窗口 */
+  base: "canvas" | "frame";
+  controls: GenControls;
+}
+export interface GenConfig {
+  version: number;
+  canvas: { w: number; h: number; radius?: number };
+  photos: GenPhoto[];
+  frame?: GenFrame | null;
+}
+/** 用户在界面上调出来的值（缺省 = 用方案里的默认值） */
+export interface GenParams {
+  scale?: number;
+  rotation?: number;
+  darken?: number;
+  blur?: number;
+  flipX?: boolean;
+  flipY?: boolean;
+  /** 拖动平移（参考框像素；相框里那张的位移记在画框的旋转坐标系里） */
+  dx?: number;
+  dy?: number;
+}
+/** `watchface_generator_plan` 的返回 */
+export interface GenPlan {
+  enabled: boolean;
+  watchfaceId?: string;
+  config?: GenConfig;
+  /** true = 用的本机缓存（断网） */
+  offline?: boolean;
+  /** 没下齐的素材名 */
+  missing?: string[];
+  /** enabled=false 的原因（没有方案 / 方案与表盘对不上） */
+  reason?: string;
+}
+
+/** 取用户值（缺省用方案默认值）并夹进方案声明的范围（与 Rust `NumCtl::resolve` 一致） */
+export function resolveCtl(ctl: GenNumCtl, v: number | undefined): number {
+  const lo = Math.min(ctl.min, ctl.max);
+  const hi = Math.max(ctl.min, ctl.max);
+  return Math.min(hi, Math.max(lo, v ?? ctl.default));
+}
+
+/** 一张照片在界面上的初始参数 = 方案里的默认值 */
+export function defaultGenParams(photo: GenPhoto): GenParams {
+  const c = photo.controls;
+  return {
+    scale: c.scale.default,
+    rotation: c.rotation.default,
+    darken: c.darken.default,
+    blur: c.blur.default,
+    flipX: c.flipX.default,
+    flipY: c.flipY.default,
+    dx: 0,
+    dy: 0,
+  };
+}
+
+/**
+ * 拖拽位移的反旋转（照抄底图网站 `getDragDelta`）：
+ * 相框有倾角时，屏幕上拖的方向与画框内的方向差一个 `rot`。
+ */
+export function rotateVec(x: number, y: number, deg: number): { x: number; y: number } {
+  if (!deg) return { x, y };
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  return { x: x * cos - y * sin, y: x * sin + y * cos };
+}
+
+/** 方案里某张照片的参考框（底图 = 整画布；框内照片 = 相框窗口） */
+export function genRefFrameOf(cfg: GenConfig, photo: GenPhoto) {
+  if (photo.base === "frame" && cfg.frame?.window) {
+    const w = cfg.frame.window;
+    return { w: w.w, h: w.h };
+  }
+  return { w: cfg.canvas.w, h: cfg.canvas.h };
+}
+
 /**
  * 照片表盘判据（与 Rust `derive_model` 完全一致）：
  * 任意**亮屏**样式（previewOffset ≠ 0）的 backImageId 高字节 == 0x82。

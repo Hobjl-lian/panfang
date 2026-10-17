@@ -87,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let bg_state = state.clone();
 
+    // 存量包体没有「按包版本」：启动时解密回填一次（单条失败只跳过，不影响启动）
+    wf_auth_server::backfill::backfill_bin_versions(&state);
+
     // 首次启动：若无任何产品，打印一条指引
     {
         let conn = state.conn();
@@ -122,6 +125,17 @@ async fn main() -> anyhow::Result<()> {
         // 包体
         .route("/inspect", post(api_admin::inspect_upload))
         .route("/versions/upload", post(api_admin::upload_version))
+        .route("/files/:id", axum::routing::delete(api_admin::delete_file))
+        // 照片表盘（判据来自 .bin 内容，不看名字；可人工纠正）
+        .route("/photo-albums", get(api_admin::photo_albums_list))
+        .route("/photo-album", post(api_admin::set_photo_album))
+        // 壁纸方案（照片表盘的壁纸生成器）：配置 + 素材
+        .route("/editor-templates", get(api_admin::editor_list))
+        .route("/editor-template", post(api_admin::editor_save))
+        .route(
+            "/editor-template/:watchface_id",
+            get(api_admin::editor_get).delete(api_admin::editor_delete),
+        )
         // 手动开通（售后/联调兜底）
         .route("/grant", post(api_admin::grant))
         // 某账号永久全资源（含以后新增的产品）
@@ -169,7 +183,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/manifest", get(api_client::manifest))
         .route("/download", post(api_client::download))
         // 失败打点：不需要登录（最早那批失败发生在拿到令牌之前）
-        .route("/events", post(api_client::report_events));
+        .route("/events", post(api_client::report_events))
+        // 壁纸方案（照片表盘的壁纸生成器）：配置 + 素材清单，不需要登录（不是付费内容）
+        .route("/editor-template", get(api_client::editor_template));
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -177,11 +193,16 @@ async fn main() -> anyhow::Result<()> {
         // 隐私政策与用户协议：App 内「关于」与登录/购买页都指向这里（已备案域名下的静态页）
         .route("/privacy", get(|| async { axum::response::Html(PRIVACY_HTML) }))
         .route("/terms", get(|| async { axum::response::Html(TERMS_HTML) }))
+        // 买家下载说明页：爱发电商品详情 / 自动回复里贴这条（版本号取当前发版）
+        .route("/get", get(api_client::get_page))
+        .route("/download", get(api_client::get_page))
         .route("/dl/:file_id", get(api_client::download_link))
         // App 自更新：latest 给 App 检查更新；latest.apk 是永久链接（302 到当前版）；
         // app/<file> 直发安装包（客户端本体免费，公开可下）
         .route("/app/latest.apk", get(api_client::app_latest_apk))
         .route("/app/:file", get(api_client::app_file))
+        // 壁纸方案的素材（模板 PNG，可能多色号）：公开静态，App 按相对路径拼过来
+        .route("/wp/:watchface_id/:file", get(api_client::editor_asset))
         .nest("/v1", client_routes)
         .nest("/admin", admin_routes)
         // 一次请求可能带多个包（同一设备拆成两个独立表盘）→ 上限按「单包 64MB × 3」留余量
@@ -218,13 +239,24 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 match afdian::sync_once(&st, 5).await {
-                    Ok((sum, n)) => println!(
-                        "[afdian] 定时同步：拉取 {} 单，新开通 {}，收回 {}，未绑定 {}",
-                        n,
-                        sum.new_grants.len(),
-                        sum.revoked.len(),
-                        sum.unbound
-                    ),
+                    Ok((sum, n)) => {
+                        println!(
+                            "[afdian] 定时同步：拉取 {} 单，新开通 {}，收回 {}，未绑定 {}",
+                            n,
+                            sum.new_grants.len(),
+                            sum.revoked.len(),
+                            sum.unbound
+                        );
+                        // 换绑后同步又遇到已归属别的账号的订单 → 已拒绝。
+                        // 正常恒为 0；非 0 说明有人在把爱发电账号换绑到别的账号上试图复制授权。
+                        if !sum.replayed.is_empty() {
+                            println!(
+                                "[afdian] ⚠️ 本轮拒绝 {} 笔订单重放（权益已归属其他账号）：{:?}",
+                                sum.replayed.len(),
+                                sum.replayed
+                            );
+                        }
+                    }
                     Err(e) => println!("[afdian] 定时同步失败：{e:#}"),
                 }
             }
@@ -272,8 +304,12 @@ async fn log_requests(
 }
 
 fn mask(s: &str) -> String {
-    if s.len() <= 4 {
+    // 按字符截断（环境变量理论上可能是非 ASCII；按字节切会 panic）
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= 4 {
         return "****".into();
     }
-    format!("{}****{}", &s[..2], &s[s.len() - 2..])
+    let head: String = chars[..2].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}****{tail}")
 }

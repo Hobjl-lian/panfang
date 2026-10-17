@@ -4,6 +4,16 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>盘坊 · 管理后台</title>
+<script>
+/* 深色模式防闪白：首帧渲染前就定好 data-theme（三态切换的完整逻辑在页尾主脚本里） */
+(function(){
+  try{
+    var m = localStorage.getItem('wf_admin_theme') || 'system';
+    var dark = m === 'dark' || (m !== 'light' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  }catch(e){}
+})();
+</script>
 <style>
   /* ===== token：一套 sans + 一套 mono；字重只有 400/500/600，不用 700 ===== */
   :root{
@@ -17,6 +27,49 @@
     --line:rgba(23,25,30,.09);
     --ok:#157F3D;
     --danger:#C7332B;
+    /* 深浅两套共用的派生色（各组件写死色的收敛） */
+    --on-primary:#fff;            /* 主色上的文字 */
+    --hover-bg:#FAFBFD;           /* 表格行 hover */
+    --ghost-hover:#E9EBEF;        /* 次按钮 hover */
+    --danger-weak:rgba(199,51,43,.07);   /* 危险按钮 hover */
+    --chip-bg:#F2F3F7;            /* 标签小片 */
+    --drop-bg:#FBFCFD;            /* 拖拽区底 */
+    --drop-hot-bg:#F6F8FF;        /* 拖拽区命中 */
+    --mask:rgba(23,25,30,.42);    /* 弹窗遮罩 */
+    --toast-bg:#17191E;           /* toast 底 */
+    --toast-ink:#fff;
+    --ok-weak:rgba(21,127,61,.10);       /* 成功角标底 */
+    --err-weak:rgba(199,51,43,.09);      /* 错误角标底 */
+    --primary-line:rgba(61,90,241,.45);  /* 卡片 hover 描边 */
+  }
+  /* 深色模式：只翻面，字阶/布局/组件一律不动。data-theme 挂在 <html> 上，由顶栏三态按钮控制（跟随系统/浅/深） */
+  html[data-theme="dark"]{
+    --primary:#7B90FF;
+    --primary-weak:rgba(123,144,255,.16);
+    --bg:#141519;
+    --panel:#1D1F24;
+    --ink:#E8EAEE;
+    --ink-2:rgba(232,234,238,.64);
+    --ink-3:rgba(232,234,238,.42);
+    --line:rgba(232,234,238,.11);
+    --ok:#5BBE7E;
+    --danger:#F26B62;
+    --on-primary:#fff;
+    --hover-bg:#23252B;
+    --ghost-hover:#2A2D34;
+    --danger-weak:rgba(242,107,98,.14);
+    --chip-bg:#26282F;
+    --drop-bg:#191B20;
+    --drop-hot-bg:#1E2338;
+    --mask:rgba(0,0,0,.55);
+    --toast-bg:#E8EAEE;
+    --toast-ink:#17191E;
+    --primary-strong:#8FA2FF;      /* 主按钮 hover：深色下反而要变亮 */
+    --drop-line:rgba(232,234,238,.22);
+    --ok-weak:rgba(91,190,126,.14);
+    --err-weak:rgba(242,107,98,.13);
+    --primary-line:rgba(123,144,255,.5);
+    color-scheme:dark;
   }
   *{box-sizing:border-box}
   html{height:100%}
@@ -45,7 +98,7 @@
     padding:18px 14px;display:flex;flex-direction:column;
   }
   .brand{display:flex;align-items:center;gap:10px;padding:2px 8px 20px;text-decoration:none;color:var(--ink)}
-  .brand-mark{width:28px;height:28px;border-radius:8px;background:var(--primary);color:#fff;
+  .brand-mark{width:28px;height:28px;border-radius:8px;background:var(--primary);color:var(--on-primary);
               display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600;flex:0 0 auto}
   .brand-name{font-size:15px;font-weight:600;line-height:1.25}
   .brand-sub{font-size:11px;color:var(--ink-3);line-height:1.3}
@@ -94,7 +147,7 @@
           padding:0 12px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
   .tbl td{padding:13px 12px;border-top:1px solid var(--line);vertical-align:top}
   .tbl tbody tr:first-child td{border-top:0}
-  .tbl tbody tr:hover{background:#FAFBFD}
+  .tbl tbody tr:hover{background:var(--hover-bg)}
   .tbl .col-actions{text-align:right;white-space:nowrap}
   .tbl .col-actions .btn{margin-left:6px}
   .tbl .cell-name{width:23%}
@@ -118,13 +171,13 @@
     font:inherit;font-size:13px;font-weight:500;border:0;cursor:pointer;border-radius:8px;
     padding:7px 14px;transition:background .12s ease,color .12s ease;
   }
-  .btn-primary{background:var(--primary);color:#fff}
-  .btn-primary:hover{background:#3450D8}
+  .btn-primary{background:var(--primary);color:var(--on-primary)}
+  .btn-primary:hover{background:var(--primary-strong,#3450D8)}
   .btn-ghost{background:var(--bg);color:var(--ink)}
-  .btn-ghost:hover{background:#E9EBEF}
+  .btn-ghost:hover{background:var(--ghost-hover)}
   .btn-sm{padding:5px 10px;font-size:12.5px}
   .btn-danger{background:transparent;color:var(--danger);padding:5px 10px;font-size:12.5px}
-  .btn-danger:hover{background:rgba(199,51,43,.07)}
+  .btn-danger:hover{background:var(--danger-weak)}
   .btn-link{background:transparent;color:var(--primary);padding:4px 6px;font-size:12.5px;font-weight:500}
   .btn-link:hover{text-decoration:underline}
   .btn:focus-visible,.nav-item:focus-visible,a:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
@@ -132,18 +185,26 @@
   /* ===== 角标 ===== */
   .badge{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:6px;
          background:var(--bg);color:var(--ink-2);font-size:12px;font-weight:500;white-space:nowrap}
-  .badge-ok{background:rgba(21,127,61,.10);color:var(--ok)}
-  .badge-err{background:rgba(199,51,43,.09);color:var(--danger)}
+  .badge-ok{background:var(--ok-weak);color:var(--ok)}
+  .badge-err{background:var(--err-weak);color:var(--danger)}
   .badge-primary{background:var(--primary-weak);color:var(--primary)}
 
   /* ===== 资源卡片墙 ===== */
   .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(252px,1fr));gap:14px}
+  /* 壁纸方案页：左列表 + 右编辑器（窄屏塌成一列） */
+  .plan-cols{display:grid;grid-template-columns:340px minmax(0,1fr);gap:14px;align-items:start}
+  @media (max-width:1080px){.plan-cols{grid-template-columns:1fr}}
+  .plan-item{padding:10px 12px;border:1px solid var(--line);border-radius:10px;cursor:pointer;background:var(--panel)}
+  .plan-item:hover{border-color:var(--primary-line)}
+  .plan-item.on{border-color:var(--primary);box-shadow:0 0 0 1px var(--primary) inset}
+  .plan-item + .plan-item{margin-top:9px}
+  .chip{display:inline-block;padding:3px 8px;border-radius:7px;background:var(--chip-bg);font-size:12px;margin:0 4px 4px 0}
   .res-card{
     position:relative;display:block;background:var(--panel);border:1px solid var(--line);
     border-radius:var(--radius,12px);padding:16px 18px;cursor:pointer;color:var(--ink);
     text-decoration:none;transition:border-color .12s ease;
   }
-  .res-card:hover{border-color:rgba(61,90,241,.45)}
+  .res-card:hover{border-color:var(--primary-line)}
   .res-name{font-size:15px;font-weight:600;line-height:1.4;padding-right:64px}
   .res-card .meta{margin-top:5px}
   .res-foot{margin-top:13px}
@@ -159,28 +220,28 @@
 
   /* ===== 拖拽区 ===== */
   .drop{
-    border:1.5px dashed rgba(23,25,30,.18);border-radius:var(--radius,12px);padding:26px;text-align:center;
-    background:#FBFCFD;cursor:pointer;transition:border-color .12s ease,background .12s ease;
+    border:1.5px dashed var(--drop-line,rgba(23,25,30,.18));border-radius:var(--radius,12px);padding:26px;text-align:center;
+    background:var(--drop-bg);cursor:pointer;transition:border-color .12s ease,background .12s ease;
   }
-  .drop.hot{border-color:var(--primary);background:#F6F8FF}
+  .drop.hot{border-color:var(--primary);background:var(--drop-hot-bg)}
   .drop .main{font-size:14px;font-weight:600;padding:0;margin:0}
 
   /* ===== 联调模式警示条 ===== */
   .dev-banner{
-    display:flex;gap:10px;padding:11px 16px;border-radius:10px;background:var(--danger);color:#fff;
+    display:flex;gap:10px;padding:11px 16px;border-radius:10px;background:var(--danger);color:var(--on-primary);
     font-size:13px;font-weight:500;line-height:1.65;
   }
 
   /* ===== toast / 弹层 ===== */
   .toast{
     position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(8px);
-    background:#17191E;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:500;
+    background:var(--toast-bg);color:var(--toast-ink);padding:10px 18px;border-radius:10px;font-size:13px;font-weight:500;
     opacity:0;transition:opacity .2s ease,transform .2s ease;max-width:70vw;z-index:50;
   }
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-  .modal{position:fixed;inset:0;background:rgba(23,25,30,.42);display:flex;align-items:center;
+  .modal{position:fixed;inset:0;background:var(--mask);display:flex;align-items:center;
          justify-content:center;z-index:40}
-  .modal .box{background:#fff;border-radius:14px;padding:24px;width:min(460px,92vw)}
+  .modal .box{background:var(--panel);border-radius:14px;padding:24px;width:min(460px,92vw)}
   .modal-title{font-size:16px;font-weight:600;margin:0 0 16px}
   details summary{cursor:pointer;color:var(--ink-2);font-size:13px;list-style:none}
   details summary::-webkit-details-marker{display:none}
@@ -198,6 +259,13 @@
   @media (prefers-reduced-motion: reduce){
     *{transition:none!important;animation:none!important}
   }
+  /* 顶栏主题切换：三态文字按钮，占位与「连接」一致 */
+  .theme-btn{
+    font:inherit;font-size:12.5px;font-weight:500;color:var(--ink-3);background:transparent;
+    border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer;
+    transition:color .12s ease,border-color .12s ease;white-space:nowrap;
+  }
+  .theme-btn:hover{color:var(--ink);border-color:var(--ink-3)}
 </style>
 </head>
 <body>
@@ -210,6 +278,12 @@
     <a class="nav-item" data-route="#/" href="#/">
       <svg class="ic" viewBox="0 0 16 16"><rect x="1.5" y="1.5" width="5.2" height="5.2" rx="1.3"/><rect x="9.3" y="1.5" width="5.2" height="5.2" rx="1.3"/><rect x="1.5" y="9.3" width="5.2" height="5.2" rx="1.3"/><rect x="9.3" y="9.3" width="5.2" height="5.2" rx="1.3"/></svg>
       资源</a>
+    <a class="nav-item" data-route="#/photo-albums" href="#/photo-albums">
+      <svg class="ic" viewBox="0 0 16 16"><rect x="1.6" y="2.6" width="12.8" height="10.8" rx="2"/><circle cx="5.6" cy="6.4" r="1.2"/><path d="M3.2 12.2 6.8 8.6l2.2 2.2 1.8-1.8 2 2"/></svg>
+      照片表盘</a>
+    <a class="nav-item" data-route="#/editor-plans" href="#/editor-plans">
+      <svg class="ic" viewBox="0 0 16 16"><rect x="2.2" y="1.8" width="11.6" height="12.4" rx="2"/><path d="M4.6 5.4h6.8M4.6 8h6.8M4.6 10.6h4"/></svg>
+      壁纸方案</a>
     <a class="nav-item" data-route="#/devices" href="#/devices">
       <svg class="ic" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.3"/><path d="M6.1 4.8 6.3 1.6h3.4l.2 3.2M6.1 11.2l.2 3.2h3.4l.2-3.2"/></svg>
       设备组</a>
@@ -229,6 +303,7 @@
     <span id="statLine"></span>
     <a class="diag-line" id="diagLine" href="#/events" style="display:none"></a>
     <span class="sp"></span>
+    <button class="theme-btn" id="themeBtn" onclick="cycleTheme()" title="深色模式：跟随系统 / 浅色 / 深色">主题：跟随系统</button>
     <input id="token" type="password" placeholder="管理令牌" style="width:180px"/>
     <button class="btn btn-ghost btn-sm" onclick="saveToken()">连接</button>
   </header>
@@ -247,7 +322,7 @@ let STATE = { products: [], groups: [] };
 let LAST_UPLOAD = '';
 let LAST_UPLOAD_OWNER = '';
 
-function toast(msg, bad){ const t=$('toast'); t.textContent=msg; t.style.background = bad? '#C7332B':'#17191E'; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), 2400); }
+function toast(msg, bad){ const t=$('toast'); t.textContent=msg; t.style.background = bad? 'var(--danger)':'var(--toast-bg)'; t.style.color = bad? 'var(--on-primary)':'var(--toast-ink)'; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), 2400); }
 function saveToken(){ localStorage.setItem('wf_admin_token', $('token').value.trim()); toast('已连接'); loadAll(); }
 function fmtSize(n){ return n>1048576 ? (n/1048576).toFixed(2)+' MB' : Math.round(n/1024)+' KB'; }
 
@@ -290,6 +365,8 @@ async function render(){
   const h = location.hash || '#/';
   try{
     if(h.startsWith('#/p/')) return renderDetail(h.slice(4));
+    if(h==='#/photo-albums') return renderPhotoAlbums();
+    if(h==='#/editor-plans') return renderEditorPlans();
     if(h==='#/devices' || h==='#/settings') return renderDeviceGroups();
     if(h==='#/afdian') return renderAfdian();
     if(h==='#/events') return renderEvents();
@@ -370,20 +447,42 @@ async function createResource(){
 }
 
 // ---------- 资源详情
-/** 设备行的「包体」单元格：单包 / 多包（同版本、按文件名依次安装） */
-function packagesCell(v){
+/** 「照片表盘」角标：判据来自 .bin 内容（亮屏样式 backImageId 高字节 0x82），不看名字 */
+function photoBadge(p){
+  if(!p || !p.photoAlbum) return '';
+  const manual = p.photoAlbumManual != null ? '<span class="badge" style="margin-left:5px">人工</span>' : '';
+  return `<span class="badge badge-ok">照片表盘</span>${manual}`;
+}
+
+/** 设备行的「包体」单元格：单包 / 多包（按顺序依次安装） */
+function packagesCell(v, productId){
   const pkg = v.package;
   const packs = (v.packages && v.packages.length) ? v.packages : (pkg ? [pkg] : []);
   if(!packs.length) return '<span class="badge badge-err">未上传</span>';
+  const del = x => (x.fileId && productId) ? `<button class="btn btn-link" style="color:var(--danger);margin-left:6px"
+      onclick="delPkg('${esc(productId)}','${esc(x.fileId)}','${esc(x.fileName)}')">删除</button>` : '';
   if(packs.length === 1){
     return `<div class="mono">${esc(packs[0].fileName)}</div>
-            <div class="micro" style="margin-top:3px">${fmtSize(packs[0].size)} · ${esc(pkg&&pkg.canvas||'')}</div>`;
+            <div class="micro" style="margin-top:3px">${esc(packs[0].version||'')} · ${fmtSize(packs[0].size)} · ${esc(pkg&&pkg.canvas||'')}${del(packs[0])}</div>
+            ${packs[0].photoAlbum? `<div style="margin-top:4px">${photoBadge(packs[0])}</div>`:''}`;
   }
   const tot = packs.reduce((s,x)=>s+(x.size||0),0);
   return `<div><span class="badge badge-primary">${packs.length} 个包</span>
             <span class="micro" style="margin-left:6px">共 ${fmtSize(tot)} · 按顺序依次安装</span></div>` +
     packs.map((x,i)=>`<div class="pack-line"><span class="mono">${i+1}. ${esc(x.fileName)}</span>
-        <span class="micro">${fmtSize(x.size)}</span></div>`).join('');
+        <span class="micro">${esc(x.version||'')} · ${fmtSize(x.size)}</span>${x.photoAlbum? ' '+photoBadge(x):''}${del(x)}</div>`).join('');
+}
+
+/** 从设备行里删掉一个包（其余包保留；已经装了它的人不受影响） */
+async function delPkg(productId, fileId, fileName){
+  if(!confirm(`从这一行删除包「${fileName}」？\n\n已经装了它的人不受影响，但之后新装/更新不会再包含这个包。`)) return;
+  try{
+    const d = await api('/admin/files/'+encodeURIComponent(fileId), {method:'DELETE'});
+    toast(d && d.variantEmptied ? '已删除最后一个包，这一行现在为空' : '已删除该包');
+    renderDetail(productId);
+  }catch(e){
+    toast(e.message || '删除失败', true);
+  }
 }
 
 /** 设备行的「购买链接」单元格：一条或多条爱发电链接 */
@@ -414,7 +513,7 @@ async function renderDetail(id){
         <div class="row-name">${esc(v.name)}</div>
         <div class="micro" style="margin-top:3px">${(v.deviceModels||[]).map(esc).join('、')}</div>
       </td>
-      <td>${packagesCell(v)}</td>
+      <td>${packagesCell(v, p.id)}</td>
       <td>${v.package? `<span class="mono">${esc(v.package.version)}</span>` : '<span class="micro">—</span>'}</td>
       <td>${linksCell(v, p.id)}</td>
       <td class="col-actions">
@@ -439,7 +538,8 @@ async function renderDetail(id){
     <div class="panel">
       <div class="drop" id="drop"><div class="main">把 .bin 拖到这里</div>
         <div class="meta" style="margin-top:6px">可多选或拖整个文件夹，自动识别设备与版本；
-          <b style="font-weight:600">同一设备的多个包请一起拖进来</b>——会存成同一版本，买家那边按文件名顺序依次安装</div></div>
+          <b style="font-weight:600">按表盘 ID 自动认包</b>——只拖改过的那一个包就只替换它，没拖的包原样保留；
+          新增包直接拖新包。同一设备的多个包也可以一起拖，按文件名顺序依次安装</div></div>
       <input type="file" id="files" multiple accept=".bin" style="display:none"/>
       <div id="up-result">${LAST_UPLOAD}</div>
     </div>
@@ -520,11 +620,24 @@ async function uploadBatchAsk(productId, files, variantId){
   }
 }
 
+/** 上传结果里「替换/新增/未变/保留」各几个包 */
+function mergeSummary(d){
+  const fs = d.files || [];
+  const n = a => fs.filter(x=>x.action===a).length;
+  const bits = [];
+  if(n('replaced')) bits.push(`替换 ${n('replaced')} 个包`);
+  if(n('added')) bits.push(`新增 ${n('added')} 个包`);
+  if(n('unchanged')) bits.push(`未变 ${n('unchanged')} 个包`);
+  if(n('kept')) bits.push(`保留 ${n('kept')} 个包`);
+  return bits.join('，');
+}
+
 /** 上传一个文件；成功返回 true（信息写进 file._msg），失败返回可读文案。 */
 async function uploadOne(productId, file, variantId, force){
   try{
     const d = await uploadBatch(productId, [file], variantId, force);
-    file._msg = `${d.variantName}${d.createdRow? ' · 新设备':''} · ${d.replacedVersion? d.replacedVersion+' → ':''}${d.version}`;
+    const sum = mergeSummary(d);
+    file._msg = `${d.variantName}${d.createdRow? ' · 新设备':''} · ${d.replacedVersion? d.replacedVersion+' → ':''}${d.version}` + (sum? ` · ${sum}`:'');
     return true;
   }catch(e){
     if(e.code === 'version_not_newer' && variantId){
@@ -577,9 +690,11 @@ async function batchUpload(productId, files){
       try{
         const d = await uploadBatchAsk(productId, g.files, g.variantId);
         const names = (d.files||[]).map(x=>x.fileName).join(' → ');
+        const sum = mergeSummary(d);
         lines.push({ name: label, ok: true,
           msg: `${d.createdRow? '新设备 · ':''}${d.replacedVersion? d.replacedVersion+' → ':''}${d.version}` +
-               (g.files.length>1? ` · 顺序 ${names}` : '') });
+               (sum? ` · ${sum}`:'') +
+               ((d.files||[]).length>1? ` · 顺序 ${names}` : '') });
         ok += g.files.length;
       }catch(e){
         lines.push({ name: label, ok: false, msg: (e && (e.message||e)) || String(e) });
@@ -731,6 +846,282 @@ async function addDevice(productId, groupId){
   try{ await api('/admin/variants',{method:'POST',body:JSON.stringify({product_id:productId, device_group_id:groupId})});
     document.getElementById('m').remove(); toast('已添加'); render(); }
   catch(e){ toast(e.message, true); }
+}
+
+// ---------- 照片表盘
+/** 判定单元格：.bin 内容判出来的结果 + 是否被人工改过 */
+function photoAlbumCell(x){
+  if(x.photoAlbum === true)  return '<span class="badge badge-ok">照片表盘</span>'
+    + (x.photoAlbumManual != null ? ' <span class="badge">人工指定</span>' : '');
+  if(x.photoAlbum === false) return '<span class="badge">不是</span>'
+    + (x.photoAlbumManual != null ? ' <span class="badge">人工指定</span>' : '');
+  return '<span class="badge badge-err">未识别</span>';
+}
+
+/** 纠正按钮：按当前生效值给「改成另一个」；被人工改过的再给一个「回到自动」 */
+function photoAlbumBtns(x){
+  const wf = esc(x.watchfaceId);
+  const flip = x.photoAlbum
+    ? `<button class="btn btn-ghost btn-sm" onclick="setPhotoAlbum('${wf}', false)">标为不是</button>`
+    : `<button class="btn btn-ghost btn-sm" onclick="setPhotoAlbum('${wf}', true)">标为照片表盘</button>`;
+  const clear = x.photoAlbumManual != null
+    ? `<button class="btn btn-link" onclick="setPhotoAlbum('${wf}', null)">回到自动</button>` : '';
+  return flip + clear;
+}
+
+async function setPhotoAlbum(watchfaceId, val){
+  try{
+    await api('/admin/photo-album', {method:'POST',
+      body: JSON.stringify({ watchface_id: watchfaceId, is_photo_album: val })});
+    toast(val === null ? '已回到自动判定' : (val ? '已标为照片表盘' : '已标为不是照片表盘'));
+    loadPhotoAlbums();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function renderPhotoAlbums(){
+  setTimeout(()=>void loadPhotoAlbums(), 0);
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">照片表盘</h1>
+        <p class="page-desc">能在手环上换成自己拍的照片的那批表盘。判据读的是 .bin 内容（亮屏样式的背景容器
+          标记 <span class="mono">0x82</span>），<b>不看名字</b> —— 名字里没有「照片表盘」的（如《OS27模块》）
+          也在里面，而固定的多壁纸表盘（如电子拍立得）不会进来。这一批就是以后配「壁纸方案」的候选。</p></div>
+      <span class="sp"></span>
+      <div class="form-row" style="margin:0">
+        <select id="pa-filter" onchange="loadPhotoAlbums()">
+          <option value="photo">只看照片表盘</option>
+          <option value="all">全部包体</option>
+        </select>
+        <button class="btn btn-ghost" onclick="loadPhotoAlbums()">刷新</button>
+      </div>
+    </div>
+    <div class="panel"><div id="pa-box"></div></div>`;
+}
+
+async function loadPhotoAlbums(){
+  const box = $('pa-box');
+  box.innerHTML = '<div class="panel-hint tight">加载中…</div>';
+  let d;
+  try{ d = await api('/admin/photo-albums'); }
+  catch(e){ box.innerHTML = `<div class="panel-hint tight" style="color:var(--danger)">${esc(e.message)}</div>`; return; }
+  const only = !($('pa-filter') && $('pa-filter').value === 'all');
+  const items = d.items.filter(x => only ? x.photoAlbum : true);
+  const s = d.summary;
+  const head = `<div class="panel-head">
+      <span class="meta">${s.packages} 个包体 · <b>${s.photoAlbums}</b> 个照片表盘${
+        s.unidentified ? ` · <span style="color:var(--danger)">${s.unidentified} 个未识别（需在服务器跑一次回填）</span>` : ''}</span>
+    </div>`;
+  if(!items.length){
+    box.innerHTML = head + '<div class="panel-hint tight">没有符合条件的包体。</div>';
+    return;
+  }
+  const rows = items.map(x=>`<tr>
+      <td class="cell-name">
+        <div class="row-name">${esc(x.productName)}</div>
+        <div class="micro" style="margin-top:3px">${esc(x.variantName)}</div>
+      </td>
+      <td>
+        <div class="mono">${esc(x.fileName)}</div>
+        <div class="micro" style="margin-top:3px">id ${esc(x.watchfaceId||'—')} · v${esc(x.version)}</div>
+      </td>
+      <td>${photoAlbumCell(x)}</td>
+      <td class="col-actions">${photoAlbumBtns(x)}</td>
+    </tr>`).join('');
+  box.innerHTML = head + `<table class="tbl">
+      <thead><tr>
+        <th class="cell-name">商品 / 设备行</th><th style="width:40%">包体</th>
+        <th style="width:16%">判定</th><th class="col-actions" style="width:20%">纠正</th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+
+// ---------- 壁纸方案（照片表盘的壁纸生成规则：方案 + 素材都由 App 拉走，不发版）
+STATE.plans = {};
+
+/** 方案骨架：三种形态，画布尺寸从设备行带过来（对不上的方案 App 会自己拒绝） */
+/** 屏幕圆角（跟底图网站的机型值一致）：手环 9/10 圆角到顶 = 跑道屏 */
+const SCREEN_RADIUS = { "192x490": 96, "212x520": 106, "336x480": 45, "432x514": 104 };
+
+function planSkeleton(kind, w, h, win){
+  const ctl = (darken, blur) => ({
+    scale:    { default: 1,  min: 0.5, max: 3,   step: 0.01, adjustable: true },
+    rotation: { default: 0,  min: -180, max: 180, step: 1,    adjustable: true },
+    darken:   { default: darken, min: 0, max: 1, step: 0.01, adjustable: true },
+    blur:     { default: blur,   min: 0, max: 40, step: 1,   adjustable: true },
+    flipX:    { default: false, adjustable: true },
+    flipY:    { default: false, adjustable: true }
+  });
+  const photos = [];
+  if(kind === 'layered'){
+    // 拍立得：底图铺满 + 相框里第二张（底图默认压暗 0.3 + 模糊 8，与网站一致）
+    photos.push({ id:'bg', label:'背景照片', base:'canvas', controls: ctl(0.3, 8) });
+    photos.push({ id:'inner', label:'相框内照片', base:'frame', controls: ctl(0, 0) });
+  }else{
+    photos.push({ id:'bg', label: kind === 'template' ? '照片' : '照片', base:'canvas', controls: ctl(0, 0) });
+  }
+  const cfg = { version: 1, canvas: { w: w, h: h, radius: SCREEN_RADIUS[w + "x" + h] || 0 }, photos };
+  if(kind !== 'plain'){
+    cfg.frame = {};
+    if(kind === 'layered' && win) cfg.frame.window = win;
+    cfg.frame.colors = [];
+  }
+  return cfg;
+}
+
+async function renderEditorPlans(){
+  setTimeout(()=>void loadEditorPlans(), 0);
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">壁纸方案</h1>
+        <p class="page-desc">一个方案 = 一个表盘（<span class="mono">watchface_id</span>）。App 把这个方案拉回去，
+          自己长出「制作壁纸」页面 —— <b>以后上新表盘/新模板不用发 App 版本</b>。
+          方案里只写相对文件名，素材走 <span class="mono">/wp/&lt;id&gt;/&lt;文件名&gt;</span> 静态下发。
+          画布尺寸必须和表盘一致：App 会拿它跟 .bin 对一遍，对不上就不给用。
+          骨架会按机型带上<b>屏幕圆角</b>（手环 9/10 是圆角到顶的跑道屏），照片与预览都按它裁，
+          不会露到屏幕圆角外面。</p></div>
+      <span class="sp"></span>
+      <button class="btn btn-ghost" onclick="loadEditorPlans()">刷新</button>
+    </div>
+    <div class="plan-cols">
+      <div class="panel" style="max-width:420px">
+        <div class="panel-head"><span>照片表盘</span><span class="meta" id="ep-count"></span></div>
+        <div id="ep-list"></div>
+      </div>
+      <div class="panel"><div id="ep-edit"></div></div>
+    </div>`;
+}
+
+async function loadEditorPlans(){
+  const list = $('ep-list');
+  list.innerHTML = '<div class="panel-hint tight">加载中…</div>';
+  let d, plans;
+  try{
+    d = await api('/admin/photo-albums');
+    plans = await api('/admin/editor-templates');
+  }catch(e){ list.innerHTML = `<div class="panel-hint tight" style="color:var(--danger)">${esc(e.message)}</div>`; return; }
+  STATE.plans = {};
+  for(const x of plans.items) STATE.plans[x.watchfaceId] = x;
+  // 同一个表盘 id 只列一次（多设备行共用 id 的情况：取第一条的设备名）
+  const seen = {};
+  const items = [];
+  for(const x of d.items){
+    if(!x.photoAlbum || !x.watchfaceId) continue;
+    if(seen[x.watchfaceId]) continue;
+    seen[x.watchfaceId] = 1;
+    items.push(x);
+  }
+  $('ep-count').textContent = `${items.length} 个 · 已配 ${plans.items.length} 条`;
+  if(!items.length){ list.innerHTML = '<div class="panel-hint tight">还没有判定为照片表盘的包体。</div>'; return; }
+  list.innerHTML = items.map(x=>{
+    const has = STATE.plans[x.watchfaceId];
+    return `<div class="plan-item" onclick="openEditorPlan('${esc(x.watchfaceId)}')">
+      <div class="row-name">${esc(x.productName)}</div>
+      <div class="micro" style="margin-top:3px">${esc(x.variantName)} · id ${esc(x.watchfaceId)}</div>
+      <div style="margin-top:4px">${has
+        ? `<span class="badge badge-ok">已配</span> <span class="meta">${has.assetCount} 个素材</span>`
+        : '<span class="badge">未配</span>'}</div>
+    </div>`;
+  }).join('');
+}
+
+async function openEditorPlan(wfid){
+  STATE.planWf = wfid;
+  const box = $('ep-edit');
+  box.innerHTML = '<div class="panel-hint tight">加载中…</div>';
+  let d, meta = null;
+  try{ d = await api('/admin/editor-template/' + encodeURIComponent(wfid)); }
+  catch(e){ box.innerHTML = `<div class="panel-hint tight">${esc(e.message)}</div>`; return; }
+  try{
+    const pa = await api('/admin/photo-albums');
+    meta = pa.items.find(x => x.watchfaceId === wfid) || null;
+  }catch(e){ /* 拿不到就当没有画布信息 */ }
+  const w = (meta && meta.screen && meta.screen[0]) || 212;
+  const h = (meta && meta.screen && meta.screen[1]) || 520;
+  const raw = d.configRaw || JSON.stringify(planSkeleton('layered', w, h, null), null, 2);
+  const assets = (d.assets || []).map(a =>
+    `<span class="chip mono">${esc(a.path)} · ${Math.round(a.size/1024)}KB</span>`).join(' ');
+
+  box.innerHTML = `
+    <div class="panel-head">
+      <span>${esc(meta ? meta.productName + ' · ' + meta.variantName : '方案')}
+        <span class="meta mono">${esc(wfid)}</span></span>
+      <span class="sp"></span>
+      ${d.exists ? `<button class="btn btn-ghost btn-sm" onclick="deleteEditorPlan('${esc(wfid)}')">删除方案</button>` : ''}
+    </div>
+    <div class="form-row">
+      <span class="micro" style="min-width:38px">骨架</span>
+      <select id="ep-kind">
+        <option value="layered">拍立得（双图 + 相框，框内有倾角）</option>
+        <option value="template">单图 + 相框模板</option>
+        <option value="plain">通用（只有六个基础功能）</option>
+      </select>
+      <input id="ep-w" value="${w}" style="width:64px" title="画布宽"/>
+      <input id="ep-h" value="${h}" style="width:64px" title="画布高"/>
+      <button class="btn btn-ghost" onclick="mkSkeleton()">生成骨架</button>
+    </div>
+    <div class="form-row">
+      <span class="micro" style="min-width:38px">窗口</span>
+      <input id="ep-x" placeholder="x" style="width:60px"/>
+      <input id="ep-y" placeholder="y" style="width:60px"/>
+      <input id="ep-ww" placeholder="宽" style="width:60px"/>
+      <input id="ep-wh" placeholder="高" style="width:60px"/>
+      <input id="ep-r" placeholder="圆角" style="width:60px"/>
+      <input id="ep-rot" placeholder="倾角" style="width:60px"/>
+      <span class="meta">拍立得必填；单图+相框不用（模板直接盖在照片上）</span>
+    </div>
+    <textarea id="ep-json" spellcheck="false" style="width:100%;height:320px">${esc(raw)}</textarea>
+    <div class="form-row">
+      <span class="micro" style="min-width:38px">素材</span>
+      <input type="file" id="ep-files" multiple accept="image/png,image/jpeg,image/webp"/>
+      <button class="btn" onclick="saveEditorPlan('${esc(wfid)}')">保存方案</button>
+    </div>
+    <div class="panel-hint tight">素材名要和 JSON 里 <span class="mono">frame.colors[].src</span> 对上（如 1.png…12.png）。
+      同名再传即覆盖。${assets ? '<br/><br/>已入库：' + assets : ''}</div>`;
+}
+
+function mkSkeleton(){
+  const kind = $('ep-kind').value;
+  const w = parseInt($('ep-w').value, 10) || 212;
+  const h = parseInt($('ep-h').value, 10) || 520;
+  let win = null;
+  const g = id => { const v = parseFloat($(id).value); return isNaN(v) ? null : v; };
+  const x = g('ep-x'), y = g('ep-y'), ww = g('ep-ww'), wh = g('ep-wh');
+  if(x !== null && y !== null && ww && wh){
+    win = { x, y, w: ww, h: wh, radius: g('ep-r') || 0, rot: g('ep-rot') || 0 };
+  }
+  if(kind === 'layered' && !win){ toast('拍立得要填画框窗口（x/y/宽/高）', true); return; }
+  $('ep-json').value = JSON.stringify(planSkeleton(kind, w, h, win), null, 2);
+  toast('骨架已生成，改完点保存');
+}
+
+async function saveEditorPlan(wfid){
+  const cfg = $('ep-json').value;
+  try{ JSON.parse(cfg); }catch(e){ toast('JSON 不合法：' + e.message, true); return; }
+  const fd = new FormData();
+  fd.append('watchface_id', wfid);
+  fd.append('config', cfg);
+  const files = $('ep-files').files;
+  for(const f of files) fd.append('file', f, f.name);
+  try{
+    const r = await api('/admin/editor-template', { method:'POST', body: fd });
+    if(r.missing && r.missing.length){
+      toast('已保存，但这些素材还缺：' + r.missing.join('、'), true);
+    }else{
+      toast(r.assets ? `已保存（本批写入 ${r.assets.length} 个素材）` : '已保存');
+    }
+    openEditorPlan(wfid);
+    loadEditorPlans();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function deleteEditorPlan(wfid){
+  if(!confirm('删除这个表盘的壁纸方案？（素材也一并删）')) return;
+  try{
+    await api('/admin/editor-template/' + encodeURIComponent(wfid), { method:'DELETE' });
+    toast('已删除');
+    $('ep-edit').innerHTML = '<div class="panel-hint tight">已删除，左侧重新选一个表盘。</div>';
+    loadEditorPlans();
+  }catch(e){ toast(e.message, true); }
 }
 
 // ---------- 设备组
@@ -1117,7 +1508,25 @@ async function loadAll(){
   if(d) STATE.products = d.products;
   render();
 }
-window.addEventListener('load', ()=>{ $('token').value = token(); loadAll(); });
+// ---------- 深色模式：三态（跟随系统 / 浅色 / 深色），记忆在 localStorage
+const THEME_KEY = 'wf_admin_theme';
+const THEME_LABEL = { system:'主题：跟随系统', light:'主题：浅色', dark:'主题：深色' };
+function sysDark(){ return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches); }
+function applyTheme(mode){
+  const dark = mode === 'dark' || (mode === 'system' && sysDark());
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const btn = $('themeBtn'); if(btn) btn.textContent = THEME_LABEL[mode] || THEME_LABEL.system;
+}
+function cycleTheme(){
+  const cur = localStorage.getItem(THEME_KEY) || 'system';
+  const next = cur === 'system' ? 'light' : cur === 'light' ? 'dark' : 'system';
+  localStorage.setItem(THEME_KEY, next);
+  applyTheme(next);
+}if (window.matchMedia) matchMedia('(prefers-color-scheme: dark)').addEventListener('change', ()=>{
+  if((localStorage.getItem(THEME_KEY) || 'system') === 'system') applyTheme('system');
+});
+
+window.addEventListener('load', ()=>{ applyTheme(localStorage.getItem(THEME_KEY) || 'system'); $('token').value = token(); loadAll(); });
 </script>
 </body>
 </html>

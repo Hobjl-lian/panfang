@@ -212,6 +212,9 @@ pub struct SyncSummary {
     pub seen: usize,
     pub new_grants: Vec<(String, String)>, // (mi_user_id, product_id)
     pub revoked: Vec<(String, String)>,
+    /// 被拒绝的重放：(订单号, 目标 mi_user_id)。这笔订单的权益已归属别的账号，
+    /// 换绑后同步又遇到它 → 拒绝。正常恒为空；非空 = 有人在换绑账号试图复制授权。
+    pub replayed: Vec<(String, String)>,
     pub unbound: usize,   // 订单买家的爱发电账号还没绑定过 → 等他绑定后再同步
     pub unchanged: usize, // 重复订单 / 非成功状态且从未开通
 }
@@ -264,6 +267,37 @@ pub fn apply_orders(state: &AppState, orders: &[OrderIn]) -> ApiResult<SyncSumma
                 ));
                 continue;
             };
+            // 这笔订单的权益归属过某个账号吗？归属在**第一次处理**时钉下（见下），
+            // 之后换绑到别的小米账号也不再重放 —— 否则同一订单可以在任意多个账号上
+            // 各开通一遍，且旧账号的授权不会收回，等于一份订单可以复制给无限多人
+            //（2026-10-16 修：买家靠「换绑 + 等一轮同步」就能把付费资源扩散出去）。
+            let owner: Option<String> = conn
+                .query_row(
+                    "SELECT granted_subject_id FROM afdian_orders WHERE out_trade_no = ?1",
+                    [&o.out_trade_no],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            match owner {
+                Some(owner_sid) if owner_sid != subject_id => {
+                    sum.replayed.push((o.out_trade_no.clone(), mi_user_id.clone()));
+                    log_line(format!(
+                        "订单 {} 已归属账号 {}，拒绝重放给 {}（换绑不复制授权）",
+                        o.out_trade_no, owner_sid, mi_user_id
+                    ));
+                    continue;
+                }
+                None => {
+                    // 第一次处理：把权益归属钉在当前绑定的账号上。
+                    // 即使这笔订单当下开不通（没配链接等），归属也已定下 —— 之后补链接仍开给它。
+                    conn.execute(
+                        "UPDATE afdian_orders SET granted_subject_id = ?2 WHERE out_trade_no = ?1",
+                        params![o.out_trade_no, subject_id],
+                    )?;
+                }
+                _ => {} // 归属就是当前账号：照常往下走（幂等）
+            }
             // 这条订单能开通哪些资源：
             //   1) 行上配了 plan_id（购买链接里的商品编号）
             //   2) 行上配了 sku → 必须命中同一个规格 id
@@ -1065,6 +1099,107 @@ mod tests {
         // 严格 id 命中时不看名字（老口径：id 对得上就开）
         let sum = apply_orders(&state, &[mk("NEW1", "planB", "NEWSKU", "随便写的")]).unwrap();
         assert_eq!(sum.new_grants.len(), 1, "id 命中应直接开通");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 换绑不复制授权：同一笔订单只能开通给一个主体（2026-10-16 修的洞）。
+    ///
+    /// 漏洞形态：买家把爱发电账号换绑到朋友的小米账号后，下一轮订单同步会把同一订单
+    /// 再开通一遍，且旧账号的授权不收回 —— 一份订单可扩散到无限多个账号。
+    /// 现在归属在首次处理时钉在 `afdian_orders.granted_subject_id` 上，重放会被拒绝。
+    #[test]
+    fn rebind_does_not_replay_order_to_new_subject() {
+        use crate::state::AppState;
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join(format!("wf-afdian-rebind-{}", crate::db::new_id("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::db::open(&dir.join("wf.db")).unwrap();
+        conn.execute(
+            "INSERT INTO products(id, name, status, created_at) VALUES('p1', '测试表盘', 'on', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO variants(id, product_id, name, device_models, created_at)
+             VALUES('v1', 'p1', '手环10/11', '[\"小米手环10\"]', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO variant_links(variant_id, url, plan_id, sku, created_at)
+             VALUES('v1', 'https://afdian.com/a/x', 'planA', NULL, 0)",
+            [],
+        )
+        .unwrap();
+        let state = AppState {
+            db: Arc::new(Mutex::new(conn)),
+            data_dir: dir.clone(),
+            cipher_dir: dir.clone(),
+            kek: [0u8; 32],
+            url_secret: vec![0u8; 32],
+            admin_token: "t".into(),
+            public_base: "http://test".into(),
+            device_limit: 2,
+            token_ttl: 100,
+        };
+        let subj_of = |mi: &str| -> String {
+            let conn = state.conn();
+            conn.query_row("SELECT id FROM subjects WHERE mi_user_id = ?1", [mi], |r| r.get(0))
+                .unwrap()
+        };
+
+        // 买家绑 A → 订单开通给 A
+        bind_afdian(&state, "U1", "miA").unwrap();
+        let order = OrderIn {
+            out_trade_no: "X1".into(),
+            afdian_user_id: "U1".into(),
+            plan_id: "planA".into(),
+            sku: None,
+            sku_titles: vec![], // 不带规格名：链接行上也没配 sku → 直接命中
+            status: 2,
+            amount: 6.0,
+            month: 0,
+        };
+        let s1 = apply_orders(&state, &[order.clone()]).unwrap();
+        assert_eq!(s1.new_grants.len(), 1, "首次应开通给 A");
+        let a = subj_of("miA");
+        {
+            let conn = state.conn();
+            let owner: Option<String> = conn
+                .query_row(
+                    "SELECT granted_subject_id FROM afdian_orders WHERE out_trade_no = 'X1'",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap();
+            assert_eq!(owner.as_deref(), Some(a.as_str()), "订单归属应钉在 A");
+        }
+        // 幂等：同一订单重复同步不重复开通、不算重放
+        let s2 = apply_orders(&state, &[order.clone()]).unwrap();
+        assert!(s2.new_grants.is_empty() && s2.replayed.is_empty());
+
+        // 换绑到 B（把爱发电账号改绑到另一个小米账号）→ 同步重放必须被拒绝
+        bind_afdian(&state, "U1", "miB").unwrap();
+        let s3 = apply_orders(&state, &[order.clone()]).unwrap();
+        assert!(s3.new_grants.is_empty(), "换绑后不得再开通");
+        assert_eq!(s3.replayed, vec![("X1".to_string(), "miB".to_string())]);
+        let b = subj_of("miB");
+        {
+            let conn = state.conn();
+            let nb: i64 = conn
+                .query_row("SELECT COUNT(*) FROM licenses WHERE subject_id = ?1", [&b], |r| r.get(0))
+                .unwrap();
+            assert_eq!(nb, 0, "B 不应获得任何授权");
+            let na: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM licenses WHERE subject_id = ?1 AND status = 'active'",
+                    [&a],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(na, 1, "A 的授权应保持");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

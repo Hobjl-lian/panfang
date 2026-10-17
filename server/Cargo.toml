@@ -31,3 +31,7 @@ anyhow = "1"
 [profile.release]
 strip = true
 lto = true
+# panic 即退出，交给 systemd Restart=always 立刻拉起：
+# 否则「持锁 panic → 全局 Mutex 中毒」会让进程活着但每个请求都 panic，
+# systemd 看不到失败、服务变成永久 500，只能人工重启。
+panic = "abort"

@@ -44,6 +44,47 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 // ---------------------------------------------------------------- 主密钥（KEK）
 
+/// **只读**主密钥：`WF_KEK`（64 位 hex）优先，否则 `<data_dir>/kek.bin`；没有就报错。
+///
+/// 离线工具（backfill 之类）必须用这个：现场生成一把新的主密钥＝解不开任何已有密文，
+/// 只会让人误以为「数据没了」。
+pub fn read_kek(data_dir: &Path) -> Result<[u8; 32]> {
+    if let Ok(s) = std::env::var("WF_KEK") {
+        return kek_from_hex(&s);
+    }
+    read_kek_at(&data_dir.join("kek.bin"))
+}
+
+/// 从明确给定的文件读主密钥（调用方负责确认这个路径没越界）。
+pub fn read_kek_at(path: &Path) -> Result<[u8; 32]> {
+    if let Ok(s) = std::env::var("WF_KEK") {
+        return kek_from_hex(&s);
+    }
+    if !path.exists() {
+        bail!(
+            "{} 不存在，也没有 WF_KEK —— 解不开密文。用 WF_DATA_DIR 指到正确的数据目录",
+            path.display()
+        );
+    }
+    let raw = std::fs::read(path)?;
+    if raw.len() != 32 {
+        bail!("{} 内容不是 32 字节", path.display());
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&raw);
+    Ok(k)
+}
+
+fn kek_from_hex(s: &str) -> Result<[u8; 32]> {
+    let raw = hex::decode(s.trim()).context("WF_KEK 需要 64 位十六进制")?;
+    if raw.len() != 32 {
+        bail!("WF_KEK 长度错误：{} 字节（需要 32）", raw.len());
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&raw);
+    Ok(k)
+}
+
 /// 读取或生成主密钥：`WF_KEK`（64 位 hex）优先，否则 `<data_dir>/kek.bin`。
 pub fn load_or_create_kek(data_dir: &Path) -> Result<[u8; 32]> {
     if let Ok(s) = std::env::var("WF_KEK") {

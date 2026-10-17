@@ -2,7 +2,8 @@
 //!
 //! 模型（见 `docs/管理页设计-方案.md`）：
 //!   product（资源/表盘）→ variant（设备行，一行 = 一个设备组）→ version（当前包体）+ 爱发电链接
-//! 上传即加密；版本号来自 .bin 头部（如 1.0.2），更高才允许替换；默认只保留最新一版。
+//! 上传即加密；按**表盘 id** 认包（同 id 替换、没上传的保留）；
+//! 版本闸门按包比较（`files.bin_version`），整行版本取各包最大值。
 
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::HeaderMap;
@@ -10,7 +11,7 @@ use axum::Json;
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bin_inspect::version_tuple;
 use crate::db::{new_id, now};
@@ -241,18 +242,56 @@ fn product_view(state: &AppState, product_id: Option<&str>) -> ApiResult<Vec<Val
             // 这一行的全部包（一个版本可能有多个：同一设备拆成两个独立表盘，按 sort_order 依次安装）
             let packages: Vec<Value> = {
                 let mut stmt = conn.prepare(
-                    "SELECT f.file_name, f.size, vr.version, f.sort_order
-                     FROM files f JOIN versions vr ON vr.id = f.version_id
+                    "SELECT f.id, f.file_name, f.size,
+                            COALESCE(NULLIF(f.bin_version, ''), vr.version) AS pkg_version,
+                            f.sort_order, f.watchface_id, f.photo_album, o.is_photo_album
+                     FROM files f
+                     JOIN versions vr ON vr.id = f.version_id
+                     LEFT JOIN photo_album_overrides o ON o.watchface_id = f.watchface_id
                      WHERE vr.variant_id = ?1 AND vr.is_latest = 1
                      ORDER BY f.sort_order, f.id",
                 )?;
-                let rows: Vec<(String, i64, String, i64)> = stmt
-                    .query_map([&vid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                // (文件 id, 文件名, 大小, 该包自己的版本, 顺序, 表盘 id, 自动判定, 人工纠正)
+                type PkgRow = (
+                    String,
+                    String,
+                    i64,
+                    String,
+                    i64,
+                    Option<String>,
+                    Option<i64>,
+                    Option<i64>,
+                );
+                let rows: Vec<PkgRow> = stmt
+                    .query_map([&vid], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ))
+                    })?
                     .filter_map(|r| r.ok())
                     .collect();
                 rows.into_iter()
-                    .map(|(file_name, size, version, sort)| {
-                        json!({ "fileName": file_name, "size": size, "version": version, "sort": sort })
+                    .map(|(file_id, file_name, size, version, sort, wfid, auto, manual)| {
+                        // 生效值 = 有人工纠正就听人的，否则用自动识别（都缺 = 未知）
+                        let effective = manual.or(auto);
+                        json!({
+                            "fileId": file_id,
+                            "fileName": file_name,
+                            "size": size,
+                            "version": version,
+                            "sort": sort,
+                            "watchfaceId": wfid,
+                            "photoAlbum": effective.map(|v| v != 0),
+                            "photoAlbumAuto": auto.map(|v| v != 0),
+                            "photoAlbumManual": manual.map(|v| v != 0),
+                        })
                     })
                     .collect()
             };
@@ -370,6 +409,337 @@ pub async fn reorder_products(
     }
     tx.commit().map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------- 照片表盘
+
+/// GET /admin/photo-albums —— 全部包体的「照片表盘」判定（自动识别 + 人工纠正）。
+///
+/// 判据是**内容**而不是名字（见 `bin_inspect::photo_album`：亮屏样式 `backImageId` 高字节
+/// `0x82`），所以名字里没有「照片表盘」的（如《OS27模块》）照样能被标出来。
+/// `photoAlbumAuto = null` 表示这个包还没被识别过（等回填工具跑一次）。
+pub async fn photo_albums_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let conn = state.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.watchface_id, f.file_name, vr.version, f.sort_order,
+                    va.id, va.name, p.id, p.name, f.photo_album, o.is_photo_album,
+                    va.screen_w, va.screen_h
+             FROM files f
+             JOIN versions vr ON vr.id = f.version_id
+             JOIN variants va ON va.id = vr.variant_id
+             JOIN products p ON p.id = va.product_id
+             LEFT JOIN photo_album_overrides o ON o.watchface_id = f.watchface_id
+             WHERE vr.is_latest = 1 AND f.watchface_id IS NOT NULL AND f.watchface_id != ''
+             ORDER BY p.sort_order, p.name, va.name, f.sort_order, f.id",
+        )
+        .map_err(ApiError::from)?;
+    type FlagRow = (
+        String,         // watchface_id
+        String,         // file_name
+        String,         // version
+        i64,            // sort_order
+        String,         // variant_id
+        String,         // variant_name
+        String,         // product_id
+        String,         // product_name
+        Option<i64>,    // 自动判定
+        Option<i64>,    // 人工纠正
+        Option<i64>,    // 设备行屏宽
+        Option<i64>,    // 设备行屏高
+    );
+    let rows: Vec<FlagRow> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+            ))
+        })
+        .map_err(ApiError::from)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut items = Vec::with_capacity(rows.len());
+    let (mut packages, mut photos, mut unidentified) = (0i64, 0i64, 0i64);
+    for (wfid, file_name, version, sort, vid, vname, pid, pname, auto, manual, sw, sh) in rows {
+        let effective = manual.or(auto);
+        packages += 1;
+        match effective {
+            Some(1) => photos += 1,
+            None => unidentified += 1,
+            _ => {}
+        }
+        items.push(json!({
+            "watchfaceId": wfid,
+            "fileName": file_name,
+            "version": version,
+            "sort": sort,
+            "variantId": vid,
+            "variantName": vname,
+            "productId": pid,
+            "productName": pname,
+            "photoAlbum": effective.map(|v| v != 0),
+            "photoAlbumAuto": auto.map(|v| v != 0),
+            "photoAlbumManual": manual.map(|v| v != 0),
+            "screen": sw.zip(sh).map(|(w, h)| json!([w, h])),
+        }));
+    }
+    Ok(Json(json!({
+        "summary": { "packages": packages, "photoAlbums": photos, "unidentified": unidentified },
+        "items": items,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PhotoAlbumSet {
+    pub watchface_id: String,
+    /// true/false = 人工判定；**null = 清除人工判定**（回到自动识别）
+    pub is_photo_album: Option<bool>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// POST /admin/photo-album —— 人工纠正某个表盘「是不是照片表盘」。
+///
+/// 自动判据（读 .bin 内容）实测够用，这个开关是给例外和你手工指定用的。
+/// 值按 `watchface_id` 存 → **重传包体不会丢**；传 `is_photo_album: null` 即清除。
+pub async fn set_photo_album(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PhotoAlbumSet>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let wfid = body.watchface_id.trim().to_string();
+    if wfid.is_empty() {
+        return Err(ApiError::bad_request("缺少 watchface_id"));
+    }
+    let conn = state.conn();
+    // 只允许改库里真实存在的表盘，避免手滑把垃圾 id 写进去
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM files WHERE watchface_id = ?1 LIMIT 1",
+            [&wfid],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(ApiError::from)?;
+    if exists.is_none() {
+        return Err(ApiError::not_found("库里没有这个表盘 id"));
+    }
+    match body.is_photo_album {
+        Some(v) => {
+            conn.execute(
+                "INSERT INTO photo_album_overrides(watchface_id, is_photo_album, note, updated_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(watchface_id) DO UPDATE SET
+                   is_photo_album = excluded.is_photo_album,
+                   note = excluded.note,
+                   updated_at = excluded.updated_at",
+                params![&wfid, v as i64, body.note, now()],
+            )
+            .map_err(ApiError::from)?;
+            Ok(Json(json!({ "ok": true, "watchfaceId": wfid, "isPhotoAlbum": v })))
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM photo_album_overrides WHERE watchface_id = ?1",
+                [&wfid],
+            )
+            .map_err(ApiError::from)?;
+            Ok(Json(json!({ "ok": true, "watchfaceId": wfid, "cleared": true })))
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 壁纸方案（照片表盘的壁纸生成器）
+
+/// GET /admin/editor-templates —— 全部「壁纸方案」清单
+pub async fn editor_list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let conn = state.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.watchface_id, t.enabled, t.updated_at, length(t.config_json),
+                    (SELECT COUNT(*) FROM editor_assets a WHERE a.watchface_id = t.watchface_id)
+             FROM editor_templates t ORDER BY t.updated_at DESC",
+        )
+        .map_err(ApiError::from)?;
+    let rows: Vec<(String, i64, i64, i64, i64)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .map_err(ApiError::from)?
+        .filter_map(|r| r.ok())
+        .collect();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|(wf, enabled, at, bytes, assets)| {
+            json!({ "watchfaceId": wf, "enabled": enabled != 0,
+                    "updatedAt": at, "configBytes": bytes, "assetCount": assets })
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// GET /admin/editor-template/:watchface_id —— 取一条方案（含素材清单）
+pub async fn editor_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(wfid): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let wfid = crate::editor::safe_watchface_id(&wfid)?;
+    let conn = state.conn();
+    let row: Option<(String, i64, i64)> = conn
+        .query_row(
+            "SELECT config_json, enabled, updated_at FROM editor_templates WHERE watchface_id = ?1",
+            [&wfid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(ApiError::from)?;
+    let Some((cfg, enabled, at)) = row else {
+        return Err(ApiError::not_found("这个表盘还没有壁纸方案"));
+    };
+    let mut stmt = conn
+        .prepare("SELECT path, size, sha256 FROM editor_assets WHERE watchface_id = ?1 ORDER BY path")
+        .map_err(ApiError::from)?;
+    let assets: Vec<Value> = stmt
+        .query_map([&wfid], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(ApiError::from)?
+        .filter_map(|r| r.ok())
+        .map(|(path, size, sha)| json!({ "path": path, "size": size, "sha256": sha }))
+        .collect();
+    Ok(Json(json!({
+        "watchfaceId": wfid,
+        "exists": true,
+        "enabled": enabled != 0,
+        "updatedAt": at,
+        "config": serde_json::from_str::<Value>(&cfg).unwrap_or(Value::Null),
+        "configRaw": cfg,
+        "assets": assets,
+    })))
+}
+
+/// POST /admin/editor-template —— 保存方案（multipart：`watchface_id` + `config`(JSON 文本) + 可选 `file[]`）
+///
+/// 素材文件名就是配置里引用的相对名（`1.png`…）。保存后会**如实回报配置引用了但还没传的图**，
+/// 免得 App 那边拉到一份引用不存在素材的配置。
+pub async fn editor_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let (parts, fields) = read_upload(&mut multipart, false).await?;
+    let wfid = crate::editor::safe_watchface_id(
+        fields.get("watchface_id").map(|s| s.as_str()).unwrap_or(""),
+    )?;
+    let cfg_raw = fields
+        .get("config")
+        .cloned()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("缺少 config"))?;
+    let cfg: Value = serde_json::from_str(&cfg_raw)
+        .map_err(|e| ApiError::bad_request(format!("config 不是合法 JSON：{e}")))?;
+    let refs = crate::editor::validate_config(&cfg)?;
+
+    // 写素材（文件名先过白名单；只落在这个表盘自己的目录里）
+    let dir = crate::editor::assets_dir(&state, &wfid);
+    std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(format!("建素材目录失败: {e}")))?;
+    let conn = state.conn();
+    let mut written: Vec<String> = Vec::new();
+    for p in &parts {
+        let name = crate::editor::safe_asset_name(&p.fname)?;
+        let path = dir.join(&name);
+        std::fs::write(&path, &p.bytes).map_err(|e| ApiError::internal(format!("写素材失败: {e}")))?;
+        conn.execute(
+            "INSERT INTO editor_assets(watchface_id, path, size, sha256, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(watchface_id, path) DO UPDATE SET
+               size = excluded.size, sha256 = excluded.sha256, created_at = excluded.created_at",
+            params![
+                &wfid,
+                &name,
+                p.bytes.len() as i64,
+                crate::crypto::sha256_hex(&p.bytes),
+                now()
+            ],
+        )
+        .map_err(ApiError::from)?;
+        written.push(name);
+    }
+
+    conn.execute(
+        "INSERT INTO editor_templates(watchface_id, config_json, enabled, updated_at)
+         VALUES(?1, ?2, 1, ?3)
+         ON CONFLICT(watchface_id) DO UPDATE SET
+           config_json = excluded.config_json, updated_at = excluded.updated_at",
+        params![&wfid, &cfg_raw, now()],
+    )
+    .map_err(ApiError::from)?;
+
+    // 配置引用了、但库里/这一批都没传的图 → 如实报出来
+    let have: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT path FROM editor_assets WHERE watchface_id = ?1")
+            .map_err(ApiError::from)?;
+        let v: Vec<String> = stmt
+            .query_map([&wfid], |r| r.get(0))
+            .map_err(ApiError::from)?
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    };
+    let missing: Vec<&String> = refs.iter().filter(|r| !have.contains(r)).collect();
+    Ok(Json(json!({
+        "ok": true,
+        "watchfaceId": wfid,
+        "uploaded": written,
+        "assets": have.len(),
+        "missing": missing,
+    })))
+}
+
+/// DELETE /admin/editor-template/:watchface_id —— 删方案（连带素材登记与文件）
+pub async fn editor_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(wfid): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let wfid = crate::editor::safe_watchface_id(&wfid)?;
+    let conn = state.conn();
+    let n = conn
+        .execute("DELETE FROM editor_templates WHERE watchface_id = ?1", [&wfid])
+        .map_err(ApiError::from)?;
+    conn.execute("DELETE FROM editor_assets WHERE watchface_id = ?1", [&wfid])
+        .map_err(ApiError::from)?;
+    let dir = crate::editor::assets_dir(&state, &wfid);
+    if dir.starts_with(crate::editor::assets_root(&state)) {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(Json(json!({ "ok": true, "removed": n })))
 }
 
 /// DELETE /admin/products/:id —— 删除资源（含各设备行包体；已购用户将无法再下载）
@@ -529,6 +899,84 @@ pub async fn delete_variant(
         return Err(ApiError::not_found("设备行不存在"));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// DELETE /admin/files/:id —— 从设备行里删掉**一个包**（其余包原样保留）。
+///
+/// 用途：按表盘 id 合并后，如果重新导出的包换了 id（会被当成新包追加）、
+/// 或者误传了多余的包，可以在这里收拾。删掉最后一个包时连同版本行一起删，
+/// 设备行本身保留（购买链接/别名不丢），之后还能重新上传。
+pub async fn delete_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let conn = state.conn();
+    let row: Option<(i64, String, Option<String>)> = conn
+        .query_row(
+            "SELECT f.version_id, f.storage_path, f.watchface_id
+             FROM files f WHERE f.id = ?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (version_id, storage, wfid) =
+        row.ok_or_else(|| ApiError::not_found("包体不存在"))?;
+    let current_ver: String = conn
+        .query_row("SELECT version FROM versions WHERE id = ?1", [version_id], |r| {
+            r.get(0)
+        })
+        .unwrap_or_default();
+
+    // 剩余包（按安装顺序）：删完要重新编号，并把整行版本落到各包最大值
+    let remaining: Vec<(String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, bin_version FROM files WHERE version_id = ?1 AND id <> ?2
+             ORDER BY sort_order, id",
+        )?;
+        let out: Vec<(String, Option<String>)> = stmt
+            .query_map(params![version_id, &id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        out
+    };
+
+    let tx = conn.unchecked_transaction().map_err(ApiError::from)?;
+    tx.execute("DELETE FROM files WHERE id = ?1", [&id])
+        .map_err(ApiError::from)?;
+    let emptied = remaining.is_empty();
+    if emptied {
+        tx.execute("DELETE FROM versions WHERE id = ?1", [version_id])
+            .map_err(ApiError::from)?;
+    } else {
+        for (i, (fid, _)) in remaining.iter().enumerate() {
+            tx.execute(
+                "UPDATE files SET sort_order = ?2 WHERE id = ?1",
+                params![fid, i as i64],
+            )
+            .map_err(ApiError::from)?;
+        }
+        let max_ver = remaining
+            .iter()
+            .filter_map(|(_, v)| v.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .max_by_key(|s| version_tuple(s))
+            .map(|s| s.to_string())
+            .unwrap_or(current_ver);
+        tx.execute(
+            "UPDATE versions SET version = ?2 WHERE id = ?1",
+            params![version_id, max_ver],
+        )
+        .map_err(ApiError::from)?;
+    }
+    tx.commit().map_err(ApiError::from)?;
+    let _ = std::fs::remove_file(&storage);
+    println!(
+        "[wf-auth] 已从设备行删除包 {id}（表盘 id={}）",
+        wfid.as_deref().unwrap_or("-")
+    );
+    Ok(Json(json!({ "ok": true, "variantEmptied": emptied })))
 }
 
 #[derive(Deserialize)]
@@ -740,8 +1188,10 @@ struct UploadPart {
 
 /// 读 multipart：**支持一次带多个 `file` 字段**（同一设备拆成两个独立表盘的情形）。
 /// `path_hint` 可以按同样的顺序重复给，也可以只给一个（都当第一个用）。
+/// 解析 multipart：`require_file` = 这类请求必须带文件（上传 .bin 是；壁纸方案的通用表盘没有模板图）。
 async fn read_upload(
     multipart: &mut Multipart,
+    require_file: bool,
 ) -> ApiResult<(Vec<UploadPart>, HashMap<String, String>)> {
     let mut files: Vec<(Vec<u8>, String)> = Vec::new();
     let mut hints: Vec<String> = Vec::new();
@@ -772,7 +1222,7 @@ async fn read_upload(
             fields.insert(name, v);
         }
     }
-    if files.is_empty() {
+    if files.is_empty() && require_file {
         return Err(ApiError::bad_request("缺少 file 字段"));
     }
     let fallback = hints.first().cloned().unwrap_or_default();
@@ -823,7 +1273,7 @@ pub async fn inspect_upload(
     mut multipart: Multipart,
 ) -> ApiResult<Json<Value>> {
     require_admin(&state, &headers)?;
-    let (parts, fields) = read_upload(&mut multipart).await?;
+    let (parts, fields) = read_upload(&mut multipart, true).await?;
     let (bytes, fname, path_hint) = {
         let p = &parts[0];
         (p.bytes.clone(), p.fname.clone(), p.path_hint.clone())
@@ -837,18 +1287,276 @@ pub async fn inspect_upload(
     Ok(Json(json!({ "info": info, "detection": detection })))
 }
 
+/// 上传合并计划：一个设备行里按**表盘 id** 认包，只替换上传上来的那一个，
+/// 没上传的原样保留。纯内存计算，便于单测。
+#[derive(Debug, Clone)]
+struct ExistingFile {
+    id: String,
+    file_name: String,
+    sha: String,
+    storage_path: String,
+    sort_order: i64,
+    watchface_id: Option<String>,
+    bin_version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IncomingFile {
+    file_name: String,
+    sha: String,
+    watchface_id: String,
+    version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PkgAction {
+    /// 同 id、同内容：不重新加密，只保留（并补齐缺的版本号/文件名）
+    Unchanged,
+    /// 同 id、内容变了：替换这一个包，槽位不变
+    Replace,
+    /// 没在现有包里找到这个 id：作为新包追加
+    Add,
+    /// 这次没上传：原样保留
+    Kept,
+}
+
+#[derive(Debug, Clone)]
+struct SlotPlan {
+    action: PkgAction,
+    existing_idx: Option<usize>,
+    incoming_idx: Option<usize>,
+    sort_order: i64,
+}
+
+#[derive(Debug)]
+struct MergePlan {
+    slots: Vec<SlotPlan>,
+    /// 整行版本 = 各包版本的最大值
+    version: String,
+}
+
+#[derive(Debug)]
+struct MergeError {
+    kind: &'static str,
+    message: String,
+}
+
+fn valid_watchface_id(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s != "000000000000"
+}
+
+/// `incoming` 已按文件名自然排序。
+fn plan_merge(
+    existing: &[ExistingFile],
+    incoming: &[IncomingFile],
+    current_version: Option<&str>,
+    force: bool,
+) -> Result<MergePlan, MergeError> {
+    let mut claimed = vec![false; existing.len()];
+    // (incoming index, action, 命中的现有包)
+    let mut decided: Vec<(usize, PkgAction, Option<usize>)> = Vec::with_capacity(incoming.len());
+
+    for (ii, inc) in incoming.iter().enumerate() {
+        let wid = inc.watchface_id.trim();
+        let target = if valid_watchface_id(wid) {
+            existing
+                .iter()
+                .position(|e| e.watchface_id.as_deref().map(str::trim) == Some(wid))
+        } else if existing.is_empty() {
+            // 首次上传：没有可识别 id 也允许（老包/特殊工程的 id 可能是全零）
+            None
+        } else if existing.len() == 1 && !claimed[0] {
+            // 老流程/老数据：单包行允许没有可识别 id 时直接替换
+            Some(0)
+        } else {
+            return Err(MergeError {
+                kind: "no_id",
+                message: format!(
+                    "包 {} 没有可识别的表盘 id，而这一行有 {} 个包，认不出要替换哪一包。\
+                     请重新导出带表盘 id 的 .bin，或先删掉旧包再上传。",
+                    inc.file_name,
+                    existing.len()
+                ),
+            });
+        };
+        match target {
+            Some(ei) => {
+                if claimed[ei] {
+                    return Err(MergeError {
+                        kind: "duplicate_id",
+                        message: format!("同一批里有两个包的表盘 id 相同（{wid}）"),
+                    });
+                }
+                claimed[ei] = true;
+                if existing[ei].sha == inc.sha {
+                    decided.push((ii, PkgAction::Unchanged, Some(ei)));
+                } else {
+                    // 版本闸门按**这个包自己**上次的版本比；没有按包版本的老数据退回整行版本
+                    let old_ver = existing[ei]
+                        .bin_version
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .or(current_version)
+                        .unwrap_or("");
+                    if !force
+                        && !old_ver.is_empty()
+                        && version_tuple(&inc.version) <= version_tuple(old_ver)
+                    {
+                        return Err(MergeError {
+                            kind: "version_not_newer",
+                            message: format!(
+                                "包 {} 的版本 {} 不高于它当前的 {}；确认要替换请点「强制替换」",
+                                inc.file_name, inc.version, old_ver
+                            ),
+                        });
+                    }
+                    decided.push((ii, PkgAction::Replace, Some(ei)));
+                }
+            }
+            None => decided.push((ii, PkgAction::Add, None)),
+        }
+    }
+
+    // 最终顺序：已有的包保持原槽位（被替换的也留在原位），新增包按本批文件名顺序追加
+    let mut slots: Vec<SlotPlan> = Vec::with_capacity(existing.len() + incoming.len());
+    let mut order: Vec<usize> = (0..existing.len()).collect();
+    order.sort_by(|&a, &b| {
+        existing[a]
+            .sort_order
+            .cmp(&existing[b].sort_order)
+            .then_with(|| existing[a].id.cmp(&existing[b].id))
+    });
+    for ei in order {
+        match decided.iter().find(|(_, _, e)| *e == Some(ei)) {
+            Some((ii, action, _)) => slots.push(SlotPlan {
+                action: *action,
+                existing_idx: Some(ei),
+                incoming_idx: Some(*ii),
+                sort_order: 0,
+            }),
+            None => slots.push(SlotPlan {
+                action: PkgAction::Kept,
+                existing_idx: Some(ei),
+                incoming_idx: None,
+                sort_order: 0,
+            }),
+        }
+    }
+    for (ii, action, ei) in &decided {
+        if ei.is_none() {
+            slots.push(SlotPlan {
+                action: *action,
+                existing_idx: None,
+                incoming_idx: Some(*ii),
+                sort_order: 0,
+            });
+        }
+    }
+    for (i, s) in slots.iter_mut().enumerate() {
+        s.sort_order = i as i64;
+    }
+
+    // 整批内容都已经在这一行里了 → 重复上传（没有替换、也没有新增）
+    if slots
+        .iter()
+        .all(|s| matches!(s.action, PkgAction::Kept | PkgAction::Unchanged))
+    {
+        return Err(MergeError {
+            kind: "duplicate",
+            message: format!(
+                "这批包和 {} 完全相同，无需重复上传",
+                current_version.unwrap_or("当前版本")
+            ),
+        });
+    }
+
+    // 整行版本 = 各包版本的最大值（买家端「可更新」另按内容指纹判断，不受影响）
+    let mut max_ver = String::new();
+    for s in &slots {
+        let mut v = match (s.existing_idx, s.incoming_idx) {
+            (Some(ei), Some(ii)) => match s.action {
+                PkgAction::Replace | PkgAction::Unchanged => incoming[ii].version.clone(),
+                _ => existing[ei].bin_version.clone().unwrap_or_default(),
+            },
+            (Some(ei), None) => existing[ei].bin_version.clone().unwrap_or_default(),
+            (None, Some(ii)) => incoming[ii].version.clone(),
+            _ => String::new(),
+        };
+        if v.trim().is_empty() {
+            v = current_version.unwrap_or("").to_string();
+        }
+        if !v.trim().is_empty()
+            && (max_ver.is_empty() || version_tuple(&v) > version_tuple(&max_ver))
+        {
+            max_ver = v;
+        }
+    }
+    if max_ver.is_empty() {
+        max_ver = current_version.unwrap_or("1.0.0").to_string();
+    }
+
+    Ok(MergePlan { slots, version: max_ver })
+}
+
+/// 已加密、待落库的一个包。
+struct EncPart {
+    file_id: String,
+    storage: std::path::PathBuf,
+    enc: crate::crypto::EncryptedFile,
+    sha_cipher: String,
+}
+
+fn insert_file_row(
+    tx: &rusqlite::Transaction<'_>,
+    version_id: i64,
+    enc: &EncPart,
+    part: &UploadPart,
+    info: &crate::bin_inspect::BinInfo,
+    sort_order: i64,
+) -> ApiResult<()> {
+    tx.execute(
+        "INSERT INTO files(id, version_id, file_name, size, sha256_plain, sha256_cipher,
+             storage_path, file_nonce, cek_wrapped, cek_wrap_nonce, created_at, sort_order,
+             watchface_id, photo_album, bin_version)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            enc.file_id,
+            version_id,
+            part.fname,
+            part.bytes.len() as i64,
+            info.sha256,
+            enc.sha_cipher,
+            enc.storage.to_string_lossy(),
+            &enc.enc.file_nonce[..],
+            &enc.enc.cek_wrapped,
+            &enc.enc.cek_wrap_nonce[..],
+            now(),
+            sort_order,
+            info.watchface_id,
+            info.photo_album as i64,
+            info.version_label
+        ],
+    )
+    .map_err(ApiError::from)?;
+    Ok(())
+}
+
 /// POST /admin/versions/upload —— 上传即加密。
 /// **一次请求可以带多个 `file`**：同一设备因内存限制拆成两个独立表盘时，
 /// 它们同属一个版本（一个购买链接），按**文件名自然排序**依次安装。
-/// 版本号取第一个包的 .bin 头部（1.0.2 这种）；比当前更高才替换（`force=true` 可强制）；
-/// 替换成功后只保留这一版（旧包密文删除）。
+///
+/// 落库规则（2026-10-17 起）：按**表盘 id** 认包，只替换上传上来的那一个包，
+/// 没上传的包原样保留；没有命中任何现有包 id 的作为新包追加。
+/// 版本闸门也按包比（用 `files.bin_version`，老数据见 `backfill.rs`）；
+/// 整行版本取各包版本的最大值。`force=true` 可强制替换同版本/旧版本内容。
 pub async fn upload_version(
     State(state): State<AppState>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult<Json<Value>> {
     require_admin(&state, &headers)?;
-    let (mut parts, fields) = read_upload(&mut multipart).await?;
+    let (mut parts, fields) = read_upload(&mut multipart, true).await?;
     // 安装顺序 = 文件名自然排序（用户约定：文件名决定顺序）
     parts.sort_by(|a, b| natural_key(&a.fname).cmp(&natural_key(&b.fname)));
 
@@ -860,7 +1568,6 @@ pub async fn upload_version(
     }
     let info = infos[0].clone();
     let fname = parts[0].fname.clone();
-    let version = info.version_label.clone();
     let force = fields
         .get("force")
         .map(|v| v == "true" || v == "1")
@@ -911,14 +1618,13 @@ pub async fn upload_version(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let (vprod, vname, vgroup, vwfid) = vrow.ok_or_else(|| ApiError::bad_request("设备行不存在"))?;
+    let (vprod, vname, vgroup, _vwfid) = vrow.ok_or_else(|| ApiError::bad_request("设备行不存在"))?;
     if vprod != product_id {
         return Err(ApiError::bad_request("设备行不属于该资源"));
     }
 
     // 同一批的每个包都必须归到这一行（否则买家装了不配套的两个包）
-    let want_wfid = vwfid.clone().unwrap_or_else(|| info.watchface_id.trim().to_string());
-    for (i, (p, det)) in parts.iter().zip(dets.iter()).enumerate().skip(1) {
+    for (det, p) in dets.iter().zip(parts.iter()).skip(1) {
         let same_row = det.variant_id.as_deref() == Some(variant_id.as_str());
         let same_group_new = det.variant_id.is_none()
             && det.device_group_id.as_deref() == Some(vgroup.as_str());
@@ -931,157 +1637,212 @@ pub async fn upload_version(
                 vname
             )));
         }
-        // 两个包是「两个独立表盘」——表盘 id 不能相同，否则设备上会互相顶掉、留档也会覆盖
-        let wid = infos[i].watchface_id.trim();
-        if !wid.is_empty() && wid != "000000000000" && wid == want_wfid.trim() {
+    }
+    // 两个包是「两个独立表盘」——表盘 id 不能相同，否则设备上会互相顶掉、留档也会覆盖。
+    // 按 id 匹配替换之后，这一条比原来更要紧：同 id 的两个包会指向同一行。
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut invalid = 0usize;
+        for (i, p) in parts.iter().enumerate() {
+            let wid = infos[i].watchface_id.trim();
+            if wid.is_empty() || wid == "000000000000" {
+                invalid += 1;
+                continue;
+            }
+            if !seen.insert(wid.to_string()) {
+                return Err(ApiError::bad_request(format!(
+                    "同一批的两个包表盘 id 相同（{wid}）：设备上会互相覆盖、编辑留档也会丢一个。
+                     拆包时每个包要生成各自的表盘 id（{}）。",
+                    p.fname
+                )));
+            }
+        }
+        if invalid > 1 {
             return Err(ApiError::bad_request(format!(
-                "同一批的两个包表盘 id 相同（{wid}）：设备上会互相覆盖、编辑留档也会丢一个。
-                 拆包时每个包要生成各自的表盘 id。"
+                "同一批有 {invalid} 个包没有可识别的表盘 id，认不出它们各自是哪个表盘。
+                 请重新导出带表盘 id 的 .bin，或一次只传一个无 id 的包。"
             )));
         }
     }
 
-    let current: Option<(String, String)> = conn
+    // 当前版本行（一个设备行只保留一条最新版本）
+    let current: Option<(i64, String)> = conn
         .query_row(
-            "SELECT vr.version, f.sha256_plain FROM files f JOIN versions vr ON vr.id = f.version_id
-             WHERE vr.variant_id = ?1 ORDER BY vr.id DESC LIMIT 1",
+            "SELECT id, version FROM versions WHERE variant_id = ?1 ORDER BY id DESC LIMIT 1",
             [&variant_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
 
-    // 整批内容都已经在这个设备行里了 → 重复上传（只更新了其中一个包时照样允许）
-    let existing: Vec<String> = {
+    // 这一行现有的全部包：按包 id 判断「替换哪一个」，没上传的原样保留
+    let mut existing: Vec<ExistingFile> = Vec::new();
+    if let Some((version_id, _)) = &current {
         let mut stmt = conn
             .prepare(
-                "SELECT f.sha256_plain FROM files f
-                 JOIN versions vr ON vr.id = f.version_id WHERE vr.variant_id = ?1",
+                "SELECT id, file_name, sha256_plain, storage_path, sort_order,
+                        watchface_id, bin_version
+                 FROM files WHERE version_id = ?1 ORDER BY sort_order, id",
             )
             .map_err(ApiError::from)?;
-        let rows: Vec<String> = stmt
-            .query_map([&variant_id], |r| r.get(0))
+        existing = stmt
+            .query_map([version_id], |r| {
+                Ok(ExistingFile {
+                    id: r.get(0)?,
+                    file_name: r.get(1)?,
+                    sha: r.get(2)?,
+                    storage_path: r.get(3)?,
+                    sort_order: r.get(4)?,
+                    watchface_id: r.get(5)?,
+                    bin_version: r.get(6)?,
+                })
+            })
             .map_err(ApiError::from)?
             .filter_map(|r| r.ok())
             .collect();
-        rows
-    };
-    if !existing.is_empty() && infos.iter().all(|i| existing.iter().any(|s| s == &i.sha256)) {
-        let cur = current
-            .as_ref()
-            .map(|(v, _)| v.clone())
-            .unwrap_or_else(|| "当前版本".into());
-        return Err(ApiError::conflict(
-            "duplicate",
-            format!("这批包和 {cur} 完全相同，无需重复上传"),
-        ));
     }
 
-    if let Some((cur_ver, _)) = &current {
-        if version_tuple(&version) <= version_tuple(cur_ver) && !force {
-            return Err(ApiError::conflict(
-                "version_not_newer",
-                format!("包体版本 {version} 不高于当前的 {cur_ver}；确认要替换请点「强制替换」"),
-            ));
+    let incoming: Vec<IncomingFile> = parts
+        .iter()
+        .zip(infos.iter())
+        .map(|(p, i)| IncomingFile {
+            file_name: p.fname.clone(),
+            sha: i.sha256.clone(),
+            watchface_id: i.watchface_id.trim().to_string(),
+            version: i.version_label.clone(),
+        })
+        .collect();
+    let cur_ver = current.as_ref().map(|(_, v)| v.as_str());
+    let plan = plan_merge(&existing, &incoming, cur_ver, force).map_err(|e| match e.kind {
+        "duplicate" => ApiError::conflict("duplicate", e.message),
+        "version_not_newer" => ApiError::conflict("version_not_newer", e.message),
+        _ => ApiError::bad_request(e.message),
+    })?;
+
+    // 只加密真正要落盘的新内容（替换/新增）；未变的包不重新加密
+    let mut encs: Vec<Option<EncPart>> = (0..parts.len()).map(|_| None).collect();
+    for slot in &plan.slots {
+        let Some(ii) = slot.incoming_idx else { continue };
+        if !matches!(slot.action, PkgAction::Replace | PkgAction::Add) {
+            continue;
         }
-    }
-
-    // 逐个加密（明文只在内存里）
-    struct EncPart {
-        file_id: String,
-        storage: std::path::PathBuf,
-        enc: crate::crypto::EncryptedFile,
-        sha_cipher: String,
-    }
-    let mut encs = Vec::with_capacity(parts.len());
-    for p in parts.iter() {
+        let p = &parts[ii];
         let enc = crate::crypto::encrypt_file(&state.kek, &p.bytes)?;
         let file_id = new_id("f_");
         let storage = state.cipher_dir.join(format!("{file_id}.enc"));
         std::fs::write(&storage, &enc.cipher)
             .map_err(|e| ApiError::internal(format!("写密文失败: {e}")))?;
         let sha_cipher = crate::crypto::sha256_hex(&enc.cipher);
-        encs.push(EncPart { file_id, storage, enc, sha_cipher });
+        encs[ii] = Some(EncPart { file_id, storage, enc, sha_cipher });
     }
     let canvas = info.canvas.map(|(w, h)| format!("{w}x{h}"));
-    let batch_files: Vec<Value> = parts
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            json!({
-                "fileId": encs[i].file_id,
-                "fileName": p.fname,
-                "size": p.bytes.len(),
-                "sha256Plain": infos[i].sha256,
-                "watchfaceId": infos[i].watchface_id,
-                "name": infos[i].name,
-                "styleCount": infos[i].style_count,
-                "sort": i as i64,
-            })
-        })
-        .collect();
 
     let tx = conn.unchecked_transaction().map_err(ApiError::from)?;
-    let old_paths: Vec<String> = {
-        let mut stmt = tx
-            .prepare(
-                "SELECT f.storage_path FROM files f
-                 JOIN versions vr ON vr.id = f.version_id WHERE vr.variant_id = ?1",
-            )
-            .map_err(ApiError::from)?;
-        let rows: Vec<String> = stmt
-            .query_map([&variant_id], |r| r.get(0))
-            .map_err(ApiError::from)?
-            .filter_map(|r| r.ok())
-            .collect();
-        rows
-    };
-    tx.execute(
-        "DELETE FROM files WHERE version_id IN (SELECT id FROM versions WHERE variant_id = ?1)",
-        [&variant_id],
-    )
-    .map_err(ApiError::from)?;
-    tx.execute("DELETE FROM versions WHERE variant_id = ?1", [&variant_id])
-        .map_err(ApiError::from)?;
-    tx.execute(
-        "INSERT INTO versions(variant_id, version, notes, is_latest, bin_fmt_version,
-             bin_style_count, bin_canvas, bin_name, created_at)
-         VALUES(?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            variant_id,
-            version,
-            fields.get("notes").cloned().filter(|s| !s.is_empty()),
-            info.fmt_version,
-            info.style_count as i64,
-            canvas,
-            info.name,
-            now()
-        ],
-    )
-    .map_err(ApiError::from)?;
-    let version_id = tx.last_insert_rowid();
-    for (i, p) in parts.iter().enumerate() {
-        let e = &encs[i];
+    let version_id = if let Some((vid, _)) = &current {
         tx.execute(
-            "INSERT INTO files(id, version_id, file_name, size, sha256_plain, sha256_cipher,
-                 storage_path, file_nonce, cek_wrapped, cek_wrap_nonce, created_at, sort_order)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "UPDATE versions SET version = ?2 WHERE id = ?1",
+            params![vid, &plan.version],
+        )
+        .map_err(ApiError::from)?;
+        *vid
+    } else {
+        tx.execute(
+            "INSERT INTO versions(variant_id, version, notes, is_latest, bin_fmt_version,
+                 bin_style_count, bin_canvas, bin_name, created_at)
+             VALUES(?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8)",
             params![
-                e.file_id,
-                version_id,
-                p.fname,
-                p.bytes.len() as i64,
-                infos[i].sha256,
-                e.sha_cipher,
-                e.storage.to_string_lossy(),
-                &e.enc.file_nonce[..],
-                &e.enc.cek_wrapped,
-                &e.enc.cek_wrap_nonce[..],
-                now(),
-                i as i64
+                variant_id,
+                &plan.version,
+                fields.get("notes").cloned().filter(|s| !s.is_empty()),
+                info.fmt_version,
+                info.style_count as i64,
+                canvas,
+                info.name,
+                now()
             ],
         )
         .map_err(ApiError::from)?;
+        tx.last_insert_rowid()
+    };
+
+    let mut old_paths: Vec<String> = Vec::new();
+    let mut merged_files: Vec<Value> = Vec::with_capacity(plan.slots.len());
+    for slot in &plan.slots {
+        let (file_id, file_name, sha, wfid, version_label, action) = match slot.action {
+            PkgAction::Kept => {
+                let e = &existing[slot.existing_idx.expect("kept 缺现有包")];
+                tx.execute(
+                    "UPDATE files SET sort_order = ?2 WHERE id = ?1",
+                    params![&e.id, slot.sort_order],
+                )
+                .map_err(ApiError::from)?;
+                (
+                    e.id.clone(),
+                    e.file_name.clone(),
+                    e.sha.clone(),
+                    e.watchface_id.clone().unwrap_or_default(),
+                    e.bin_version.clone().unwrap_or_default(),
+                    "kept",
+                )
+            }
+            PkgAction::Unchanged => {
+                let e = &existing[slot.existing_idx.expect("unchanged 缺现有包")];
+                let ii = slot.incoming_idx.expect("unchanged 缺上传包");
+                tx.execute(
+                    "UPDATE files SET sort_order = ?2, file_name = ?3, bin_version = ?4 WHERE id = ?1",
+                    params![&e.id, slot.sort_order, parts[ii].fname, infos[ii].version_label],
+                )
+                .map_err(ApiError::from)?;
+                (
+                    e.id.clone(),
+                    parts[ii].fname.clone(),
+                    infos[ii].sha256.clone(),
+                    infos[ii].watchface_id.trim().to_string(),
+                    infos[ii].version_label.clone(),
+                    "unchanged",
+                )
+            }
+            PkgAction::Replace => {
+                let e = &existing[slot.existing_idx.expect("replace 缺现有包")];
+                let ii = slot.incoming_idx.expect("replace 缺上传包");
+                let enc = encs[ii].as_ref().expect("replace 缺密文");
+                old_paths.push(e.storage_path.clone());
+                tx.execute("DELETE FROM files WHERE id = ?1", [&e.id])
+                    .map_err(ApiError::from)?;
+                insert_file_row(&tx, version_id, enc, &parts[ii], &infos[ii], slot.sort_order)?;
+                (
+                    enc.file_id.clone(),
+                    parts[ii].fname.clone(),
+                    infos[ii].sha256.clone(),
+                    infos[ii].watchface_id.trim().to_string(),
+                    infos[ii].version_label.clone(),
+                    "replaced",
+                )
+            }
+            PkgAction::Add => {
+                let ii = slot.incoming_idx.expect("add 缺上传包");
+                let enc = encs[ii].as_ref().expect("add 缺密文");
+                insert_file_row(&tx, version_id, enc, &parts[ii], &infos[ii], slot.sort_order)?;
+                (
+                    enc.file_id.clone(),
+                    parts[ii].fname.clone(),
+                    infos[ii].sha256.clone(),
+                    infos[ii].watchface_id.trim().to_string(),
+                    infos[ii].version_label.clone(),
+                    "added",
+                )
+            }
+        };
+        merged_files.push(json!({
+            "fileId": file_id,
+            "fileName": file_name,
+            "sha256Plain": sha,
+            "watchfaceId": wfid,
+            "version": version_label,
+            "action": action,
+            "sort": slot.sort_order,
+        }));
     }
+
     if !info.watchface_id.trim().is_empty() && info.watchface_id.trim() != "000000000000" {
         tx.execute(
             "UPDATE variants SET watchface_id = ?2 WHERE id = ?1 AND (watchface_id IS NULL OR watchface_id = '')",
@@ -1094,19 +1855,19 @@ pub async fn upload_version(
         let _ = std::fs::remove_file(p);
     }
 
-    let replaced = current.as_ref().map(|(v, _)| v.clone());
+    let replaced = current.as_ref().map(|(_, v)| v.clone());
     Ok(Json(json!({
         "ok": true,
         "variantId": variant_id,
         "variantName": vname,
         "createdRow": created_row,
-        "version": version,
+        "version": plan.version,
         "replacedVersion": replaced,
         "forced": force,
-        "count": batch_files.len(),
-        // 一批多个包时：files 是全部（按 sort 顺序），file 保留第一个做兼容
-        "files": batch_files,
-        "file": batch_files.first().cloned().unwrap_or(Value::Null),
+        "count": merged_files.len(),
+        // 合并后这一行的全部包（按安装顺序），action = kept / unchanged / replaced / added
+        "files": merged_files,
+        "file": merged_files.first().cloned().unwrap_or(Value::Null),
         "bin": {
             "watchfaceId": info.watchface_id, "name": info.name,
             "versionLabel": info.version_label, "fmtVersion": info.fmt_version,
@@ -1161,6 +1922,13 @@ pub async fn afdian_sync(
                         sum.revoked.len(),
                         sum.unbound
                     );
+                    if !sum.replayed.is_empty() {
+                        println!(
+                            "[afdian] ⚠️ 本轮拒绝 {} 笔订单重放（权益已归属其他账号）：{:?}",
+                            sum.replayed.len(),
+                            sum.replayed
+                        );
+                    }
                     json!({ "ok": true, "orders": count, "summary": sum, "finishedAt": crate::db::now() })
                 }
                 Err(e) => {
@@ -1659,7 +2427,7 @@ pub async fn app_release_upload(
     mut multipart: Multipart,
 ) -> ApiResult<Json<Value>> {
     require_admin(&state, &headers)?;
-    let (parts, fields) = read_upload(&mut multipart).await?;
+    let (parts, fields) = read_upload(&mut multipart, true).await?;
     let bytes = &parts[0].bytes;
 
     // 它得真是个 APK：ZIP 头 + ZIP 目录里必然出现的 AndroidManifest.xml
@@ -1723,6 +2491,13 @@ pub async fn app_release_upload(
     let file_name = format!("panfang-{version_name}-{}.apk", &sha256[..8]);
     let storage = app_dir.join(&file_name);
     std::fs::write(&storage, bytes).map_err(|e| ApiError::internal(format!("写 APK 失败: {e}")))?;
+    // APK 由 nginx 直接静态分发（见 deploy/nginx-api.conf）：服务以 wf + UMask=0027 运行，
+    // 新文件默认 640 wf:wf，nginx(www-data) 读不到 → 显式给只读权限，否则新版下载 404。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o644));
+    }
     let size = bytes.len() as i64;
 
     {
@@ -1851,7 +2626,151 @@ pub async fn app_release_delete(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_afdian_url;
+    use super::*;
+
+    fn ex(id: &str, sha: &str, sort: i64, wid: &str, ver: &str) -> ExistingFile {
+        ExistingFile {
+            id: id.into(),
+            file_name: format!("{id}.bin"),
+            sha: sha.into(),
+            storage_path: format!("/tmp/{id}.enc"),
+            sort_order: sort,
+            watchface_id: Some(wid.into()),
+            bin_version: Some(ver.into()),
+        }
+    }
+
+    fn inc(name: &str, sha: &str, wid: &str, ver: &str) -> IncomingFile {
+        IncomingFile {
+            file_name: name.into(),
+            sha: sha.into(),
+            watchface_id: wid.into(),
+            version: ver.into(),
+        }
+    }
+
+    /// 用户的实际场景：A=1.0.2 不动，B 从 1.0.1 升到 1.0.2，只传 B。
+    #[test]
+    fn partial_update_only_replaces_matched_package() {
+        let existing = vec![
+            ex("a", "sha-a", 0, "111111111111", "1.0.2"),
+            ex("b", "sha-b", 1, "222222222222", "1.0.1"),
+        ];
+        let incoming = vec![inc("b-new.bin", "sha-b2", "222222222222", "1.0.2")];
+        let plan = plan_merge(&existing, &incoming, Some("1.0.2"), false).unwrap();
+
+        assert_eq!(plan.slots.len(), 2);
+        assert_eq!(plan.slots[0].action, PkgAction::Kept);
+        assert_eq!(plan.slots[1].action, PkgAction::Replace);
+        assert_eq!(plan.slots[1].existing_idx, Some(1));
+        // 整行版本 = 各包最大值，仍然是 1.0.2
+        assert_eq!(plan.version, "1.0.2");
+    }
+
+    /// 同版本号但内容变了：默认拦下，force 才放行（与旧行为一致）
+    #[test]
+    fn same_version_new_content_needs_force() {
+        let existing = vec![ex("b", "sha-b", 0, "222222222222", "1.0.2")];
+        let incoming = vec![inc("b.bin", "sha-b2", "222222222222", "1.0.2")];
+        let err = plan_merge(&existing, &incoming, Some("1.0.2"), false).unwrap_err();
+        assert_eq!(err.kind, "version_not_newer");
+
+        let plan = plan_merge(&existing, &incoming, Some("1.0.2"), true).unwrap();
+        assert_eq!(plan.slots[0].action, PkgAction::Replace);
+    }
+
+    /// 原样重传：不重新加密，也不允许整批空转
+    #[test]
+    fn unchanged_batch_is_duplicate() {
+        let existing = vec![
+            ex("a", "sha-a", 0, "111111111111", "1.0.2"),
+            ex("b", "sha-b", 1, "222222222222", "1.0.2"),
+        ];
+        let incoming = vec![
+            inc("a.bin", "sha-a", "111111111111", "1.0.2"),
+            inc("b.bin", "sha-b", "222222222222", "1.0.2"),
+        ];
+        let err = plan_merge(&existing, &incoming, Some("1.0.2"), true).unwrap_err();
+        assert_eq!(err.kind, "duplicate");
+    }
+
+    /// 只传没见过的 id → 当新包追加，不碰已有包
+    #[test]
+    fn unknown_id_appends_new_package() {
+        let existing = vec![ex("a", "sha-a", 0, "111111111111", "1.0.2")];
+        let incoming = vec![inc("c.bin", "sha-c", "333333333333", "1.0.3")];
+        let plan = plan_merge(&existing, &incoming, Some("1.0.2"), false).unwrap();
+
+        assert_eq!(plan.slots.len(), 2);
+        assert_eq!(plan.slots[0].action, PkgAction::Kept);
+        assert_eq!(plan.slots[1].action, PkgAction::Add);
+        assert_eq!(plan.slots[1].sort_order, 1);
+        assert_eq!(plan.version, "1.0.3");
+    }
+
+    /// 没有表盘 id：首次上传允许；单包行按替换处理；多包行拒绝（避免误伤）
+    #[test]
+    fn missing_id_single_package_ok_multi_rejected() {
+        let first = plan_merge(
+            &[],
+            &[inc("new.bin", "sha-new", "000000000000", "1.0.0")],
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(first.slots[0].action, PkgAction::Add);
+
+        let single = vec![ex("a", "sha-a", 0, "111111111111", "1.0.2")];
+        let inc_old = vec![inc("a.bin", "sha-a2", "000000000000", "1.0.3")];
+        let plan = plan_merge(&single, &inc_old, Some("1.0.2"), false).unwrap();
+        assert_eq!(plan.slots[0].action, PkgAction::Replace);
+
+        let multi = vec![
+            ex("a", "sha-a", 0, "111111111111", "1.0.2"),
+            ex("b", "sha-b", 1, "222222222222", "1.0.2"),
+        ];
+        let err = plan_merge(&multi, &inc_old, Some("1.0.2"), false).unwrap_err();
+        assert_eq!(err.kind, "no_id");
+    }
+
+    /// 替换留在原槽位，新包追加到末尾；上传顺序不改变已有安装顺序
+    #[test]
+    fn replacement_keeps_slot_and_add_appends() {
+        let existing = vec![
+            ex("a", "sha-a", 0, "111111111111", "1.0.2"),
+            ex("b", "sha-b", 1, "222222222222", "1.0.1"),
+        ];
+        let incoming = vec![
+            inc("b.bin", "sha-b2", "222222222222", "1.0.2"),
+            inc("c.bin", "sha-c", "333333333333", "1.0.3"),
+        ];
+        let plan = plan_merge(&existing, &incoming, Some("1.0.2"), true).unwrap();
+        let acts: Vec<_> = plan.slots.iter().map(|s| (s.action, s.sort_order)).collect();
+        assert_eq!(
+            acts,
+            vec![
+                (PkgAction::Kept, 0),
+                (PkgAction::Replace, 1),
+                (PkgAction::Add, 2)
+            ]
+        );
+    }
+
+    /// 一起传「没变的 A + 变了的 B」：A 记为未变，不重复加密
+    #[test]
+    fn batch_with_one_unchanged_is_not_duplicate() {
+        let existing = vec![
+            ex("a", "sha-a", 0, "111111111111", "1.0.2"),
+            ex("b", "sha-b", 1, "222222222222", "1.0.1"),
+        ];
+        let incoming = vec![
+            inc("a.bin", "sha-a", "111111111111", "1.0.2"),
+            inc("b.bin", "sha-b2", "222222222222", "1.0.2"),
+        ];
+        let plan = plan_merge(&existing, &incoming, Some("1.0.2"), false).unwrap();
+        assert_eq!(plan.slots[0].action, PkgAction::Unchanged);
+        assert_eq!(plan.slots[1].action, PkgAction::Replace);
+    }
 
     #[test]
     fn afdian_url_parsing() {

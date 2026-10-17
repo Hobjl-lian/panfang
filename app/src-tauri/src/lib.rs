@@ -4,11 +4,13 @@ pub mod bridge;
 pub mod cloud;
 pub mod conn;
 pub mod diag;
+pub mod generator_cmd;
 pub mod paid;
 pub mod watchface_bin;
 pub mod watchface_edit;
 pub mod watchface_imgcodec;
 pub mod watchface_render;
+pub mod wallpaper_gen;
 
 use bridge::AppState;
 
@@ -148,6 +150,11 @@ pub fn run() {
             install_back_lock,
             keep_screen_on,
             open_webview_settings,
+            generator_cmd::watchface_generator_plan,
+            generator_cmd::watchface_generator_render,
+            generator_cmd::watchface_generator_frame,
+            generator_cmd::watchface_generator_cached,
+            generator_cmd::watchface_generator_clear,
             app_update::app_update_check,
             app_update::app_update_download,
             app_update::app_update_install,

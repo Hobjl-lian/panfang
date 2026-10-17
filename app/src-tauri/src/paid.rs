@@ -836,7 +836,9 @@ pub async fn paid_latest_file(
 }
 
 /// 下载 → 解密（内存）→ 直装到设备；全程发 `wf-paid-progress`，安装阶段另有 `wf-install-progress`。
-/// **一批多个包时按顺序依次安装，返回最后一个包的表盘 id**（前端拿它设为当前表盘）。
+/// **一批多个包时按顺序依次安装，返回最后一个包的表盘 id**（前端拿它设为当前表盘）；
+/// 表盘 id 是设备往返解析出来的，个别情况下解析不出来 —— 那种情况**安装本身已经成功**，
+/// 返回 `None` 让界面照常走成功页（不能反过来报「安装失败」骗用户重装）。
 /// `file_ids` = 只装选中的这些包（多包体「勾选安装」）；None = 全装。
 /// 记账的版本指纹始终按**全量包体**算（与服务端 latest_sha 同口径），勾选装一部分不影响「可更新」判断。
 #[tauri::command]
@@ -848,7 +850,7 @@ pub async fn paid_install(
     variant_id: String,
     device_name: Option<String>,
     file_ids: Option<Vec<String>>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let (base, token) = with_ctx(&state, |c| Ok((c.base.clone(), c.token().map(|t| t.to_string()))))
         .map_err(|e| e.to_string())?;
     let token = token.ok_or_else(|| "NOT_BOUND".to_string())?;
@@ -1000,7 +1002,7 @@ pub async fn paid_install(
         format!("已安装 {version}")
     };
     emit_progress(&app, "done", &done, None, None);
-    last_id.ok_or_else(|| "装完了，但没拿到表盘 id（可能不是表盘文件）".to_string())
+    Ok(last_id)
 }
 
 #[cfg(test)]

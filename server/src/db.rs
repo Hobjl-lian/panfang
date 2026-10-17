@@ -18,6 +18,9 @@ pub fn new_id(prefix: &str) -> String {
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // WAL 下 NORMAL 是标准做法：崩溃最多丢最后几笔事务，但不会损坏库；
+    // 默认 FULL 每条写语句都 fsync —— 全量补拉 2.5 万单（十万级写）会把全局锁占上分钟级。
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
     migrate(&conn)?;
@@ -53,12 +56,29 @@ fn migrate(conn: &Connection) -> Result<()> {
     add("variants", "afdian_plan_id", "afdian_plan_id TEXT")?;
     add("variants", "afdian_sku", "afdian_sku TEXT")?;
     add("afdian_orders", "sku_name", "sku_name TEXT")?;  // 规格名（JSON 数组），用于按规格路由到设备行
+    // 这笔订单的权益归属哪个主体：第一次同步处理时钉下，之后**换绑到别的小米账号也不再重放**。
+    // 没有它时：买家把爱发电账号换绑到其他账号，下一轮同步会把同一订单再开通一遍，
+    // 且旧账号授权不收回 → 一份订单可扩散到任意多个账号（2026-10-16 修）。
+    add("afdian_orders", "granted_subject_id", "granted_subject_id TEXT")?;
     // 一个版本可以有多个包（同一设备因内存限制拆成两个独立表盘，依次安装）；
     // sort_order = 安装顺序（按文件名自然排序得出），从 0 起
     add("files", "sort_order", "sort_order INTEGER NOT NULL DEFAULT 0")?;
+    // 每个包自己的表盘 id（一个设备行可能有 2 个包）与「是不是照片表盘」的自动识别结果。
+    // 老数据由 `cargo run --bin wf-backfill-flags` 解密后回填；NULL = 未识别。
+    add("files", "watchface_id", "watchface_id TEXT")?;
+    add("files", "photo_album", "photo_album INTEGER")?;
+    // 每个包自己的 .bin 版本号（同一设备行可能有 2 个包，版本各自独立）。
+    // 上传时按**包**比较新旧（只替换 ID 命中的那个包）；老数据由服务启动时解密回填
+    // （backfill.rs）。NULL = 还没回填，比较时退回整行版本。
+    add("files", "bin_version", "bin_version TEXT")?;
     // 某些主体（例如 App 开发者本人）需要永久全资源：在售与将来新增的资源都自动可下载，
     // 不用每个产品手动 grant 一次。0/1 标记，生效与否在鉴权时判断（licenses 表保持不变）。
     add("subjects", "all_access", "all_access INTEGER NOT NULL DEFAULT 0")?;
+    // 绑定会话的发起 IP 与回调 IP：正常绑定两步都来自同一台手机（同一出口 IP）；
+    // 不一致说明「链接是别人发来的」（OAuth 登录 CSRF / 钓鱼），只记录告警、不阻断，
+    // 出事时能据此定位是哪一次绑定被借用（2026-10-17 上线前审查加）。
+    add("afdian_oauth", "start_ip", "start_ip TEXT")?;
+    add("afdian_oauth", "callback_ip", "callback_ip TEXT")?;
 
     // 诊断信息保留 90 天 —— 《隐私政策》里写明了，就得真删，否则政策是假的
     let cutoff = now() - 90 * 86_400;
@@ -288,10 +308,41 @@ CREATE TABLE IF NOT EXISTS files(
   cek_wrapped BLOB NOT NULL,
   cek_wrap_nonce BLOB NOT NULL,
   created_at INTEGER NOT NULL,
-  sort_order INTEGER NOT NULL DEFAULT 0       -- 同一版本内的安装顺序（0 起）
+  sort_order INTEGER NOT NULL DEFAULT 0,      -- 同一版本内的安装顺序（0 起）
+  watchface_id TEXT,                          -- 这个包自己的表盘 id（一个设备行可能有 2 个包，各自独立）
+  photo_album INTEGER                         -- 1/0 = 自动识别是不是照片表盘；NULL = 还没识别（老数据）
 );
 CREATE INDEX IF NOT EXISTS idx_files_version ON files(version_id);
 CREATE INDEX IF NOT EXISTS idx_files_plain ON files(sha256_plain);
+
+-- 照片表盘的**人工纠正**（自动判据见 bin_inspect::photo_album：亮屏样式 backImageId 高字节 0x82）。
+-- 按 watchface_id 存而不是按 files 行存：重传包体会换掉 files 行，但表盘 id 是稳定的，
+-- 人工纠正不会因为重传而丢失。生效值 = 有纠正就用纠正，否则用 files.photo_album。
+CREATE TABLE IF NOT EXISTS photo_album_overrides(
+  watchface_id TEXT PRIMARY KEY,
+  is_photo_album INTEGER NOT NULL,            -- 1 = 是、0 = 不是
+  note TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+-- 照片表盘的「壁纸方案」（一条 = 一个表盘包体，见 docs/方案-壁纸生成器.md）。
+-- config_json = 版本化的配置：画布尺寸 / 每张照片的基准与可调范围 / 相框窗口与多色号素材。
+-- 素材文件落 <data_dir>/editor-assets/<watchface_id>/，这里只登记文件名 + sha256（供 App 校验）。
+-- **素材不加密**：定位是"不发 App 版本就能上新方案"，不是保密内容（用户明确）。
+CREATE TABLE IF NOT EXISTS editor_templates(
+  watchface_id TEXT PRIMARY KEY,
+  config_json TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS editor_assets(
+  watchface_id TEXT NOT NULL,
+  path TEXT NOT NULL,                         -- 素材文件名，只允许相对名（无目录、无 ..）
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(watchface_id, path)
+);
 
 CREATE TABLE IF NOT EXISTS codes(
   id INTEGER PRIMARY KEY AUTOINCREMENT,

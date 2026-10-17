@@ -433,6 +433,48 @@ fn main() {
                 &format!("同一批出现相同表盘 id 被拒（实际 {}）", r3.status),
             );
         }
+        // [2c] 按表盘 id 只替换其中一个包：另一个包原样保留（老版本是整行替换，会丢包）
+        if let Some((_, bytes)) = payload.iter().find(|(n, _)| n == "b2-惊鸿10P.bin") {
+            let mut changed = bytes.clone();
+            if changed.len() >= 8 {
+                // 头部 0x04 = 版本号（u32 LE）；末位 +1 造一个「更高版本」的新内容
+                let v = u32::from_le_bytes([changed[4], changed[5], changed[6], changed[7]]);
+                changed[4..8].copy_from_slice(&(v + 1).to_le_bytes());
+                let r = http.upload(
+                    "/admin/versions/upload",
+                    &admin,
+                    &[("product_id", batch_pid.as_str())],
+                    "b2-惊鸿10P.bin",
+                    &changed,
+                );
+                let j = r.json();
+                let fs = j["files"].as_array().cloned().unwrap_or_default();
+                let acts: Vec<&str> = fs.iter().filter_map(|f| f["action"].as_str()).collect();
+                ok(
+                    r.status == 200
+                        && fs.len() == 2
+                        && acts == vec!["replaced", "kept"]
+                        && fs[1]["fileName"] == serde_json::json!("b10-AWOS9P.bin"),
+                    &format!(
+                        "只传第二个包 → 只替换它、另一个原样保留（状态 {}，{} 个包，动作 {:?}）",
+                        r.status,
+                        fs.len(),
+                        acts
+                    ),
+                );
+                let d = http.get(&format!("/admin/products/{batch_pid}"), Some(&admin));
+                let pk = d.json()["variants"][0]["packages"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let v0 = pk.first().and_then(|x| x["version"].as_str()).unwrap_or("?");
+                let v1 = pk.get(1).and_then(|x| x["version"].as_str()).unwrap_or("?");
+                ok(
+                    pk.len() == 2 && v0 != v1,
+                    &format!("详情页两个包各自显示自己的版本（{v0} / {v1}）"),
+                );
+            }
+        }
         // 清理：删掉拆包测试资源（连带设备行与包体）
         let _ = http.request(
             "DELETE",

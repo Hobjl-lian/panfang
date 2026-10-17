@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 use crate::db::now;
 use crate::state::{bearer, client_ip, require_client, user_agent, ApiError, ApiResult, AppState};
 
+/// 买家下载页（`/get`）：静态模板 + 当前发版信息占位符。
+const GET_PAGE_HTML: &str = include_str!("../static/get.html");
+
 // ---------------------------------------------------------------- 兑换码（已下线）
 // 兑换码这条路已废弃：App 与管理页都不再用它。接口一并删除（曾经的 /v1/redeem 没有任何开关
 // 保护，留着就是白拿资源的口子）。数据库里的 codes 表保留（不做破坏性迁移），但不再读写。
@@ -204,6 +207,7 @@ pub struct OauthStart {
 /// 用户授权后爱发电把浏览器带回 `/v1/afdian/callback`，App 用 `state` 轮询 `/v1/afdian/oauth/poll` 取结果。
 pub async fn afdian_oauth_start(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<OauthStart>,
 ) -> ApiResult<Json<Value>> {
     let Some(cfg) = crate::afdian::oauth_cfg() else {
@@ -226,8 +230,8 @@ pub async fn afdian_oauth_start(
         let subject_id = subject_ensure(&conn, &mi_uid)?;
         conn.execute(
             "INSERT INTO afdian_oauth(state, subject_id, mi_user_id, device_fp, device_pubkey, device_name,
-                                      status, expires_at, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+                                      status, expires_at, created_at, start_ip)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9)",
             params![
                 st,
                 subject_id,
@@ -236,7 +240,8 @@ pub async fn afdian_oauth_start(
                 body.device_pubkey.unwrap_or_default(),
                 body.device_name.unwrap_or_default(),
                 expires_at,
-                now()
+                now(),
+                client_ip(&headers)
             ],
         )?;
     }
@@ -291,6 +296,7 @@ pub struct OauthCb {
 /// 拿 code 换身份 → 建立绑定 → 把这个买家的历史订单一次性补上 → 给 App 备好登录态。
 pub async fn afdian_oauth_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<OauthCb>,
 ) -> ApiResult<Response> {
     let page = |title: &str, body: &str| {
@@ -320,17 +326,17 @@ stroke-linecap="round" stroke-linejoin="round"><path d="M12 20s-7-4.35-7-9a4 4 0
     };
 
     // 1) 校验会话（读操作单独一段，别持锁去调会抢锁的辅助函数）
-    let row: Option<(String, String, i64, String)> = {
+    let row: Option<(String, String, i64, String, Option<String>)> = {
         let conn = state.conn();
         conn.query_row(
-            "SELECT subject_id, mi_user_id, expires_at, status FROM afdian_oauth WHERE state = ?1",
+            "SELECT subject_id, mi_user_id, expires_at, status, start_ip FROM afdian_oauth WHERE state = ?1",
             [st],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(ApiError::from)?
     };
-    let Some((subject_id, mi_uid, expires_at, status)) = row else {
+    let Some((subject_id, mi_uid, expires_at, status, start_ip)) = row else {
         return Ok(page("授权链接已失效", "请回到盘坊 App 重新点一次「用爱发电账号登录」。").into_response());
     };
     if status != "pending" {
@@ -339,6 +345,26 @@ stroke-linecap="round" stroke-linejoin="round"><path d="M12 20s-7-4.35-7-9a4 4 0
     if now() > expires_at {
         mark_oauth_error(&state, st, "授权超时，请回到 App 重新发起");
         return Ok(page("授权超时", "请回到盘坊 App 重新点一次「用爱发电账号登录」。").into_response());
+    }
+    // 发起绑定（App）与用户授权（浏览器）正常都在同一台手机上，出口 IP 应当一致。
+    // 不一致 = 这条授权链接可能是别人发给用户点的（OAuth 登录 CSRF）：
+    // 只打告警日志、不阻断（手机中途切网会误报），出事时可据此定位哪一次绑定被借用。
+    let cb_ip = client_ip(&headers);
+    if let Some(sip) = start_ip.as_deref().filter(|s| !s.is_empty()) {
+        if !cb_ip.is_empty() && sip != cb_ip {
+            let short: String = st.chars().take(8).collect(); // state 未校验字符集，按字符截断防 panic
+            eprintln!(
+                "[afdian] ⚠ 绑定会话 {} 的发起 IP 与授权 IP 不一致：start={} callback={}（核对这一单是否是买家本人操作）",
+                short, sip, cb_ip
+            );
+        }
+    }
+    {
+        let conn = state.conn();
+        let _ = conn.execute(
+            "UPDATE afdian_oauth SET callback_ip=?2 WHERE state=?1",
+            params![st, cb_ip],
+        );
     }
 
     // 2) code → 爱发电 user_id（联调模式支持 code=dev:<uid> 直接模拟）
@@ -985,6 +1011,89 @@ pub async fn app_latest(State(state): State<AppState>) -> ApiResult<Json<Value>>
     })))
 }
 
+/// GET /get（与 `/download` 同一个页面）——买家下载说明页。
+///
+/// 爱发电商品详情 / 自动回复里贴这一条，比裸 `.apk` 可信，也能把系统要求和常见问题
+/// 一次讲清。版本信息从当前发版读，页面本身是静态模板。
+pub async fn get_page(State(state): State<AppState>) -> Response {
+    let row: Option<(String, Option<String>, i64, i64)> = {
+        let conn = state.conn();
+        conn.query_row(
+            "SELECT version_name, notes, size, created_at
+             FROM app_releases WHERE is_current=1 ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .unwrap_or(None)
+    };
+    let (version, notes, size, created) =
+        row.unwrap_or_else(|| ("—".to_string(), None, 0, 0));
+    let size_mb = if size > 0 {
+        // 与浏览器下载时显示的口径一致（十进制 MB），避免出现「24 MB 的包写成 23.1 MB」
+        format!("{:.1}", size as f64 / 1_000_000.0)
+    } else {
+        "—".to_string()
+    };
+    let updated = if created > 0 {
+        ymd_from_unix(created)
+    } else {
+        "—".to_string()
+    };
+    let notes_block = match notes {
+        Some(n) if !n.trim().is_empty() => format!(
+            "<p class=\"meta\" style=\"margin:10px 0 0\">本次更新：{}</p>",
+            escape_html(n.trim()).replace('\n', "<br/>")
+        ),
+        _ => String::new(),
+    };
+    let html = GET_PAGE_HTML
+        .replace("{{VERSION}}", &escape_html(&version))
+        .replace("{{SIZE_MB}}", &size_mb)
+        .replace("{{UPDATED_AT}}", &updated)
+        .replace("{{NOTES_BLOCK}}", &notes_block);
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        html,
+    )
+        .into_response()
+}
+
+fn escape_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Unix 时间戳 → `YYYY-MM-DD`（按东八区）。服务端没有 chrono，这里用历法算法，
+/// 不值得为一个日期展示加一个依赖。
+fn ymd_from_unix(ts: i64) -> String {
+    let days = (ts + 8 * 3600).div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// 对外文件名只允许这些字符：它同时是 URL 段与库内查询键，不给路径穿越留缝。
 fn safe_app_file(name: &str) -> bool {
     !name.is_empty()
@@ -1056,6 +1165,113 @@ pub async fn app_file(State(state): State<AppState>, Path(file): Path<String>) -
         )
             .into_response(),
         Err(e) => ApiError::internal(format!("读取 APK 失败: {e}")).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------- 壁纸方案（照片表盘的壁纸生成器）
+
+/// GET /v1/editor-template?watchface_id= —— App 拉这个表盘的壁纸方案。
+///
+/// **不需要登录**：配置与素材不是付费内容（定位是"不发 App 版本就能上新方案"）。
+/// 没有方案/被停用时返回 `{enabled:false}` —— App 见到它就退回普通编辑页，**不报错**。
+/// 素材只回**相对路径**（`/wp/<watchface_id>/<file>`），App 自己拼到 base 上；配置里不许有外链。
+pub async fn editor_template(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
+    let wfid = crate::editor::safe_watchface_id(
+        q.get("watchface_id").map(|s| s.as_str()).unwrap_or(""),
+    )?;
+    let conn = state.conn();
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT config_json, enabled FROM editor_templates WHERE watchface_id = ?1",
+            [&wfid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(ApiError::from)?;
+    let Some((cfg, enabled)) = row else {
+        return Ok(Json(json!({ "enabled": false, "watchfaceId": wfid })));
+    };
+    if enabled == 0 {
+        return Ok(Json(json!({ "enabled": false, "watchfaceId": wfid })));
+    }
+    let mut stmt = conn
+        .prepare("SELECT path, size, sha256 FROM editor_assets WHERE watchface_id = ?1 ORDER BY path")
+        .map_err(ApiError::from)?;
+    let assets: Vec<Value> = stmt
+        .query_map([&wfid], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(ApiError::from)?
+        .filter_map(|r| r.ok())
+        .map(|(path, size, sha)| {
+            json!({ "path": path, "size": size, "sha256": sha,
+                    "url": format!("/wp/{wfid}/{path}") })
+        })
+        .collect();
+    Ok(Json(json!({
+        "enabled": true,
+        "watchfaceId": wfid,
+        "config": serde_json::from_str::<Value>(&cfg).unwrap_or(Value::Null),
+        "assets": assets,
+    })))
+}
+
+/// GET /wp/<watchface_id>/<file> —— 直发方案素材（png/jpg/webp）。
+///
+/// 只按**库里的登记记录**精确查（不拼路径），文件名再走一次白名单 —— 双重保险，防目录穿越。
+pub async fn editor_asset(
+    State(state): State<AppState>,
+    Path((wfid, file)): Path<(String, String)>,
+) -> Response {
+    let (Ok(wfid), Ok(file)) = (
+        crate::editor::safe_watchface_id(&wfid),
+        crate::editor::safe_asset_name(&file),
+    ) else {
+        return ApiError::not_found("素材不存在").into_response();
+    };
+    let ok: Option<String> = {
+        let conn = state.conn();
+        conn.query_row(
+            "SELECT path FROM editor_assets WHERE watchface_id = ?1 AND path = ?2",
+            params![&wfid, &file],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+    };
+    if ok.is_none() {
+        return ApiError::not_found("素材不存在").into_response();
+    }
+    let path = crate::editor::assets_dir(&state, &wfid).join(&file);
+    let ctype = match file
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, ctype.to_string()),
+                // 素材名按色号固定、内容有 sha256 兜底 → 可以长缓存
+                (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => ApiError::internal(format!("读取素材失败: {e}")).into_response(),
     }
 }
 
@@ -1197,6 +1413,17 @@ pub async fn report_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_page_helpers_escape_and_format_date() {
+        assert_eq!(
+            escape_html("<b>\"x\"&'y'</b>"),
+            "&lt;b&gt;&quot;x&quot;&amp;&#39;y&#39;&lt;/b&gt;"
+        );
+        // 1792202771 = 2026-10-17 10:06（东八区）
+        assert_eq!(ymd_from_unix(1_792_202_771), "2026-10-17");
+        assert_eq!(ymd_from_unix(951_782_400), "2000-02-29");
+    }
 
     #[test]
     fn scrub_masks_long_secretish_runs_only() {

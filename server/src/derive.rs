@@ -116,6 +116,24 @@ fn snapshot(
         if let Some(v) = variants.iter().find(|v| v.3.as_deref() == Some(wid)) {
             chosen = Some((v.0.clone(), v.1.clone(), "watchface_id".into()));
         }
+        // 设备行上只存了排序第一个包的 id；一个设备行可能有 2 个独立表盘，
+        // 第二个包的 id 只存在 files 表里 —— 只传第二个包时靠这里归位。
+        if chosen.is_none() {
+            let hit: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT va.id, va.name FROM variants va
+                     JOIN versions vr ON vr.variant_id = va.id
+                     JOIN files f ON f.version_id = vr.id
+                     WHERE va.product_id = ?1 AND f.watchface_id = ?2
+                     ORDER BY vr.id DESC LIMIT 1",
+                    [product_id, wid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((id, name)) = hit {
+                chosen = Some((id, name, "watchface_id".into()));
+            }
+        }
     }
     // ② 画布尺寸 → 设备组（**按屏幕比对**，不依赖名字；名字只是兜底）
     if chosen.is_none() {

@@ -431,7 +431,8 @@ fn spawn_2fa_auto_complete(app: tauri::AppHandle, browser_id: u32) {
             }
             Err(e) => {
                 log::warn!("[2fa] 自动收尾失败：{e}");
-                emit(&app, "error", &format!("验证未完成，请重新验证（{e}）"), None);
+                // 技术细节只进日志；浮窗/行内只给人话（铁律：报错只给一句操作指引）
+                emit(&app, "error", "验证未完成，请重新验证", None);
             }
         }
     });

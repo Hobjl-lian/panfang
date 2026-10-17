@@ -44,6 +44,12 @@ pub struct ConnKeep<R: Runtime> {
     handle: PluginHandle<R>,
 }
 
+/// 安卓：真正调到 Kotlin 侧。
+///
+/// ⚠️ `run_mobile_plugin` 只在 mobile 目标上存在 —— 桌面构建必须走下面那套空实现，
+/// 否则 `cargo test`/`cargo build`（Windows 主机）直接编译不过，而 binface 回归
+/// 与单元测试都要在主机上编这个 crate。
+#[cfg(target_os = "android")]
 impl<R: Runtime> ConnKeep<R> {
     /// 拉起/刷新前台服务（同一进程，服务在 = 进程不会被当成 cached 冻结）。
     pub fn start(&self, device_name: &str, addr: &str) -> Result<KeepStatus, String> {
@@ -100,6 +106,26 @@ impl<R: Runtime> ConnKeep<R> {
 }
 
 /// 取插件句柄：`app.conn_keep()`（仅安卓）。
+/// 桌面：编译通过、调用即报错（插件只在安卓上有意义，本就不注册句柄）。
+#[cfg(not(target_os = "android"))]
+impl<R: Runtime> ConnKeep<R> {
+    pub fn start(&self, _device_name: &str, _addr: &str) -> Result<KeepStatus, String> {
+        Err("连接保活仅安卓可用".into())
+    }
+    pub fn stop(&self) -> Result<(), String> {
+        Err("连接保活仅安卓可用".into())
+    }
+    pub fn is_running(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+    pub fn open_app_settings(&self) -> Result<(), String> {
+        Err("连接保活仅安卓可用".into())
+    }
+    pub fn battery_help(&self) -> Result<String, String> {
+        Ok("failed".into())
+    }
+}
+
 #[cfg(target_os = "android")]
 pub trait ConnKeepExt<R: Runtime> {
     fn conn_keep(&self) -> &ConnKeep<R>;

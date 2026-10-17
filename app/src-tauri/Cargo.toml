@@ -1,6 +1,6 @@
 [package]
 name = "wf_installer"
-version = "0.3.20"
+version = "0.3.26"
 description = "小米 Vela 设备表盘安装工具（个人/私域使用）"
 edition = "2024"
 default-run = "wf_installer"
