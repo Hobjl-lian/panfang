@@ -1011,24 +1011,23 @@ pub async fn app_latest(State(state): State<AppState>) -> ApiResult<Json<Value>>
     })))
 }
 
-/// GET /get（与 `/download` 同一个页面）——买家下载说明页。
+/// GET /get（与 `/download` 同一个页面）——买家下载页。
 ///
-/// 爱发电商品详情 / 自动回复里贴这一条，比裸 `.apk` 可信，也能把系统要求和常见问题
-/// 一次讲清。版本信息从当前发版读，页面本身是静态模板。
+/// 只保留下载所需的最小信息：版本 + 微信/QQ 打开提示 + 三条下载相关问题。
+/// 安装步骤放在 App 内的「使用指引」里，页面不再重复。
 pub async fn get_page(State(state): State<AppState>) -> Response {
-    let row: Option<(String, Option<String>, i64, i64)> = {
+    let row: Option<(String, i64, i64)> = {
         let conn = state.conn();
         conn.query_row(
-            "SELECT version_name, notes, size, created_at
+            "SELECT version_name, size, created_at
              FROM app_releases WHERE is_current=1 ORDER BY id DESC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .unwrap_or(None)
     };
-    let (version, notes, size, created) =
-        row.unwrap_or_else(|| ("—".to_string(), None, 0, 0));
+    let (version, size, created) = row.unwrap_or_else(|| ("—".to_string(), 0, 0));
     let size_mb = if size > 0 {
         // 与浏览器下载时显示的口径一致（十进制 MB），避免出现「24 MB 的包写成 23.1 MB」
         format!("{:.1}", size as f64 / 1_000_000.0)
@@ -1040,18 +1039,10 @@ pub async fn get_page(State(state): State<AppState>) -> Response {
     } else {
         "—".to_string()
     };
-    let notes_block = match notes {
-        Some(n) if !n.trim().is_empty() => format!(
-            "<p class=\"meta\" style=\"margin:10px 0 0\">本次更新：{}</p>",
-            escape_html(n.trim()).replace('\n', "<br/>")
-        ),
-        _ => String::new(),
-    };
     let html = GET_PAGE_HTML
         .replace("{{VERSION}}", &escape_html(&version))
         .replace("{{SIZE_MB}}", &size_mb)
-        .replace("{{UPDATED_AT}}", &updated)
-        .replace("{{NOTES_BLOCK}}", &notes_block);
+        .replace("{{UPDATED_AT}}", &updated);
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
