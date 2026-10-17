@@ -140,6 +140,39 @@ export interface CloudDevice {
   status?: number;
 }
 
+/** `local_payload_probe` 的返回（本地安装确认页用；只看文件本身，不连设备） */
+export interface LocalPayloadProbe {
+  kind: "watchface" | "quickapp" | "unknown";
+  watchfaceId?: string | null;
+  size: number;
+}
+
+/**
+ * 随机表盘 ID：12 位数字（与在售表盘同形，首位非 0）。
+ * 只是候选值；确认页会再和手环上已有的 ID 比对。
+ */
+export function randomWatchfaceId(): string {
+  // 界面门槛是 Chromium 111+，crypto.getRandomValues 必然可用
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  let s = String(1 + (bytes[0] % 9));
+  for (let i = 1; i < 12; i++) s += String(bytes[i] % 10);
+  return s;
+}
+
+/** 表盘 ID 合法形态：与 Rust `valid_watchface_id` / AstroBox 一致（9 或 12 位 ASCII 字母数字） */
+export function isValidWatchfaceId(s: string): boolean {
+  return /^[0-9A-Za-z]{9}$/.test(s) || /^[0-9A-Za-z]{12}$/.test(s);
+}
+
+/** 文件大小（确认页显示用） */
+export function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
 /** pb `WatchFaceItem`（`watchface_get_list` 的一项） */
 export interface WfListItem {
   id: string;
@@ -278,25 +311,8 @@ export interface PhotoCrop {
 }
 
 /**
- * 裁剪视图上的拖拽/缩放/旋转 → 后端需要的变换（画布像素）。
- *
- * 换算**必须用表盘画布宽度**（后端 `draw_photo` 是在 `model.width×height` 空间里做变换的，
- * 视图与画布规格不一致时只有按画布宽度换算才对得上）——与 legacy `ed-crop-apply` 一致。
+ * 壁纸生成器：把用户参数夹进方案声明的范围（App 侧预览与 Rust 同一套语义）。
  */
-export function cropToTransform(
-  view: { x: number; y: number; scale: number; rotation: number },
-  canvasW: number,
-  viewW: number,
-): PhotoCrop {
-  const k = viewW > 0 ? canvasW / viewW : 1;
-  return {
-    scale: view.scale,
-    dx: Math.round(view.x * k),
-    dy: Math.round(view.y * k),
-    rotation: view.rotation,
-  };
-}
-
 // --------------------------------------------------------------- 壁纸生成器
 // 形状与 Rust `wallpaper_gen` 一一对应（服务端下发的方案 → 界面按它长控件）。
 
@@ -376,6 +392,58 @@ export interface GenPlan {
   missing?: string[];
   /** enabled=false 的原因（没有方案 / 方案与表盘对不上） */
   reason?: string;
+  /**
+   * enabled=false 的分类（服务端与客户端的约定）：
+   * none = 这个表盘本来就没配方案（走本地通用方案）；network = 取不到且无缓存；
+   * mismatch = 有方案但画布对不上；bad = 方案内容/表盘 id 有问题。
+   */
+  code?: "none" | "network" | "mismatch" | "bad";
+}
+
+/**
+ * 没配方案的照片表盘：本地长一份「一张照片、不套模板」的通用方案。
+ * 画布 = 表盘自身的画布（尺寸与 .bin 对齐），圆角跟屏幕一致；
+ * 六个基础功能（缩放/旋转/压暗/模糊/水平翻转/垂直翻转）全部给用户调。
+ */
+export function genericGenPlan(
+  screen: { width: number; height: number; radius?: number } | null | undefined,
+  watchfaceId?: string
+): GenPlan {
+  const w = Math.max(16, Math.round(screen?.width || 212));
+  const h = Math.max(16, Math.round(screen?.height || 520));
+  const radius = Math.max(0, Math.min(screen?.radius || 0, w / 2, h / 2));
+  const num = (def: number, min: number, max: number, step: number): GenNumCtl => ({
+    default: def,
+    min,
+    max,
+    step,
+    adjustable: true
+  });
+  return {
+    enabled: true,
+    watchfaceId,
+    offline: false,
+    missing: [],
+    config: {
+      version: 1,
+      canvas: { w, h, radius },
+      photos: [
+        {
+          id: "photo",
+          label: "照片",
+          base: "canvas",
+          controls: {
+            scale: num(1, 0.2, 3, 0.01),
+            rotation: num(0, -180, 180, 1),
+            darken: num(0, 0, 1, 0.01),
+            blur: num(0, 0, 40, 1),
+            flipX: { default: false, adjustable: true },
+            flipY: { default: false, adjustable: true }
+          }
+        }
+      ]
+    }
+  };
 }
 
 /** 取用户值（缺省用方案默认值）并夹进方案声明的范围（与 Rust `NumCtl::resolve` 一致） */

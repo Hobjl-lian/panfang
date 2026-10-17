@@ -115,6 +115,54 @@ fn migrate(conn: &Connection) -> Result<()> {
             println!("[wf-auth] 迁移：设备行 {vid} 的购买链接移入 variant_links（支持一行多链接）");
         }
     }
+    // 壁纸生成器缩放下限：0.5 → 0.2（2026-10-17）。
+    // 横向照片在竖长画布上被 cover 放大后，0.5 只够退到「看到一半」；老裁剪页下线后
+    // 生成器是照片表盘唯一入口，必须能让用户退到看得见整张照片。幂等，只改大于 0.2 的。
+    {
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT watchface_id, config_json FROM editor_templates")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut changed = 0;
+        for (wfid, raw) in rows {
+            let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(photos) = cfg.get_mut("photos").and_then(|p| p.as_array_mut()) else {
+                continue;
+            };
+            let mut dirty = false;
+            for p in photos {
+                let Some(scale) = p
+                    .get_mut("controls")
+                    .and_then(|c| c.get_mut("scale"))
+                    .and_then(|s| s.as_object_mut())
+                else {
+                    continue;
+                };
+                let too_high = scale
+                    .get("min")
+                    .and_then(|m| m.as_f64())
+                    .map(|m| m > 0.2)
+                    .unwrap_or(false);
+                if too_high {
+                    scale.insert("min".into(), serde_json::json!(0.2));
+                    dirty = true;
+                }
+            }
+            if dirty {
+                conn.execute(
+                    "UPDATE editor_templates SET config_json = ?1 WHERE watchface_id = ?2",
+                    rusqlite::params![cfg.to_string(), wfid],
+                )?;
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            println!("[wf-auth] 迁移：{changed} 条壁纸方案的缩放下限改为 0.2");
+        }
+    }
     Ok(())
 }
 

@@ -96,6 +96,8 @@ async fn main() -> anyhow::Result<()> {
         token_ttl: 30 * 24 * 3600,
     };
     let bg_state = state.clone();
+    // 关键词自动回复：常驻轮询（默认关闭，管理页打开开关后才真正发消息）
+    afdian_chat::spawn_auto_reply_worker(state.clone());
 
     // 存量包体没有「按包版本」：启动时解密回填一次（单条失败只跳过，不影响启动）
     wf_auth_server::backfill::backfill_bin_versions(&state);
@@ -166,6 +168,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/afdian/chat/dialogs", get(afdian_chat::chat_dialogs))
         .route("/afdian/chat/messages", get(afdian_chat::chat_messages))
         .route("/afdian/chat/send", post(afdian_chat::chat_send))
+        // 关键词自动回复：规则维护 / 开关 / 试匹配（默认关闭）
+        .route(
+            "/afdian/chat/rules",
+            get(afdian_chat::chat_rules_get).post(afdian_chat::chat_rules_save),
+        )
+        .route(
+            "/afdian/chat/rules/test",
+            post(afdian_chat::chat_rules_test),
+        )
+        .route(
+            "/afdian/chat/auto-reply",
+            post(afdian_chat::chat_auto_reply_set),
+        )
         // 授权与统计
         .route("/activations", get(api_admin::activations_list))
         .route("/revoke", post(api_admin::revoke))

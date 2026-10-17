@@ -65,5 +65,3 @@ cargo test                     # 单元/回归测试
 
 - 本项目以 **AGPL-3.0** 分发（见 [`LICENSE`](./LICENSE)）。
 - 上游署名与附加条款见 [`README.md`](./README.md) 的「开源许可与署名」一节。
-
-更多说明见本仓库首页。

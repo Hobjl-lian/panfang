@@ -84,8 +84,12 @@ fn base_and_token(state: &AppState) -> Result<(String, Option<String>)> {
 ///   "offline": false,        // true = 用的本机缓存（断网/服务端不可达）
 ///   "missing": ["1.png"] }   // 没下齐的素材（App 侧提示「先联网下载一次」）
 /// ```
-/// 没有方案、方案与表盘对不上、字段坏掉 → `{ "enabled": false, "reason": "…" }`，**不报错**
-/// （App 侧退回普通编辑页）。
+/// 拿不到方案时返回 `{ "enabled": false, "code": "…", "reason": "…" }`，**不抛错**：
+/// - `code = "none"`     = 服务端没有这个表盘的方案（App 用本地通用方案：只放照片、不套模板）
+/// - `code = "network"`  = 服务端不可达且本机没有缓存（App 提示先联网打开一次）
+/// - `code = "mismatch"` = 有方案但画布尺寸与这张表盘不一致（不许套用）
+/// - `code = "bad"`      = 表盘 id / 方案内容本身有问题
+/// 老客户端只认 `enabled`，多出来的字段不影响它。
 #[tauri::command]
 pub async fn watchface_generator_plan(
     state: tauri::State<'_, AppState>,
@@ -95,11 +99,15 @@ pub async fn watchface_generator_plan(
 ) -> Result<Value, String> {
     let wfid = match safe_id(&watchface_id) {
         Ok(v) => v,
-        Err(e) => return Ok(json!({ "enabled": false, "reason": e.to_string() })),
+        Err(e) => {
+            return Ok(json!({ "enabled": false, "code": "bad", "reason": e.to_string() }))
+        }
     };
     let cache = match editor_dir(&state, &wfid) {
         Ok(d) => d,
-        Err(e) => return Ok(json!({ "enabled": false, "reason": e.to_string() })),
+        Err(e) => {
+            return Ok(json!({ "enabled": false, "code": "bad", "reason": e.to_string() }))
+        }
     };
     let plan_file = cache.join("plan.json");
 
@@ -117,28 +125,42 @@ pub async fn watchface_generator_plan(
                 (p, true)
             }
             None => {
-                return Ok(json!({ "enabled": false, "reason": format!("取方案失败: {e}") }));
+                return Ok(json!({
+                    "enabled": false,
+                    "code": "network",
+                    "reason": format!("取方案失败: {e}")
+                }));
             }
         },
     };
     if !plan["enabled"].as_bool().unwrap_or(false) {
-        return Ok(json!({ "enabled": false, "watchfaceId": wfid }));
+        // 服务端明确回答「这个表盘没有方案」：App 走本地通用方案（不套模板）
+        return Ok(json!({ "enabled": false, "code": "none", "watchfaceId": wfid }));
     }
 
     // 2) 方案必须与这张表盘对得上：画布尺寸不一致就直接不给用（9P 的方案不许套到 10）
     let config: wgen::GenConfig = match serde_json::from_value(plan["config"].clone()) {
         Ok(c) => c,
         Err(e) => {
-            return Ok(json!({ "enabled": false, "reason": format!("方案读不出来: {e}") }));
+            return Ok(json!({
+                "enabled": false,
+                "code": "bad",
+                "reason": format!("方案读不出来: {e}")
+            }));
         }
     };
     if let Err(e) = config.check() {
-        return Ok(json!({ "enabled": false, "reason": format!("方案不合法: {e}") }));
+        return Ok(json!({
+            "enabled": false,
+            "code": "bad",
+            "reason": format!("方案不合法: {e}")
+        }));
     }
     if let (Some(w), Some(h)) = (canvas_w, canvas_h) {
         if w != config.canvas.w || h != config.canvas.h {
             return Ok(json!({
                 "enabled": false,
+                "code": "mismatch",
                 "reason": format!("方案对应的是 {}x{}，这张表盘是 {}x{}", config.canvas.w, config.canvas.h, w, h)
             }));
         }
@@ -252,16 +274,17 @@ pub async fn watchface_generator_render(
     photos_b64: Vec<String>,
     color_i: Option<i64>,
 ) -> Result<String, String> {
-    let wfid = safe_id(&watchface_id).map_err(|e| e.to_string())?;
-    let dir = editor_dir(&state, &wfid).map_err(|e| e.to_string())?;
     let cfg: wgen::GenConfig =
         serde_json::from_str(&config_json).map_err(|e| format!("方案读不出来: {e}"))?;
     cfg.check().map_err(|e| format!("{e:#}"))?;
     let params: Vec<wgen::GenParams> = serde_json::from_str(&params_json).unwrap_or_default();
 
-    // 相框素材（按色号挑；文件名过白名单，只从缓存目录里读）
+    // 相框素材（按色号挑；文件名过白名单，只从缓存目录里读）。
+    // 没有相框的方案（本地通用方案 / AWOS）不需要表盘 id，也不碰磁盘目录。
     let frame_png: Option<Vec<u8>> = match cfg.color(color_i) {
         Some(c) => {
+            let wfid = safe_id(&watchface_id).map_err(|e| e.to_string())?;
+            let dir = editor_dir(&state, &wfid).map_err(|e| e.to_string())?;
             let name = safe_asset(&c.src).map_err(|e| e.to_string())?;
             let path = dir.join(&name);
             match std::fs::read(&path) {
@@ -337,13 +360,14 @@ pub async fn watchface_generator_frame(
     config_json: String,
     color_i: Option<i64>,
 ) -> Result<Option<String>, String> {
-    let wfid = safe_id(&watchface_id).map_err(|e| e.to_string())?;
-    let dir = editor_dir(&state, &wfid).map_err(|e| e.to_string())?;
     let cfg: wgen::GenConfig =
         serde_json::from_str(&config_json).map_err(|e| format!("方案读不出来: {e}"))?;
+    // 没有相框色号的方案（本地通用方案 / AWOS）不需要表盘 id，直接回空
     let Some(c) = cfg.color(color_i) else {
         return Ok(None);
     };
+    let wfid = safe_id(&watchface_id).map_err(|e| e.to_string())?;
+    let dir = editor_dir(&state, &wfid).map_err(|e| e.to_string())?;
     let name = safe_asset(&c.src).map_err(|e| e.to_string())?;
     match std::fs::read(dir.join(&name)) {
         Ok(bytes) => {

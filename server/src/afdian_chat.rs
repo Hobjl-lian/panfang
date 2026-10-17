@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::crypto;
-use crate::db::now;
+use crate::db::{new_id, now};
 use crate::state::{require_admin, ApiError, ApiResult, AppState};
 
 const AFDIAN_BASE: &str = "https://afdian.com";
@@ -729,6 +729,723 @@ pub async fn chat_send(
     Ok(Json(json!({ "ok": true, "messageId": message_id })))
 }
 
+// ---------------------------------------------------------------- 关键词自动回复
+
+/// 轮询间隔：60 秒。服务端是固定 IP，保守一点比被风控划算；
+/// 只拉会话列表，只有「最新消息变了」的会话才再拉一次内容。
+const AUTO_REPLY_INTERVAL_SECS: u64 = 60;
+/// 每轮最多回复几个会话：防止一次性给很多人发消息。
+const AUTO_REPLY_MAX_PER_TICK: usize = 10;
+/// 同一会话的冷却时间：10 分钟内不再自动回复，避免买卖双方来回触发。
+const AUTO_REPLY_COOLDOWN_SECS: i64 = 600;
+const MAX_RULES: usize = 50;
+const MAX_KEYWORDS_PER_RULE: usize = 10;
+const MAX_KEYWORD_CHARS: usize = 40;
+
+#[derive(Debug, Clone)]
+struct Rule {
+    id: String,
+    keywords: Vec<String>,
+    match_mode: String,
+    reply: String,
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct RuleIn {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default, rename = "matchMode", alias = "match_mode")]
+    pub match_mode: Option<String>,
+    #[serde(default)]
+    pub reply: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+pub struct RulesBody {
+    #[serde(default)]
+    pub rules: Vec<RuleIn>,
+}
+
+#[derive(Deserialize)]
+pub struct AutoReplyBody {
+    pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+pub struct RuleTestBody {
+    pub text: String,
+}
+
+fn load_rules(state: &AppState) -> Vec<Rule> {
+    let conn = state.conn();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, keywords, match_mode, reply, enabled FROM afdian_chat_rules
+         ORDER BY sort, created_at",
+    ) else {
+        return Vec::new();
+    };
+    let rows: Vec<Rule> = stmt
+        .query_map([], |r| {
+            let keywords: String = r.get(1)?;
+            Ok(Rule {
+                id: r.get(0)?,
+                keywords: serde_json::from_str::<Vec<String>>(&keywords).unwrap_or_default(),
+                match_mode: r.get(2)?,
+                reply: r.get(3)?,
+                enabled: r.get::<_, i64>(4)? != 0,
+            })
+        })
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    rows
+}
+
+fn normalize_rules(input: &[RuleIn]) -> ApiResult<Vec<Rule>> {
+    if input.len() > MAX_RULES {
+        return Err(ApiError::bad_request(format!(
+            "规则最多 {MAX_RULES} 条"
+        )));
+    }
+    let mut rules = Vec::new();
+    for item in input {
+        let keywords: Vec<String> = item
+            .keywords
+            .iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+        let reply = item.reply.trim().to_string();
+        // 没填关键词或没填回复的行直接忽略（前端新增但没填完的行不该报错）
+        if keywords.is_empty() || reply.is_empty() {
+            continue;
+        }
+        if keywords.len() > MAX_KEYWORDS_PER_RULE {
+            return Err(ApiError::bad_request(format!(
+                "每条规则最多 {MAX_KEYWORDS_PER_RULE} 个关键词"
+            )));
+        }
+        if keywords.iter().any(|k| k.chars().count() > MAX_KEYWORD_CHARS) {
+            return Err(ApiError::bad_request(format!(
+                "单个关键词最长 {MAX_KEYWORD_CHARS} 个字"
+            )));
+        }
+        if reply.chars().count() > MAX_MESSAGE_CHARS {
+            return Err(ApiError::bad_request(format!(
+                "回复内容太长（上限 {MAX_MESSAGE_CHARS} 字）"
+            )));
+        }
+        let match_mode = match item.match_mode.as_deref().unwrap_or("any") {
+            "all" => "all",
+            "exact" => "exact",
+            _ => "any",
+        }
+        .to_string();
+        let id = item
+            .id
+            .clone()
+            .map(|v| v.trim().to_string())
+            .filter(|v| {
+                !v.is_empty()
+                    && v.chars().count() <= 64
+                    && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+            .unwrap_or_else(|| new_id("r_"));
+        rules.push(Rule {
+            id,
+            keywords,
+            match_mode,
+            reply,
+            enabled: item.enabled,
+        });
+    }
+    Ok(rules)
+}
+
+fn replace_rules(state: &AppState, rules: &[Rule]) -> ApiResult<()> {
+    let mut conn = state.conn();
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM afdian_chat_rules", [])?;
+    for (index, rule) in rules.iter().enumerate() {
+        let keywords = serde_json::to_string(&rule.keywords).unwrap_or_else(|_| "[]".into());
+        tx.execute(
+            "INSERT OR REPLACE INTO afdian_chat_rules(id, keywords, match_mode, reply, enabled, sort, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                rule.id,
+                keywords,
+                rule.match_mode,
+                rule.reply,
+                if rule.enabled { 1i64 } else { 0i64 },
+                index as i64,
+                now()
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct AutoSettings {
+    enabled: bool,
+    initialized: bool,
+    last_poll_at: Option<i64>,
+    last_poll_error: Option<String>,
+}
+
+fn load_settings(state: &AppState) -> AutoSettings {
+    let conn = state.conn();
+    conn.query_row(
+        "SELECT auto_reply_enabled, initialized, last_poll_at, last_poll_error
+         FROM afdian_chat_settings WHERE id = 1",
+        [],
+        |r| {
+            Ok(AutoSettings {
+                enabled: r.get::<_, i64>(0)? != 0,
+                initialized: r.get::<_, i64>(1)? != 0,
+                last_poll_at: r.get(2)?,
+                last_poll_error: r.get(3)?,
+            })
+        },
+    )
+    .unwrap_or_default()
+}
+
+fn set_auto_reply_enabled(state: &AppState, enabled: bool) -> ApiResult<()> {
+    // 先读旧状态再取连接锁：持锁再调用 load_settings 会自己等自己（死锁）
+    let was_enabled = load_settings(state).enabled;
+    let initialized = if enabled && !was_enabled { 0i64 } else { 1i64 };
+    let conn = state.conn();
+    // 从关到开：清掉基线，下一次轮询只记录当前进度、不回复历史消息
+    conn.execute(
+        "INSERT INTO afdian_chat_settings(id, auto_reply_enabled, initialized, updated_at)
+         VALUES(1, ?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET auto_reply_enabled = excluded.auto_reply_enabled,
+             initialized = excluded.initialized, updated_at = excluded.updated_at",
+        params![if enabled { 1i64 } else { 0i64 }, initialized, now()],
+    )?;
+    Ok(())
+}
+
+fn mark_initialized(state: &AppState) {
+    let conn = state.conn();
+    let _ = conn.execute(
+        "UPDATE afdian_chat_settings SET initialized = 1, updated_at = ?1 WHERE id = 1",
+        params![now()],
+    );
+}
+
+fn mark_poll(state: &AppState, error: Option<&str>) {
+    let conn = state.conn();
+    let _ = conn.execute(
+        "UPDATE afdian_chat_settings SET last_poll_at = ?1, last_poll_error = ?2, updated_at = ?1
+         WHERE id = 1",
+        params![now(), error],
+    );
+}
+
+#[derive(Default, Clone)]
+struct UserState {
+    last_seen: Option<String>,
+    last_replied: Option<String>,
+    last_reply_at: Option<i64>,
+}
+
+fn load_user_state(state: &AppState, user_id: &str) -> UserState {
+    let conn = state.conn();
+    conn.query_row(
+        "SELECT last_seen_msg_id, last_replied_msg_id, last_reply_at
+         FROM afdian_chat_autoreply_state WHERE user_id = ?1",
+        [user_id],
+        |r| {
+            Ok(UserState {
+                last_seen: r.get(0)?,
+                last_replied: r.get(1)?,
+                last_reply_at: r.get(2)?,
+            })
+        },
+    )
+    .unwrap_or_default()
+}
+
+fn touch_seen(state: &AppState, user_id: &str, message_id: Option<&str>) {
+    let conn = state.conn();
+    let _ = conn.execute(
+        "INSERT INTO afdian_chat_autoreply_state(user_id, last_seen_msg_id, updated_at)
+         VALUES(?1, ?2, ?3)
+         ON CONFLICT(user_id) DO UPDATE SET last_seen_msg_id = excluded.last_seen_msg_id,
+             updated_at = excluded.updated_at, last_error = NULL",
+        params![user_id, message_id, now()],
+    );
+}
+
+fn mark_replied(state: &AppState, user_id: &str, seen_id: &str, reply_at: i64) {
+    let conn = state.conn();
+    let _ = conn.execute(
+        "INSERT INTO afdian_chat_autoreply_state(user_id, last_seen_msg_id, last_replied_msg_id, last_reply_at, updated_at)
+         VALUES(?1, ?2, ?2, ?3, ?3)
+         ON CONFLICT(user_id) DO UPDATE SET last_seen_msg_id = excluded.last_seen_msg_id,
+             last_replied_msg_id = excluded.last_replied_msg_id,
+             last_reply_at = excluded.last_reply_at, updated_at = excluded.updated_at,
+             last_error = NULL",
+        params![user_id, seen_id, reply_at],
+    );
+}
+
+fn set_user_error(state: &AppState, user_id: &str, error: &str) {
+    let conn = state.conn();
+    let _ = conn.execute(
+        "INSERT INTO afdian_chat_autoreply_state(user_id, last_error, updated_at)
+         VALUES(?1, ?2, ?3)
+         ON CONFLICT(user_id) DO UPDATE SET last_error = excluded.last_error,
+             updated_at = excluded.updated_at",
+        params![user_id, error, now()],
+    );
+}
+
+fn log_autoreply(
+    state: &AppState,
+    user_id: &str,
+    user_name: &str,
+    inbound_id: &str,
+    outbound_id: &str,
+    rule_id: &str,
+    keyword: &str,
+    content: &str,
+) {
+    let conn = state.conn();
+    let _ = conn.execute(
+        "INSERT INTO afdian_chat_autoreply_log
+             (user_id, user_name, inbound_msg_id, outbound_msg_id, rule_id, matched_keyword, content, ts)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![user_id, user_name, inbound_id, outbound_id, rule_id, keyword, content, now()],
+    );
+    // 只保留最近 200 条，避免无限增长（管理页只显示 20 条）
+    let _ = conn.execute(
+        "DELETE FROM afdian_chat_autoreply_log WHERE id NOT IN
+             (SELECT id FROM afdian_chat_autoreply_log ORDER BY id DESC LIMIT 200)",
+        [],
+    );
+}
+
+fn normalize_match(text: &str) -> String {
+    text.trim().to_lowercase()
+}
+
+/// 关键词命中判定：any=包含任意一个，all=全部包含，exact=完全等于。
+/// 返回命中的关键词（all 返回全部，用「 + 」连接），用于审计日志。
+fn rule_hit(text: &str, rule: &Rule) -> Option<String> {
+    if !rule.enabled || rule.reply.trim().is_empty() {
+        return None;
+    }
+    let normalized = normalize_match(text);
+    if normalized.is_empty() {
+        return None;
+    }
+    let keywords: Vec<&String> = rule
+        .keywords
+        .iter()
+        .filter(|k| !normalize_match(k).is_empty())
+        .collect();
+    if keywords.is_empty() {
+        return None;
+    }
+    match rule.match_mode.as_str() {
+        "exact" => keywords
+            .iter()
+            .find(|k| normalize_match(k) == normalized)
+            .map(|k| k.trim().to_string()),
+        "all" => {
+            if keywords
+                .iter()
+                .all(|k| normalized.contains(&normalize_match(k)))
+            {
+                Some(
+                    keywords
+                        .iter()
+                        .map(|k| k.trim().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" + "),
+                )
+            } else {
+                None
+            }
+        }
+        _ => keywords
+            .iter()
+            .find(|k| normalized.contains(&normalize_match(k)))
+            .map(|k| k.trim().to_string()),
+    }
+}
+
+fn find_rule<'a>(text: &str, rules: &'a [Rule]) -> Option<(&'a Rule, String)> {
+    rules
+        .iter()
+        .find_map(|rule| rule_hit(text, rule).map(|keyword| (rule, keyword)))
+}
+
+struct DialogRow {
+    user_id: String,
+    name: String,
+    latest_id: Option<String>,
+}
+
+fn parse_dialog_rows(value: &Value) -> Vec<DialogRow> {
+    value
+        .pointer("/data/list")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|record| {
+                    let user = record.get("user")?;
+                    let user_id = user.get("user_id").map(text_of).filter(|s| !s.is_empty())?;
+                    let name = user
+                        .get("name")
+                        .map(text_of)
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "爱发电用户".to_string());
+                    let latest_id = record
+                        .get("latest_msg_id")
+                        .map(text_of)
+                        .filter(|s| !s.is_empty());
+                    Some(DialogRow {
+                        user_id,
+                        name,
+                        latest_id,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_message_list(value: &Value) -> Vec<Value> {
+    value
+        .pointer("/data/list")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(parse_message).collect())
+        .unwrap_or_default()
+}
+
+/// 对方发来的最后一段连续文字（遇到我们自己的消息或非文本消息就停）。
+fn trailing_inbound_text(items: &[Value]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for item in items.iter().rev() {
+        if item["direction"] != "receive" || item["messageType"] != json!(1) {
+            break;
+        }
+        let content = item["content"].as_str().unwrap_or("").trim();
+        if !content.is_empty() {
+            parts.push(content.to_string());
+        }
+    }
+    parts.reverse();
+    parts.join("\n")
+}
+
+fn response_message_id(value: &Value) -> String {
+    value
+        .pointer("/data/id")
+        .or_else(|| value.pointer("/data/msg_id"))
+        .or_else(|| value.pointer("/data/message/id"))
+        .map(text_of)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+/// 启动后台轮询（服务启动时调用一次）。默认关闭；管理页打开开关后才真正发消息。
+pub fn spawn_auto_reply_worker(state: AppState) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(AUTO_REPLY_INTERVAL_SECS));
+        tick.tick().await; // interval 的第一次是立即触发的，先吃掉
+        loop {
+            tick.tick().await;
+            if !load_settings(&state).enabled {
+                continue;
+            }
+            match auto_reply_tick(&state).await {
+                Ok(()) => {}
+                Err(error) => {
+                    println!("[afdian-chat] 自动回复失败：{}", error.message);
+                    mark_poll(&state, Some(&error.message));
+                }
+            }
+        }
+    });
+}
+
+async fn auto_reply_tick(state: &AppState) -> ApiResult<()> {
+    let settings = load_settings(state);
+    let rules: Vec<Rule> = load_rules(state)
+        .into_iter()
+        .filter(|rule| rule.enabled && !rule.keywords.is_empty() && !rule.reply.trim().is_empty())
+        .collect();
+    if rules.is_empty() {
+        mark_poll(state, Some("还没有可用的关键词规则"));
+        return Ok(());
+    }
+    let token = load_token(state)?;
+    let value = get_json(
+        "/api/message/dialogs",
+        &token,
+        &[("page", "1"), ("unread", "0")],
+        "私信列表加载失败",
+    )
+    .await
+    .map_err(|error| {
+        if error.error == "afdian_session_expired" {
+            record_probe(state, false, Some(&error.message));
+        }
+        error
+    })?;
+    let dialogs = parse_dialog_rows(&value);
+
+    // 刚开启：只记录当前每个会话的最新消息，历史未读一律不回
+    if !settings.initialized {
+        for dialog in &dialogs {
+            touch_seen(state, &dialog.user_id, dialog.latest_id.as_deref());
+        }
+        mark_initialized(state);
+        mark_poll(state, None);
+        return Ok(());
+    }
+
+    let mut budget = AUTO_REPLY_MAX_PER_TICK;
+    let mut failed = 0usize;
+    for dialog in dialogs {
+        if budget == 0 {
+            break;
+        }
+        let Some(latest) = dialog.latest_id.as_deref() else {
+            continue;
+        };
+        let user_state = load_user_state(state, &dialog.user_id);
+        if user_state.last_seen.as_deref() == Some(latest) {
+            continue;
+        }
+        // 第一次见到这个会话：只记基线，不回
+        if user_state.last_seen.is_none() {
+            touch_seen(state, &dialog.user_id, Some(latest));
+            continue;
+        }
+        if user_state.last_replied.as_deref() == Some(latest) {
+            touch_seen(state, &dialog.user_id, Some(latest));
+            continue;
+        }
+        if let Some(ts) = user_state.last_reply_at {
+            if ts > now() - AUTO_REPLY_COOLDOWN_SECS {
+                touch_seen(state, &dialog.user_id, Some(latest));
+                continue;
+            }
+        }
+
+        let page = match get_json(
+            "/api/message/messages",
+            &token,
+            &[("user_id", dialog.user_id.as_str()), ("type", "new")],
+            "私信内容加载失败",
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                if error.error == "afdian_session_expired" {
+                    return Err(error);
+                }
+                set_user_error(state, &dialog.user_id, &error.message);
+                failed += 1;
+                continue;
+            }
+        };
+        let items = parse_message_list(&page);
+        let Some(last) = items.last() else {
+            touch_seen(state, &dialog.user_id, Some(latest));
+            continue;
+        };
+        // 最后一条必须还是对方发来的文字（我们手动回过、或只是系统消息，都不回）
+        if last["direction"] != json!("receive") || last["messageType"] != json!(1) {
+            touch_seen(state, &dialog.user_id, Some(latest));
+            continue;
+        }
+        let inbound = trailing_inbound_text(&items);
+        if inbound.trim().is_empty() {
+            touch_seen(state, &dialog.user_id, Some(latest));
+            continue;
+        }
+        let Some((rule, keyword)) = find_rule(&inbound, &rules) else {
+            touch_seen(state, &dialog.user_id, Some(latest));
+            continue;
+        };
+
+        match post_json(
+            "/api/message/send",
+            &token,
+            &send_payload(&dialog.user_id, &rule.reply),
+            "消息发送失败",
+        )
+        .await
+        {
+            Ok(sent) => {
+                let outbound_id = response_message_id(&sent);
+                mark_replied(state, &dialog.user_id, latest, now());
+                log_autoreply(
+                    state,
+                    &dialog.user_id,
+                    &dialog.name,
+                    latest,
+                    &outbound_id,
+                    &rule.id,
+                    &keyword,
+                    &rule.reply,
+                );
+                println!(
+                    "[afdian-chat] 自动回复 {}（命中「{}」）",
+                    dialog.name, keyword
+                );
+                budget -= 1;
+            }
+            Err(error) => {
+                if error.error == "afdian_session_expired" {
+                    return Err(error);
+                }
+                set_user_error(state, &dialog.user_id, &error.message);
+                failed += 1;
+            }
+        }
+    }
+    mark_poll(
+        state,
+        if failed > 0 {
+            Some("部分会话自动回复失败，详见下方最近记录")
+        } else {
+            None
+        },
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------- 自动回复管理接口
+
+fn rules_json(rules: &[Rule]) -> Value {
+    Value::Array(
+        rules
+            .iter()
+            .map(|rule| {
+                json!({
+                    "id": rule.id,
+                    "keywords": rule.keywords,
+                    "matchMode": rule.match_mode,
+                    "reply": rule.reply,
+                    "enabled": rule.enabled,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// GET /admin/afdian/chat/rules —— 规则 + 开关状态 + 最近自动回复
+pub async fn chat_rules_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let settings = load_settings(&state);
+    let rules = load_rules(&state);
+    let logs: Vec<Value> = {
+        let conn = state.conn();
+        let mut stmt = conn.prepare(
+            "SELECT user_name, content, matched_keyword, ts FROM afdian_chat_autoreply_log
+             ORDER BY id DESC LIMIT 20",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "userName": r.get::<_, Option<String>>(0)?,
+                    "content": r.get::<_, String>(1)?,
+                    "keyword": r.get::<_, Option<String>>(2)?,
+                    "ts": r.get::<_, i64>(3)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    Ok(Json(json!({
+        "enabled": settings.enabled,
+        "initialized": settings.initialized,
+        "lastPollAt": settings.last_poll_at,
+        "lastPollError": settings.last_poll_error,
+        "rules": rules_json(&rules),
+        "logs": logs,
+    })))
+}
+
+/// POST /admin/afdian/chat/rules —— 整表保存（前端一次提交全部规则）
+pub async fn chat_rules_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RulesBody>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let rules = normalize_rules(&body.rules)?;
+    replace_rules(&state, &rules)?;
+    Ok(Json(json!({
+        "ok": true,
+        "rules": rules_json(&rules),
+    })))
+}
+
+/// POST /admin/afdian/chat/auto-reply —— 开关（默认关闭；开启时重置基线）
+pub async fn chat_auto_reply_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AutoReplyBody>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    set_auto_reply_enabled(&state, body.enabled)?;
+    let settings = load_settings(&state);
+    Ok(Json(json!({
+        "ok": true,
+        "enabled": settings.enabled,
+        "initialized": settings.initialized,
+    })))
+}
+
+/// POST /admin/afdian/chat/rules/test —— 拿一句话试规则（只预览，不发送）
+pub async fn chat_rules_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RuleTestBody>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let text = body.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("请输入一句要测试的内容"));
+    }
+    let rules: Vec<Rule> = load_rules(&state)
+        .into_iter()
+        .filter(|rule| rule.enabled)
+        .collect();
+    match find_rule(text, &rules) {
+        Some((rule, keyword)) => Ok(Json(json!({
+            "matched": true,
+            "ruleId": rule.id,
+            "keyword": keyword,
+            "reply": rule.reply,
+        }))),
+        None => Ok(Json(json!({ "matched": false }))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,5 +1555,95 @@ mod tests {
         assert!(is_login_failure("请先登录"));
         assert!(is_login_failure("请求失败 HTTP 401"));
         assert!(!is_login_failure("消息发送失败"));
+    }
+
+    fn rule(keywords: &[&str], mode: &str, enabled: bool) -> Rule {
+        Rule {
+            id: "r1".into(),
+            keywords: keywords.iter().map(|k| k.to_string()).collect(),
+            match_mode: mode.into(),
+            reply: "固定回复".into(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn keyword_matching_modes() {
+        let any = rule(&["安装", "连不上"], "any", true);
+        assert_eq!(rule_hit("怎么安装表盘", &any).as_deref(), Some("安装"));
+        assert_eq!(rule_hit("手表连不上了", &any).as_deref(), Some("连不上"));
+        assert!(rule_hit("照片怎么换", &any).is_none());
+
+        let all = rule(&["安装", "照片"], "all", true);
+        assert_eq!(
+            rule_hit("照片表盘怎么安装", &all).as_deref(),
+            Some("安装 + 照片")
+        );
+        assert!(rule_hit("怎么安装", &all).is_none());
+
+        let exact = rule(&["安装", "连不上"], "exact", true);
+        assert!(rule_hit("安装", &exact).is_some());
+        assert!(rule_hit("怎么安装", &exact).is_none());
+
+        // 大小写不敏感；空文本、停用规则不命中
+        let english = rule(&["Install"], "any", true);
+        assert!(rule_hit("install failed", &english).is_some());
+        assert!(rule_hit("", &any).is_none());
+        assert!(rule_hit("怎么安装", &rule(&["安装"], "any", false)).is_none());
+    }
+
+    #[test]
+    fn inbound_text_collects_only_trailing_text_messages() {
+        let items = vec![
+            json!({"direction":"receive","messageType":1,"content":"第一句"}),
+            json!({"direction":"send","messageType":1,"content":"我们的回复"}),
+            json!({"direction":"receive","messageType":1,"content":"第二句"}),
+            json!({"direction":"receive","messageType":1,"content":"第三句"}),
+        ];
+        assert_eq!(trailing_inbound_text(&items), "第二句\n第三句");
+        // 最后一条是我们发的：不算待回复内容
+        let items2 = vec![
+            json!({"direction":"receive","messageType":1,"content":"问题"}),
+            json!({"direction":"send","messageType":1,"content":"回答"}),
+        ];
+        assert_eq!(trailing_inbound_text(&items2), "");
+    }
+
+    #[test]
+    fn rule_validation_skips_empty_rows() {
+        let input = vec![
+            RuleIn {
+                id: None,
+                keywords: vec!["安装".into(), " ".into()],
+                match_mode: Some("exact".into()),
+                reply: "看这里".into(),
+                enabled: true,
+            },
+            // 没填完的行直接跳过，不报错
+            RuleIn {
+                id: None,
+                keywords: vec![],
+                match_mode: None,
+                reply: "".into(),
+                enabled: true,
+            },
+        ];
+        let rules = normalize_rules(&input).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].keywords, vec!["安装"]);
+        assert_eq!(rules[0].match_mode, "exact");
+        assert!(rules[0].id.starts_with("r_"));
+
+        // 非法 id 会被换掉（避免前端传路径字符）
+        let bad_id = RuleIn {
+            id: Some("../x".into()),
+            keywords: vec!["安装".into()],
+            match_mode: None,
+            reply: "ok".into(),
+            enabled: true,
+        };
+        let rules = normalize_rules(&[bad_id]).unwrap();
+        assert!(rules[0].id.starts_with("r_"));
+        assert_eq!(rules[0].match_mode, "any");
     }
 }

@@ -548,24 +548,42 @@ pub(crate) async fn install_file_bytes(
     file_data: Vec<u8>,
     ext: String,
 ) -> Result<String, String> {
-    install_file_bytes_id(app, addr, file_data, ext)
+    install_file_bytes_id(app, addr, file_data, ext, None)
         .await
         .map(|_| "安装完成".to_string())
 }
 
+/// 复写表盘 ID 的合法形态：与 AstroBox 的 `is_valid_watchface_id_str` 完全一致
+/// （9 或 12 位 ASCII 字母数字）。在售表盘都是 12 位数字，9 位是更早的机型。
+fn valid_watchface_id(s: &str) -> bool {
+    let b = s.as_bytes();
+    matches!(b.len(), 9 | 12) && b.iter().all(u8::is_ascii_alphanumeric)
+}
+
 /// 安装并返回**装上去的表盘 id**（非表盘类型返回 None）。
 /// 付费安装用它：一批多个包时，把**最后一个包**的表盘设为当前。
+///
+/// `rewrite_watchface_id`：用户在本地安装确认页选的「复写表盘 ID」。
+/// 给了就先把文件里的 ID 改掉（`.bin` 改头部、`.mwz` 连内部 bin 与 description.xml 一起改），
+/// 安装请求也用这个新 ID —— 语义是**装成一张新表盘**，不碰手环上原有的同名表盘。
+/// **付费安装路径永远传 None**（付费资源不允许复写 ID，也不会走本地通道）。
 pub(crate) async fn install_file_bytes_id(
     app: &tauri::AppHandle,
     addr: &str,
     file_data: Vec<u8>,
     ext: String,
+    rewrite_watchface_id: Option<String>,
 ) -> Result<Option<String>, String> {
     use corelib::device::xiaomi::components::install::InstallSystem;
     use corelib::device::xiaomi::components::mass::SendMassCallbackData;
     use tauri::Emitter;
 
-    log::info!("[install] addr={addr} ext={ext} len={}", file_data.len());
+    let mut file_data = file_data;
+    log::info!(
+        "[install] addr={addr} ext={ext} len={} rewrite_id={:?}",
+        file_data.len(),
+        rewrite_watchface_id
+    );
     // 长任务开始：心跳让路（把「忙」当掉线会误报），自动重连也等它收尾
     let _busy = crate::conn::busy_guard();
 
@@ -596,35 +614,83 @@ pub(crate) async fn install_file_bytes_id(
     if let Some(pkg) = package_name.as_deref() {
         log::info!("[install] quickapp package={pkg}");
     }
-    let watchface_id = if matches!(data_type, MassDataType::Watchface) {
+    let original_id = if matches!(data_type, MassDataType::Watchface) {
         resolve_watchface_id(addr, &file_data).await
     } else {
         None
     };
-    if let Some(id) = watchface_id.as_deref() {
+    if let Some(id) = original_id.as_deref() {
         if id.trim().starts_with("1209") {
             return Err("表盘文件已损坏".to_string());
         }
     }
 
+    // 复写表盘 ID（本地安装确认页选的）：文件里的 ID 改掉，安装请求也用新 ID。
+    // 复用 AstroBox 的 `set_watchface_id_vec`：`.bin` 改头部字段、`.mwz` 连内部 bin、
+    // description.xml / manifest.xml 与文件名一起改。
+    let want_rewrite = matches!(data_type, MassDataType::Watchface)
+        && rewrite_watchface_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some();
+    let watchface_id = if matches!(data_type, MassDataType::Watchface) {
+        match rewrite_watchface_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(new_id) => {
+                if !valid_watchface_id(new_id) {
+                    return Err("表盘 ID 需要 9 或 12 位字母数字".to_string());
+                }
+                let res_config = corelib::device::xiaomi::config::ResConfig::default();
+                corelib::device::xiaomi::resutils::set_watchface_id_vec(
+                    &mut file_data,
+                    &res_config,
+                    new_id,
+                )
+                .map_err(|e| format!("复写表盘 ID 失败：{e}"))?;
+                log::info!(
+                    "[install] 表盘 ID 复写：{:?} → {new_id}",
+                    original_id.as_deref().unwrap_or("(读不出来)")
+                );
+                Some(new_id.to_string())
+            }
+            None => original_id.clone(),
+        }
+    } else {
+        None
+    };
+
     // 留档：安装成功后把 .bin 存到 <data>/watchface_archive/<MAC>/<id>.bin
     // （编辑「已装表盘」的唯一数据源：设备上的表盘无法回读，必须安装时留档）
+    // **必须在复写 ID 之后取**：留档要与真正装上去的那份字节一致。
     let archive_copy: Option<Vec<u8>> = if matches!(data_type, MassDataType::Watchface) {
         Some(file_data.clone())
     } else {
         None
     };
 
-    // 同 ID 表盘已存在 → **先卸载再装**。
-    // 原因：corelib 的表盘安装请求把 version_code 写死成 65536（见
-    // `build_watchface_install_request`），设备拿它跟已装表盘的版本比较，不比对方大就回
-    // `PrepareStatus::Downgrade` —— 也就是「同一个表盘装第二次」必然失败。
-    // 卸载再装 = 每次安装都是干净结果（与 AstroBox 的安装语义一致）。
+    // 同 ID 表盘处理：
+    // - **没复写**：先卸载再装（corelib 的 version_code 写死 65536，同 ID 重装必然 Downgrade）
+    // - **复写了**：新 ID 必须没被占用 —— 占用就明确拒绝，**绝不卸载别人的表盘**
+    //   （这正是这次要解决的问题：撞 ID 时把另一张顶掉）
     if let Some(id) = watchface_id.clone() {
-        match uninstall_if_exists(addr, &id).await {
-            Ok(true) => log::info!("[install] 设备已有同 ID 表盘 {id}，已先卸载再安装"),
-            Ok(false) => {}
-            Err(e) => log::warn!("[install] 预处理（同 ID 卸载）失败，继续尝试安装: {e}"),
+        if want_rewrite {
+            match device_watchface_ids(addr).await {
+                Ok(ids) => {
+                    if ids.iter().any(|x| x == &id) {
+                        return Err("这个表盘 ID 手环上已经有了，请返回换一个再装".to_string());
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[install] 复写 ID 前取表盘列表失败: {e}");
+                    return Err("读不到手环上的表盘列表，请重连后再试".to_string());
+                }
+            }
+        } else {
+            match uninstall_if_exists(addr, &id).await {
+                Ok(true) => log::info!("[install] 设备已有同 ID 表盘 {id}，已先卸载再安装"),
+                Ok(false) => {}
+                Err(e) => log::warn!("[install] 预处理（同 ID 卸载）失败，继续尝试安装: {e}"),
+            }
         }
     }
 
@@ -691,18 +757,25 @@ pub(crate) async fn install_file_bytes_id(
         .map_err(|e| format!("{e}"))
 }
 
-/// 设备上若已有同 ID 表盘 → 卸载它，返回是否真的卸了。
-/// 用于「重装同一个表盘」（设备判 Downgrade）与「更新表盘」两条路径。
-async fn uninstall_if_exists(addr: &str, face_id: &str) -> anyhow::Result<bool> {
+/// 设备上的表盘 id 列表（「复写 ID 前查占用」与「同 ID 先卸载」共用）。
+async fn device_watchface_ids(addr: &str) -> anyhow::Result<Vec<String>> {
     use corelib::device::xiaomi::components::resource::ResourceSystem;
-    use corelib::device::xiaomi::components::watchface::WatchfaceSystem;
 
     let list = with_device_system::<ResourceSystem, _, _>(addr, |sys| {
         sys.request_watchface_list()
     })
     .await?;
     let items = await_oneshot(list, "设备未返回表盘列表").await?;
-    if !items.iter().any(|it| it.id == face_id) {
+    Ok(items.into_iter().map(|it| it.id).collect())
+}
+
+/// 设备上若已有同 ID 表盘 → 卸载它，返回是否真的卸了。
+/// 用于「重装同一个表盘」（设备判 Downgrade）与「更新表盘」两条路径。
+async fn uninstall_if_exists(addr: &str, face_id: &str) -> anyhow::Result<bool> {
+    use corelib::device::xiaomi::components::watchface::WatchfaceSystem;
+
+    let ids = device_watchface_ids(addr).await?;
+    if !ids.iter().any(|x| x == face_id) {
         return Ok(false);
     }
     let id = face_id.to_string();
@@ -898,18 +971,71 @@ pub async fn device_install(
 
 /// 安装（字节版）：安卓系统文件选择器返回 content:// URI，无法用文件路径打开；
 /// 前端用 <input type="file"> 读取文件字节并 base64 编码后传入（安卓/桌面通用）。
+///
+/// `rewrite_watchface_id`：本地安装确认页勾选「复写表盘 ID」时传入的新 ID（见上面安装核心）。
 #[tauri::command]
 pub async fn device_install_payload(
     app: tauri::AppHandle,
     addr: String,
     data_b64: String,
     ext: String,
+    rewrite_watchface_id: Option<String>,
 ) -> Result<String, String> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data_b64.as_bytes())
         .map_err(|e| format!("安装数据解码失败: {e}"))?;
-    install_file_bytes(&app, &addr, bytes, ext).await
+    install_file_bytes_id(&app, &addr, bytes, ext, rewrite_watchface_id)
+        .await
+        .map(|_| "安装完成".to_string())
+}
+
+/// 本地安装确认页用：只看文件本身（不连设备），返回类型、表盘 ID 与大小。
+/// 只做展示；真正的复写与占用检查在安装核心（`install_file_bytes_id`）里再做一遍。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalPayloadProbe {
+    /// watchface / quickapp / unknown
+    pub kind: String,
+    pub watchface_id: Option<String>,
+    pub size: usize,
+}
+
+#[tauri::command]
+pub fn local_payload_probe(data_b64: String, ext: String) -> Result<LocalPayloadProbe, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("文件数据解码失败: {e}"))?;
+    let file_type = get_file_type(&bytes);
+    let is_quickapp = ext.eq_ignore_ascii_case("rpk") || file_type == FileType::ThirdPartyApp;
+    let is_watchface = if is_quickapp {
+        false
+    } else if file_type == FileType::Zip {
+        ext.eq_ignore_ascii_case("mwz") || extract_install_watchface_bin(&bytes).is_some()
+    } else {
+        file_type == FileType::WatchFace
+    };
+    let watchface_id = if is_watchface {
+        corelib::device::xiaomi::resutils::get_watchface_id(
+            &bytes,
+            &corelib::device::xiaomi::config::ResConfig::default(),
+        )
+    } else {
+        None
+    };
+    Ok(LocalPayloadProbe {
+        kind: if is_quickapp {
+            "quickapp"
+        } else if is_watchface {
+            "watchface"
+        } else {
+            "unknown"
+        }
+        .to_string(),
+        watchface_id,
+        size: bytes.len(),
+    })
 }
 
 // ---------- 命令：表盘管理 ----------
@@ -1693,5 +1819,41 @@ mod rpk_tests {
         let data = make_rpk(&[("manifest.json", r#"{"name":"no-package"}"#)]);
         assert_eq!(rpk_package_name(&data), None);
         assert_eq!(rpk_package_name(b"not a zip"), None);
+    }
+}
+
+#[cfg(test)]
+mod watchface_id_tests {
+    use super::valid_watchface_id;
+
+    /// 与 AstroBox `is_valid_watchface_id_str` 同一条规则：9 或 12 位 ASCII 字母数字
+    #[test]
+    fn accepts_9_or_12_alnum_only() {
+        assert!(valid_watchface_id("123456789"));
+        assert!(valid_watchface_id("156700567401"));
+        assert!(valid_watchface_id("AbCdEf123456"));
+        assert!(!valid_watchface_id(""));
+        assert!(!valid_watchface_id("12345678"));
+        assert!(!valid_watchface_id("1234567890"));
+        assert!(!valid_watchface_id("1567005674011"));
+        assert!(!valid_watchface_id("15670056740!"));
+    }
+
+    /// 复写走的是 corelib 的实现（bin 头 0x28 起、9/12 位），这里验证真的改到了字节上
+    #[test]
+    fn rewrite_patches_bin_header() {
+        let mut data = vec![0u8; 200];
+        data[..4].copy_from_slice(&[0x5A, 0xA5, 0x34, 0x12]);
+        data[40..52].copy_from_slice(b"156700567401");
+        let cfg = corelib::device::xiaomi::config::ResConfig::default();
+        corelib::device::xiaomi::resutils::set_watchface_id_vec(
+            &mut data,
+            &cfg,
+            "987654321012",
+        )
+        .unwrap();
+        let got = corelib::device::xiaomi::resutils::get_watchface_id(&data, &cfg);
+        assert_eq!(got.as_deref(), Some("987654321012"));
+        assert_eq!(&data[40..52], b"987654321012");
     }
 }

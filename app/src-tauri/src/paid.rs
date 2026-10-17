@@ -1174,7 +1174,8 @@ pub async fn paid_install(
 
         // 交给现有安装通道（它会发 wf-install-progress，并按表盘 id 各自留档 → 两个包可分别编辑）
         emit_progress(&app, "transfer", &phase("正在传输到手环…"), None, None);
-        let id = crate::bridge::install_file_bytes_id(&app, &addr, plain, "bin".to_string())
+        // 付费资源不允许复写 ID（最后一个参数恒为 None）
+        let id = crate::bridge::install_file_bytes_id(&app, &addr, plain, "bin".to_string(), None)
             .await
             .map_err(|e| {
                 let msg = phase(&format!("安装失败：{e}"));

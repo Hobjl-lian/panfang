@@ -22,7 +22,6 @@ import {
   b64ToDataUrl,
   dataUrlToB64,
   sniffImageMime,
-  cropToTransform,
   isPhotoDialBinSummary,
   normalizeWfList,
   frameSizeFor,
@@ -36,7 +35,6 @@ import {
   type LayerModelDoc,
   type ScreenInfo,
   type PhotoCrop,
-  setSystemBarsLight,
   setInstallBackLock,
   setKeepScreenOn,
   openWebViewSettings,
@@ -50,9 +48,14 @@ import {
   type GenParams,
   type GenPlan,
   defaultGenParams,
+  genericGenPlan,
   genRefFrameOf,
   resolveCtl,
-  rotateVec
+  rotateVec,
+  randomWatchfaceId,
+  isValidWatchfaceId,
+  formatBytes,
+  type LocalPayloadProbe
 } from "./tauri";
 import {
   Lightning, CaretRight, FolderOpen, Check, House, SlidersHorizontal, Watch,
@@ -136,7 +139,7 @@ const LEGAL_BASE = "https://api.hobjl-shop.top";
 const APP_BEIAN_NO = "粤ICP备2026135374号-2A";
 const BEIAN_URL = "https://beian.miit.gov.cn/";
 
-type FlowStep = "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "paid_account" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "crop_image" | "photo_generator" | "settings_account" | "settings_device";
+type FlowStep = "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "paid_account" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "install_confirm" | "photo_generator" | "settings_account" | "settings_device";
 
 /** 逐包更新状态（服务端 packages + App 安装快照逐包比较后补上 needs_update/new） */
 interface PaidPackageStatus {
@@ -421,7 +424,8 @@ function parseRoute(route: string): { step: FlowStep; tab: TabKey } {
   // 见 KNOWN_ROUTES：安装是瞬时过程，重启后回到进来之前那一页才是对的）
   if (route === "install") return { step: "redeem_installing", tab: "home" };
   if (route === "dial-edit") return { step: "dial_edit", tab: "manage" };
-  if (route === "crop") return { step: "crop_image", tab: "manage" };
+  // 本地安装确认页：选完文件先停在确认（复写 ID 也在这里选），确认后才进安装
+  if (route === "install-confirm") return { step: "install_confirm", tab: "home" };
   if (route === "generator") return { step: "photo_generator", tab: "manage" };
   if (route === "about") return { step: "about_app", tab: "settings" };
   if (route === "about/developer") return { step: "about_developer", tab: "settings" };
@@ -445,7 +449,6 @@ const KNOWN_ROUTES = [
   "connect-help",
   "guide",
   "dial-edit",
-  "crop",
   "generator",
   "about",
   "about/developer",
@@ -518,12 +521,11 @@ function sanitizeBootStack(p: PersistedUi | null): string[] {
   const loggedIn = !!p?.profile?.nickname;
   if (!loggedIn && stack.some(r => r !== "login" && r !== "devices")) return ["login"];
   if (stack[0] !== "login" && !stack[0].startsWith("main/")) return ["login"];
-  // 编辑页/裁剪页的现场（留档字节、图层模型、待裁照片）都在内存里，重启恢复不了：
+  // 编辑页/制作壁纸页的现场（留档字节、图层模型、照片）都在内存里，重启恢复不了：
   // 一律退回去 —— 否则编辑页会拿设计稿的演示数据充数（真机上出现过「假表盘」就是这个）。
   while (
     stack.length > 1 &&
-    (stack[stack.length - 1] === "crop" ||
-      stack[stack.length - 1] === "generator" ||
+    (stack[stack.length - 1] === "generator" ||
       stack[stack.length - 1] === "dial-edit")
   ) {
     stack.pop();
@@ -636,11 +638,8 @@ export default function App() {
   // 当前页面：从恢复出来的页面栈顶开始（恢复不了就是登录页）
   const [currentStep, setCurrentStep] = useState<FlowStep>(boot.step);
 
-  // 状态栏/导航栏图标颜色随页面底色走：浅色页深色图标；裁剪页黑底用白色图标。
-  // 其余页全是浅底（登录/兑换/关于/编辑页），只有 crop_image 是深色。
-  useEffect(() => {
-    setSystemBarsLight(currentStep !== "crop_image");
-  }, [currentStep]);
+  // 状态栏/导航栏图标颜色：所有页面（含制作壁纸页）都是浅底 → 深色图标（由原生侧默认值保证，
+  // 这里不再按页切换；原来的深色裁剪页已下线）。
 
   /**
    * 系统 WebView 版本门禁（安卓）：界面用了 Tailwind v4 产物的 color-mix() 与 dvh，
@@ -991,7 +990,31 @@ export default function App() {
   /** 这次安装来自哪里：兑换流程（演示）还是本地 .bin 文件 → 决定失败后「重试安装」怎么重试 */
   const [installSource, setInstallSource] = useState<"paid" | "local">("paid");
   /** 本地安装的待装文件（失败重试要用同一份字节，不再让用户重选文件） */
-  const localInstall = useRef<{ addr: string; b64: string; ext: string } | null>(null);
+  const localInstall = useRef<{
+    addr: string;
+    b64: string;
+    ext: string;
+    rewriteId?: string;
+  } | null>(null);
+
+  /** 本地安装确认页：选完文件先停在这里（显示文件信息 + 可选的「复写表盘 ID」） */
+  const [pendingLocal, setPendingLocal] = useState<{
+    addr: string;
+    b64: string;
+    ext: string;
+    name: string;
+    size: number;
+    kind: LocalPayloadProbe["kind"];
+    originalId: string | null;
+  } | null>(null);
+  /** 是否复写 ID（默认关：不改文件的行为和以前一致，用户自己选） */
+  const [rewriteIdOn, setRewriteIdOn] = useState(false);
+  /** 复写用的新 ID（默认随机生成，用户可改） */
+  const [rewriteId, setRewriteId] = useState("");
+  /** 手环上已有的表盘 ID（只用于确认页提前提示冲突；null = 还没取到） */
+  const [deviceIdList, setDeviceIdList] = useState<string[] | null>(null);
+  /** 列表没取到（断链/超时）：确认页如实说「安装时再查一遍」，不假装已核对 */
+  const [deviceIdFailed, setDeviceIdFailed] = useState(false);
 
   const [dials, setDials] = useState<InstalledDial[]>(() => boot.dials);
   const [editingDial, setEditingDial] = useState<InstalledDial | null>(boot.editingDial);
@@ -1234,6 +1257,22 @@ export default function App() {
     applyRoute(route);
   };
 
+  /**
+   * 替换当前页（栈深度不变）。用途：确认页点「开始安装」→ 把确认页换成进度页，
+   * 安装成功后「完成」才回得到确认页之前那一页（不会退回到确认页）。
+   */
+  const replaceRoute = (route: string) => {
+    if (route === currentRoute()) return;
+    navStack.current = [...navStack.current.slice(0, -1), route];
+    topIsOverlay.current = false;
+    try {
+      window.history.replaceState({ panfang: true, route }, "", `#${route}`);
+    } catch {
+      /* 无 history：只改页面状态 */
+    }
+    applyRoute(route);
+  };
+
   /** 当前历史栈顶是不是「设备浮窗」那一层（返回键据此只关浮窗、不跳页） */
   const topIsOverlay = useRef(false);
   /** 「怎么连上手环」是不是从浮窗进来的（返回时要把浮窗还回去） */
@@ -1386,9 +1425,6 @@ export default function App() {
     slots: Array<{ slot: number; names: string[]; ids: number[]; defaultId: number }>;
     startStyleColorIndex: number | null;
   } | null>(null);
-  /** 待裁剪照片（选图后暂存，裁剪完成才进壁纸列表） */
-  const pendingPhoto = useRef<{ b64: string; mime: string; name: string } | null>(null);
-  /** 壁纸列表对应的原始字节与裁剪变换（下标与 wallpapers 一一对应） */
   /** 壁纸列表对应的原始字节与变换（下标与 wallpapers 一一对应）。
    *  `generated: true` = 生成器出的成品（相框已烙在图里），应用时直接用、不再走裁剪合成。 */
   const wallpaperMeta = useRef<Array<{ b64: string; crop: PhotoCrop | null; name: string; generated?: boolean }>>([]);
@@ -1430,32 +1466,11 @@ export default function App() {
   const [wallpapers, setWallpapers] = useState<string[]>(INITIAL_WALLPAPERS);
   const [currentWallpaperIndex, setCurrentWallpaperIndex] = useState(0);
 
-  // 裁剪图片页面状态
-  const [pendingCropImage, setPendingCropImage] = useState<string>("");
-  const [cropOffset, setCropOffset] = useState({ x: 0, y: 0 });
-  const [cropRotation, setCropRotation] = useState(0);
-  const [cropScale, setCropScale] = useState(1);
-  const isCropDragging = useRef(false);
-  const cropDragStart = useRef({ x: 0, y: 0 });
-  // 裁剪预览用 canvas 2D 画（安卓/vivo WebView 上 <img>+CSS transform 会黑屏）：
-  // 位图缓存 + 「位图被回收后重解码」那套防护见 rebuildCropBitmap / ensureCropVisible
-  const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const cropViewRef = useRef<HTMLDivElement | null>(null);
-  const cropBitmap = useRef<CanvasImageSource | null>(null);
-  const cropBitmapCache = useRef<Map<string, CanvasImageSource>>(new Map());
-  const cropDecoding = useRef(false);
-  /** 供滚动/可见性等异步回调读取的最新变换与视口尺寸（避免闭包读到旧值） */
-  const cropStateRef = useRef({
-    x: 0,
-    y: 0,
-    scale: 1,
-    rotation: 0,
-    frame: { w: 208, h: 248, radius: 30 }
-  });
-
-  // ---------------------- 壁纸生成器（方案来自服务端，没有方案的表盘走老的裁剪页） ----------------------
-  /** 当前表盘的壁纸方案（null = 这个表盘不配生成器 / 还没取到） */
+  // ---------------------- 壁纸生成器（照片表盘统一走这一页：有无模板由方案决定） ----------------------
+  /** 当前表盘的壁纸方案（null = 还没取到 / 取不到） */
   const [genPlan, setGenPlan] = useState<GenPlan | null>(null);
+  /** 取方案失败时的原因（断网首次 / 画布对不上）：入口处如实提示，不静默降级 */
+  const [genPlanError, setGenPlanError] = useState<string | null>(null);
   /** 每层的用户值（下标与方案里的 photos 一一对应） */
   const [genParams, setGenParams] = useState<GenParams[]>([]);
   /** 每层的照片：prev = 预览用的缩图（data URL），full = 原图字节（生成时用） */
@@ -1490,13 +1505,11 @@ export default function App() {
   const mockTopContainer = containers[0]?.selected ?? "";
   const mockBottomContainer = containers[1]?.selected ?? "";
 
-  // —— 画布 / 裁剪遮罩的尺寸参数化（docs/设计稿v2-对照与UI实施要点.md §5.2）——
+  // —— 画布尺寸参数化（docs/设计稿v2-对照与UI实施要点.md §5.2）——
   // 屏幕来源：优先当前连接设备，其次表盘自身画布，最后演示默认（212×520 跑道屏）。
   const canvasScreen: ScreenInfo = dialScreens.device ?? dialScreens.dial ?? DEMO_SCREEN;
   /** 编辑页画布框：等比最大 200×260 的 2/3（收紧版，给下方操作区留更多空间）+ 圆角同比例 */
   const canvasFrame = frameSizeFor(canvasScreen, 134, 174);
-  /** 裁剪视图/蒙版：同一套比例（设计稿的裁剪框 208×248 作为尺寸上限） */
-  const cropFrame = frameSizeFor(canvasScreen, 208, 248);
   /** 表盘与当前设备规格不一致时给出告警 */
   const canvasSpecMismatch =
     dialScreens.dial && dialScreens.device &&
@@ -1505,14 +1518,6 @@ export default function App() {
       : null;
   /** 演示/无渲染图时，设计稿那层 mock 内容按 208×248 基准等比缩放进设备框 */
   const mockScale = Math.min(canvasFrame.w / 208, canvasFrame.h / 248);
-  // 裁剪预览的绘制参数（异步回调里读它，始终是最新值）
-  cropStateRef.current = {
-    x: cropOffset.x,
-    y: cropOffset.y,
-    scale: cropScale,
-    rotation: cropRotation,
-    frame: { w: cropFrame.w, h: cropFrame.h, radius: cropFrame.radius }
-  };
 
   const showToast = (msg: string, kind: "success" | "error" = "success") => {
     setToast({ msg, kind });
@@ -2097,11 +2102,11 @@ export default function App() {
       })) as LayerModelDoc | null;
       if (stale()) return;
       binSession.current = { faceId: dial.id, dataB64: a.dataB64, model };
-      // 壁纸方案（照片表盘才有）：拉回来决定「添加照片」是进生成器还是进裁剪页；
-      // 素材同时补齐（失败不挡路：没方案的表盘照旧用裁剪页）
+      // 壁纸方案：照片表盘一律进生成器（有方案套模板，没方案用本地通用方案）
       setGenPlan(null);
-      if (model?.photoAlbum && model.watchfaceId) {
-        void loadGenPlan(model.watchfaceId, model.width, model.height);
+      setGenPlanError(null);
+      if (model?.photoAlbum) {
+        void loadGenPlan(model.watchfaceId, model.width, model.height, model.screen);
       }
 
       const dev = wfItems.current.find(x => x.id === dial.id);
@@ -3110,64 +3115,13 @@ export default function App() {
   };
 
   const handleAddWallpaper = () => {
-    if (invoke) {
-      // 这个表盘有壁纸方案（照片表盘）：进「制作壁纸」页 —— 选好照片当场看到成品，
-      // 不用再「网站导出 PNG → 传进 App」；没有方案的表盘照旧进裁剪页。
-      if (genPlan?.config) {
-        pushRoute("generator");
-        return;
-      }
-      openPhotoPicker();
+    // 照片表盘统一走「制作壁纸」：有方案（含本地通用方案）就进生成器；
+    // 方案取不到（断网首次 / 画布对不上）如实提示，**不再退回老裁剪页**。
+    if (genPlan?.config) {
+      pushRoute("generator");
       return;
     }
-    const newPhotos = [INITIAL_WALLPAPERS[0], INITIAL_WALLPAPERS[3], INITIAL_WALLPAPERS[1], INITIAL_WALLPAPERS[2]];
-    const picked = newPhotos[wallpapers.length % newPhotos.length];
-    setPendingCropImage(picked);
-    setCropOffset({ x: 0, y: 0 });
-    setCropRotation(0);
-    setCropScale(1);
-    pushRoute("crop"); // 进裁剪页 = 压一层页面栈（返回/取消回编辑页）
-  };
-
-  /**
-   * 系统选图（安卓 content:// 与桌面通用）：文件字节 → base64 缓存 → data URL 进裁剪页。
-   * 用临时 input 触发，不改动任何界面结构。
-   */
-  const openPhotoPicker = () => {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "image/*";
-    input.style.display = "none";
-    document.body.appendChild(input);
-    input.addEventListener("change", () => {
-      const file = input.files && input.files[0];
-      input.remove();
-      if (!file) return;
-      void (async () => {
-        try {
-          const u8 = new Uint8Array(await file.arrayBuffer());
-          const b64 = bytesToB64(u8);
-          const mime = sniffImageMime(u8) || file.type || "image/png";
-          // 手机原图可能 4000 万像素（RGBA ≈ 160MB/张，相册多张直接把应用顶掉）；
-          // 表盘画布最宽 432px、裁剪还能放大，2560 足够。相册存档也用这份缩图。
-          const raw = b64ToDataUrl(b64, mime);
-          const capped = await shrinkForPreview(raw, 2560);
-          pendingPhoto.current = {
-            b64: dataUrlToB64(capped) || b64,
-            mime: capped === raw ? mime : "image/jpeg",
-            name: file.name || "照片",
-          };
-          setPendingCropImage(capped);
-          setCropOffset({ x: 0, y: 0 });
-          setCropRotation(0);
-          setCropScale(1);
-          pushRoute("crop"); // 进裁剪页 = 压一层页面栈
-        } catch (err) {
-          showToast(humanize(err, "crop_open"), "error");
-        }
-      })();
-    });
-    input.click();
+    showToast(genPlanError || "壁纸方案还在加载，请稍后再点一次", "error");
   };
 
   // ================= 付费表盘：绑定 → 我的表盘 → 安装 =================
@@ -3763,10 +3717,22 @@ export default function App() {
    * （进度条 + 阶段文案 + 成功态，见 currentStep === "redeem_installing" / "redeem_success"），
    * 所以只切页面状态、不另造 UI。失败留在同一页给行内错误 + 「重试安装」（用同一份字节重试）。
    */
-  const runLocalInstall = (payload: { addr: string; b64: string; ext: string; name: string }) => {
+  const runLocalInstall = (payload: {
+    addr: string;
+    b64: string;
+    ext: string;
+    name: string;
+    /** 用户在确认页选的「复写表盘 ID」（不传 = 保持文件原 ID） */
+    rewriteId?: string;
+  }) => {
     const inv = invoke;
     if (!inv) return;
-    localInstall.current = { addr: payload.addr, b64: payload.b64, ext: payload.ext };
+    localInstall.current = {
+      addr: payload.addr,
+      b64: payload.b64,
+      ext: payload.ext,
+      rewriteId: payload.rewriteId
+    };
     setInstallSource("local");
     const isQuickApp = payload.ext === "rpk";
     installKindRef.current = isQuickApp ? "quickapp" : "watchface";
@@ -3774,8 +3740,10 @@ export default function App() {
     setInstallError(null);
     setInstallProgress(6);
     setProgressPhase(isQuickApp ? "正在校验快应用文件..." : "正在校验表盘文件...");
-    // 进安装进度页（与兑换流程同一套页面；返回键可退回进来之前那一页）
+    // 进安装进度页（与兑换流程同一套页面）：
+    // 从确认页进来 = 把确认页换成进度页（成功后「完成」直接回确认页之前那一页）
     if (currentRoute() === "install") setCurrentStep("redeem_installing");
+    else if (currentRoute() === "install-confirm") replaceRoute("install");
     else pushRoute("install");
     deviceBusy.current = true; // 传输期间不探连接状态（忙 ≠ 掉线）
     installBeat.current = Date.now();
@@ -3793,7 +3761,8 @@ export default function App() {
               canvas?: [number, number] | null;
               watchfaceId?: string | null;
             } | null;
-            seenWfId = info?.watchfaceId || "";
+            // 复写了 ID 时，装上去的是新 ID（成功页「去做壁纸」要按它查方案）
+            seenWfId = payload.rewriteId || info?.watchfaceId || "";
             let dev: [number, number] | null = paidScreen;
             if (!dev) {
               const s = (await inv("paid_device_screen", {
@@ -3820,7 +3789,8 @@ export default function App() {
             inv("device_install_payload", {
               addr: payload.addr,
               dataB64: payload.b64,
-              ext: payload.ext
+              ext: payload.ext,
+              rewriteWatchfaceId: payload.rewriteId ?? null
             })
           )
         )) as string | null;
@@ -3877,7 +3847,36 @@ export default function App() {
           const name =
             (file.name || "").replace(/\.[^.]+$/, "") ||
             (ext === "rpk" ? "本地快应用" : "本地表盘");
-          runLocalInstall({ addr, b64: bytesToB64(u8), ext, name });
+          const b64 = bytesToB64(u8);
+          // 先看文件本身（类型 / 表盘 ID / 大小）→ 进确认页；确认后才真正开始安装
+          const probe = (await inv("local_payload_probe", {
+            dataB64: b64,
+            ext
+          })) as LocalPayloadProbe | null;
+          setPendingLocal({
+            addr,
+            b64,
+            ext,
+            name,
+            size: probe?.size ?? u8.length,
+            kind: probe?.kind ?? "unknown",
+            originalId: probe?.watchfaceId ? String(probe.watchfaceId) : null
+          });
+          setRewriteIdOn(false);
+          setRewriteId(randomWatchfaceId());
+          setDeviceIdList(null);
+          setDeviceIdFailed(false);
+          pushRoute("install-confirm");
+          // 后台拉一次手环上的表盘 ID：确认页提前标出「这个 ID 已经有了」
+          void (async () => {
+            try {
+              const list = normalizeWfList(await inv("watchface_get_list", { addr }));
+              setDeviceIdList(list.map(x => x.id));
+            } catch {
+              setDeviceIdFailed(true);
+              /* 取不到就不提前标；安装时 Rust 还会再查一遍 */
+            }
+          })();
         } catch (err) {
           showToast(humanize(err, "pick_file"), "error");
         }
@@ -3886,65 +3885,97 @@ export default function App() {
     input.click();
   };
 
-  /** 裁剪页「完成」：新照片进壁纸列表（真实模式同时记录裁剪变换，应用时合成用） */
-  const handleCropConfirm = () => {
-    if (pendingCropImage) {
-      const session = binSession.current;
-      const photo = pendingPhoto.current;
-      const applied =
-        invoke && session?.model
-          ? cropToTransform(
-              { x: cropOffset.x, y: cropOffset.y, scale: cropScale, rotation: cropRotation },
-              session.model.width,
-              cropFrame.w
-            )
-          : null;
-      const b64 = photo?.b64 || dataUrlToB64(pendingCropImage) || "";
-      setWallpapers(prev => [pendingCropImage, ...prev]);
-      wallpaperMeta.current = [
-        { b64, crop: applied, name: photo?.name || "照片" },
-        ...wallpaperMeta.current
-      ];
-      setCurrentWallpaperIndex(0);
-      if (invoke && session) void renderDialPreview({ wallIdx: 0 });
+  /** 复写 ID 的候选：随机一个、避开手环上已有的 ID 与文件自己的 ID */
+  const nextFreeRandomId = (): string => {
+    const used = new Set<string>(deviceIdList || []);
+    if (pendingLocal?.originalId) used.add(pendingLocal.originalId);
+    for (let i = 0; i < 30; i++) {
+      const id = randomWatchfaceId();
+      if (!used.has(id)) return id;
     }
-    pendingPhoto.current = null;
-    goBackOr("main/manage"); // 裁剪页是编辑页压出来的 → 返回编辑页
-    showToast("已保存裁剪壁纸");
+    return randomWatchfaceId();
   };
+
+  /** 确认页「开始安装」：校验复写 ID → 进安装流程 */
+  const confirmLocalInstall = () => {
+    const p = pendingLocal;
+    if (!p) return;
+    let rewrite: string | undefined;
+    if (p.kind === "watchface" && rewriteIdOn) {
+      const id = rewriteId.trim();
+      if (!isValidWatchfaceId(id)) {
+        showToast("表盘 ID 需要 9 或 12 位字母数字", "error");
+        return;
+      }
+      if (deviceIdList?.includes(id)) {
+        showToast("这个 ID 手环上已经有了，请换一个", "error");
+        return;
+      }
+      rewrite = id;
+    }
+    setPendingLocal(null);
+    runLocalInstall({ addr: p.addr, b64: p.b64, ext: p.ext, name: p.name, rewriteId: rewrite });
+  };
+
+  // 离开确认页（取消 / 已开始安装）就把待装字节释放掉（可能是几十 MB）
+  useEffect(() => {
+    if (currentStep !== "install_confirm") setPendingLocal(null);
+  }, [currentStep]);
 
   // ---------------------- 壁纸生成器：取方案 / 画布预览 / 生成进列表 ----------------------
 
   /**
-   * 取这个表盘的壁纸方案（照片表盘才有）。拿不到就保持 null —— 界面照旧走裁剪页，
-   * **不报错、不挡路**（方案是锦上添花，不是安装的前提）。
+   * 取这个表盘的壁纸方案。**照片表盘一律走生成器**：
+   * - 服务端有方案 → 用它（模板/相框都由方案决定）；
+   * - 服务端说没有（`code: "none"`）→ 本地长一份通用方案（一张照片、不套模板）；
+   * - 取不到（断网首次 / 画布对不上）→ 记错误，入口处如实提示，不拿错方案硬套。
    */
-  const loadGenPlan = async (watchfaceId: string, canvasW: number, canvasH: number) => {
+  const loadGenPlan = async (
+    watchfaceId: string,
+    canvasW: number,
+    canvasH: number,
+    screen: { width: number; height: number; radius?: number } | null | undefined
+  ) => {
     const inv = invoke;
-    if (!inv || !watchfaceId) return;
-    try {
-      const p = (await inv("watchface_generator_plan", {
-        watchfaceId,
-        canvasW,
-        canvasH
-      })) as GenPlan | null;
-      if (!p?.enabled || !p.config) {
-        if (p?.reason) console.warn("[gen] 方案不可用:", p.reason);
-        setGenPlan(null);
-        return;
-      }
+    if (!inv) return;
+    const apply = (p: GenPlan) => {
+      const cfg = p.config!;
       setGenPlan(p);
-      if (p.missing?.length) console.warn("[gen] 素材没下齐:", p.missing);
-      // 界面初始值 = 方案里的默认值（两张图各自一份）
-      setGenParams(p.config.photos.map(ph => defaultGenParams(ph)));
-      setGenLayers(p.config.photos.map(() => ({ prev: "", full: "" })));
-      setGenColor(p.config.frame?.colors?.[0]?.i ?? null);
+      // 界面初始值 = 方案里的默认值（几张照片各一份）
+      setGenParams(cfg.photos.map(ph => defaultGenParams(ph)));
+      setGenLayers(cfg.photos.map(() => ({ prev: "", full: "" })));
+      setGenColor(cfg.frame?.colors?.[0]?.i ?? null);
       setGenActive(0);
       genImgs.current = new Map();
       genFrame.current = { key: "", img: null };
+    };
+    try {
+      const p = watchfaceId
+        ? ((await inv("watchface_generator_plan", {
+            watchfaceId,
+            canvasW,
+            canvasH
+          })) as GenPlan | null)
+        : null;
+      if (p?.enabled && p.config) {
+        setGenPlanError(null);
+        apply(p);
+        if (p.missing?.length) console.warn("[gen] 素材没下齐:", p.missing);
+        return;
+      }
+      if (!p || p.code === "none") {
+        // 这个表盘没有配方案：通用方案（照片 + 六个基础功能，不套模板）
+        setGenPlanError(null);
+        apply(genericGenPlan(screen, watchfaceId || undefined));
+        return;
+      }
+      console.warn("[gen] 方案不可用:", p.code, p.reason);
+      setGenPlan(null);
+      setGenPlanError(p.reason || "壁纸方案加载失败，请连网重开这一页");
     } catch (err) {
       console.warn("[gen] 取方案失败:", err);
       setGenPlan(null);
+      setGenPlanError("壁纸方案加载失败，请连网重开这一页");
     }
   };
 
@@ -3987,7 +4018,7 @@ export default function App() {
       return;
     }
     handleOpenDialEdit(dial, "main/manage");
-    showToast("在这儿做壁纸：选好照片直接套好相框");
+    showToast("在这儿做壁纸：选好照片就能生成");
   };
 
   /** 照片缩一份给预览用（预览在画布上画，缩图就够；生成时才用原图） */
@@ -4160,21 +4191,21 @@ export default function App() {
       ctx.restore();
     });
 
-    // 相框素材盖在最上层（尺寸不一致就居中，与 Rust 的 blit 一致）。
-    // 没选照片的空态也画它（用户 2026-10-16：空着一块灰看着怪，
-    // 「默认加载第一个配色的模板、照片位空着」——所见即模板的样子）
+    // 没选照片的空态：先把屏幕形状画出来（没模板的通用方案也要有个「照片放哪」的底）。
+    // 有模板时再盖模板（用户 2026-10-16：「默认加载第一个配色的模板、照片位空着」）。
     const fimg = genFrame.current.img;
-    if (fimg && fimg.complete && fimg.naturalWidth) {
-      if (!hasPhoto) {
-        ctx.fillStyle = "#E7E9EF";
-        if (cr > 0.5) {
-          ctx.beginPath();
-          roundRectPath(ctx, 0, 0, W, H, cr);
-          ctx.fill();
-        } else {
-          ctx.fillRect(0, 0, W, H);
-        }
+    if (!hasPhoto) {
+      ctx.fillStyle = "#E7E9EF";
+      if (cr > 0.5) {
+        ctx.beginPath();
+        roundRectPath(ctx, 0, 0, W, H, cr);
+        ctx.fill();
+      } else {
+        ctx.fillRect(0, 0, W, H);
       }
+    }
+    // 相框素材盖在最上层（尺寸不一致就居中，与 Rust 的 blit 一致）
+    if (fimg && fimg.complete && fimg.naturalWidth) {
       ctx.drawImage(
         fimg,
         (W - fimg.naturalWidth) / 2,
@@ -4302,6 +4333,15 @@ export default function App() {
     return total;
   };
 
+  /** 生成/保存之后把这一页的编辑现场清干净（照片、参数、拖拽、解码缓存） */
+  const resetGenEditing = (cfg: GenConfig) => {
+    setGenLayers(cfg.photos.map(() => ({ prev: "", full: "" })));
+    setGenParams(cfg.photos.map(ph => defaultGenParams(ph)));
+    setGenActive(0);
+    genImgs.current = new Map();
+    genLiveDrag.current = null;
+  };
+
   /** 生成器「生成壁纸」：用原图合成一张成品 → 进壁纸列表，并把现场清干净做下一张 */
   const handleGenerateWallpaper = async () => {
     const plan = genPlan;
@@ -4317,11 +4357,7 @@ export default function App() {
       const total = genPushWallpaper(png);
       // 生成完把现场清干净（用户 2026-10-16：不清掉会以为还没做完）：
       // 照片清空、参数回默认 → 直接引导选下一张
-      setGenLayers(plan.config.photos.map(() => ({ prev: "", full: "" })));
-      setGenParams(plan.config.photos.map(ph => defaultGenParams(ph)));
-      setGenActive(0);
-      genImgs.current = new Map();
-      genLiveDrag.current = null;
+      resetGenEditing(plan.config);
       showToast(`已生成第 ${total} 张 · 换张照片继续，或点「保存」回去`);
     } catch (err) {
       showToast(humanize(err, "generator"), "error");
@@ -4353,6 +4389,7 @@ export default function App() {
    * 「点了保存却没生成，会觉得东西丢了」）。生成失败就留在本页给报错，不走。
    */
   const saveGenWallpapers = async () => {
+    const plan = genPlan;
     if (genPendingEdit) {
       setGenSaving(true);
       setGenRendering(true);
@@ -4360,6 +4397,9 @@ export default function App() {
         const png = await genRenderOnce();
         if (!png) throw new Error("合成失败");
         genPushWallpaper(png);
+        // 保存 = 按当前编辑生成一张并离开：把现场清掉，
+        // 否则返回守卫会把「刚保存过」误判成「还有没生成的」再弹一次窗。
+        if (plan?.config) resetGenEditing(plan.config);
       } catch (err) {
         showToast(humanize(err, "generator"), "error");
         setGenRendering(false);
@@ -4370,6 +4410,9 @@ export default function App() {
       setGenSaving(false);
     }
     const n = genSessionMade + (genPendingEdit ? 1 : 0);
+    // 主动返回（不是系统返回/侧滑）：不要触发「是否保存」守卫。
+    // 守卫只在用户自己按返回时问；保存动作已经生成并清场了。
+    genBackGuardRef.current = null;
     goBackOr("main/manage");
     showToast(n > 0 ? `已保存 ${n} 张壁纸，在编辑页点「应用」推到手环` : "已返回");
   };
@@ -4383,6 +4426,8 @@ export default function App() {
       wallpaperMeta.current = wallpaperMeta.current.slice(drop);
       setCurrentWallpaperIndex(0);
     }
+    // 用户已经明确选了「不保存」：这是主动离开，不要再次被返回守卫拦下
+    genBackGuardRef.current = null;
     goBackOr("main/manage");
     showToast(drop > 0 ? "已放弃这次做的壁纸" : "已返回");
   };
@@ -4409,231 +4454,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentStep, genPlan, genParams, genLayers, genColor]);
 
-
-  // ---------------------- 裁剪预览：canvas 2D 绘制 + 真机防护 ----------------------
-  // 背景：安卓（尤其 vivo）WebView 上 `<img>` + CSS transform 会黑屏、位图滚出视野会被回收，
-  // 所以照搬 legacy `app/ui/index.legacy2.html` 的 canvas 2D 画法，并带上三条防护：
-  //   ① cropSourceDead → rebuildCropBitmap（清缓存后重新解码）
-  //   ② cropCanvasLooksEmpty → ensureCropVisible（滚动/回到前台/重新进入视野时检查）
-  //   ③ drawImage 包 try/catch（回收时不报错也不出图，只能按结果兜底）
-
-  /** 位图尺寸（ImageBitmap 用 width，<img> 用 naturalWidth） */
-  const bitmapSize = (src: CanvasImageSource | null) => {
-    if (!src) return { w: 0, h: 0 };
-    const s = src as { width?: number; naturalWidth?: number; height?: number; naturalHeight?: number };
-    return { w: Number(s.naturalWidth) || Number(s.width) || 0, h: Number(s.naturalHeight) || Number(s.height) || 0 };
-  };
-
-  /** 位图是否已被 WebView 回收（被 close 的 ImageBitmap / 解码丢失的 <img> → 尺寸为 0） */
-  const cropSourceDead = (src: CanvasImageSource | null): boolean => {
-    const { w, h } = bitmapSize(src);
-    return !w || !h;
-  };
-
-  /** 待裁剪图片 → Blob（App 内用选定文件的字节；浏览器演示用本地素材 URL） */
-  const cropPhotoBlob = async (): Promise<Blob | null> => {
-    const photo = pendingPhoto.current;
-    if (photo?.b64) {
-      try {
-        const u8 = b64ToBytes(photo.b64);
-        // 复制成独立的 ArrayBuffer，避开 TS 的 SharedArrayBuffer 宽化
-        const buf = new ArrayBuffer(u8.byteLength);
-        new Uint8Array(buf).set(u8);
-        return new Blob([buf], { type: photo.mime || "image/png" });
-      } catch {
-        /* 落到 URL 分支 */
-      }
-    }
-    if (pendingCropImage) {
-      try {
-        return await (await fetch(pendingCropImage)).blob();
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  };
-
-  /** 位图解码：优先 createImageBitmap，回退 <img> 解码 */
-  const decodeBitmapFromBlob = async (blob: Blob): Promise<CanvasImageSource | null> => {
-    try {
-      return await createImageBitmap(blob);
-    } catch {
-      /* 回退到 <img> */
-    }
-    return await new Promise((resolve) => {
-      const im = new Image();
-      const url = URL.createObjectURL(blob);
-      im.onload = () => {
-        URL.revokeObjectURL(url);
-        resolve(im);
-      };
-      im.onerror = () => {
-        URL.revokeObjectURL(url);
-        resolve(null);
-      };
-      im.src = url;
-    });
-  };
-
-  /** 载入当前待裁剪图片的位图（命中缓存直接复用；缓存里的已死则丢弃重解码），完成后重绘 */
-  const loadCropBitmap = async () => {
-    if (cropDecoding.current) return;
-    cropDecoding.current = true;
-    try {
-      const key = pendingCropImage;
-      let src = (key ? cropBitmapCache.current.get(key) : undefined) ?? null;
-      if (src && cropSourceDead(src)) {
-        cropBitmapCache.current.delete(key);
-        src = null;
-      }
-      if (!src) {
-        const blob = await cropPhotoBlob();
-        if (blob) src = await decodeBitmapFromBlob(blob);
-        if (src && key) cropBitmapCache.current.set(key, src);
-      }
-      cropBitmap.current = src;
-      drawCrop();
-    } finally {
-      cropDecoding.current = false;
-    }
-  };
-
-  /** 丢掉缓存的位图并重新解码（画布空了 / 位图被回收时调） */
-  const rebuildCropBitmap = async (_reason: string) => {
-    const key = pendingCropImage;
-    if (key) cropBitmapCache.current.delete(key);
-    cropBitmap.current = null;
-    await loadCropBitmap();
-  };
-
-  /** 裁剪预览：canvas 2D 绘制（与后端 draw_photo 同一套变换：cover 基准 × 缩放 + 平移 + 旋转） */
-  const drawCrop = () => {
-    const cvs = cropCanvasRef.current;
-    if (!cvs) return;
-    const src = cropBitmap.current;
-    if (!src) {
-      // 位图还没解码出来 → 触发一次解码（解完会自己重绘）
-      if (pendingCropImage || pendingPhoto.current) void loadCropBitmap();
-      return;
-    }
-    if (cropSourceDead(src)) {
-      void rebuildCropBitmap("位图已回收");
-      return;
-    }
-    const st = cropStateRef.current;
-    const { w, h } = st.frame;
-    const dpr = window.devicePixelRatio || 1;
-    cvs.width = Math.round(w * dpr);
-    cvs.height = Math.round(h * dpr);
-    cvs.style.width = `${w}px`;
-    cvs.style.height = `${h}px`;
-    const ctx = cvs.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, w, h);
-    const { w: nw, h: nh } = bitmapSize(src);
-    // 基础缩放 = 画布→视图 的等比显示比（视图框是画布的缩小版，与 cropToTransform 用同一个比例）：
-    // scale=1 表示 1 图片像素 = 1 画布像素 —— 按表盘尺寸出的图（如 212×520）在视图里恰好铺满框；
-    // 不是画布规格的图则按原生尺寸居中摆放。再乘用户缩放。
-    const canvasW = binSession.current?.model?.width || st.frame.w;
-    const k = (st.frame.w / canvasW) * Math.max(st.scale, 0.05);
-    ctx.save();
-    try {
-      ctx.translate(w / 2 + st.x, h / 2 + st.y);
-      ctx.rotate((st.rotation * Math.PI) / 180);
-      ctx.scale(k, k);
-      ctx.drawImage(src, -nw / 2, -nh / 2, nw, nh);
-    } catch {
-      // 位图被回收时 drawImage 会抛：清缓存重解码，别再画个黑屏
-      ctx.restore();
-      void rebuildCropBitmap("drawImage 失败");
-      return;
-    }
-    ctx.restore();
-  };
-
-  /** 画布「看起来是空的」探测：中心区 3×3 采样点全黑即认定没画上（回收后可能既不报错也不出图） */
-  const cropCanvasLooksEmpty = (cvs: HTMLCanvasElement): boolean => {
-    try {
-      const ctx = cvs.getContext("2d");
-      if (!ctx || !cvs.width) return false;
-      for (const fx of [0.3, 0.5, 0.7]) {
-        for (const fy of [0.3, 0.5, 0.7]) {
-          const d = ctx.getImageData(Math.round(cvs.width * fx), Math.round(cvs.height * fy), 1, 1).data;
-          if (d[0] > 8 || d[1] > 8 || d[2] > 8) return false; // 有内容
-        }
-      }
-      return true; // 9 个采样点全黑 → 当没画上
-    } catch {
-      return false; // 读不到就当作正常，交给 try/catch 那条路
-    }
-  };
-
-  /** 确认裁剪预览还在（滚回来 / 切回前台时调）：画布空了就重建位图，否则只重绘 */
-  const ensureCropVisible = (reason: string) => {
-    if (!pendingCropImage || currentStep !== "crop_image") return;
-    const cvs = cropCanvasRef.current;
-    if (!cvs) return;
-    if (cropCanvasLooksEmpty(cvs)) {
-      void rebuildCropBitmap(reason);
-      return;
-    }
-    drawCrop();
-  };
-
-  // 进裁剪页：解码首绘 + 滚动/可见性/视野三条检查（vivo 上「滚出屏幕再回来永久黑屏」的修法）
-  useEffect(() => {
-    if (currentStep !== "crop_image") return;
-    void loadCropBitmap();
-    // 滚动（捕获阶段）中读像素很贵，节流到 300ms 一次
-    let lastCheck = 0;
-    const onScroll = () => {
-      const now = Date.now();
-      if (now - lastCheck < 300) return;
-      lastCheck = now;
-      ensureCropVisible("滚动后画布为空");
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") ensureCropVisible("回到前台");
-    };
-    document.addEventListener("scroll", onScroll, true);
-    document.addEventListener("visibilitychange", onVisibility);
-    // 滚动事件在个别 WebView 上不一定到（滚动发生在内层容器）→ 再挂一个 IntersectionObserver 兜底
-    let wasOffscreen = false;
-    const ob =
-      typeof IntersectionObserver === "function"
-        ? new IntersectionObserver(
-            entries => {
-              for (const en of entries) {
-                if (!en.isIntersecting) {
-                  wasOffscreen = true;
-                  continue;
-                }
-                if (wasOffscreen) {
-                  wasOffscreen = false;
-                  ensureCropVisible("重新进入视野");
-                }
-              }
-            },
-            { threshold: 0.01 }
-          )
-        : null;
-    const view = cropViewRef.current;
-    if (ob && view) ob.observe(view);
-    return () => {
-      document.removeEventListener("scroll", onScroll, true);
-      document.removeEventListener("visibilitychange", onVisibility);
-      if (ob) ob.disconnect();
-    };
-  }, [currentStep, pendingCropImage]);
-
-  // 拖拽/缩放/旋转变化 → 重绘（canvas 2D 画，不用 CSS transform）
-  useEffect(() => {
-    if (currentStep !== "crop_image") return;
-    drawCrop();
-  }, [currentStep, pendingCropImage, cropOffset, cropRotation, cropScale]);
 
   const handleApplyDialConfig = () => {
     if (!editingDial) return;
@@ -5632,7 +5452,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.36"} · 开源许可与开发者
+                              盘坊 v{appVersion ?? "0.3.40"} · 开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -5645,7 +5465,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 · 版本 {appVersion ?? "0.3.36"}
+                      盘坊 · 版本 {appVersion ?? "0.3.40"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -6460,6 +6280,192 @@ export default function App() {
             </div>
           )}
 
+          {/* 4.9 本地安装确认页：选完文件先停在这里（显示文件信息 + 可选复写表盘 ID） */}
+          {currentStep === "install_confirm" && pendingLocal && (() => {
+            const p = pendingLocal;
+            const isWatchface = p.kind === "watchface";
+            const idTrimmed = rewriteId.trim();
+            const idInvalid = rewriteIdOn && isWatchface && !isValidWatchfaceId(idTrimmed);
+            const idTaken = rewriteIdOn && isWatchface && !!deviceIdList?.includes(idTrimmed);
+            const canInstall = !rewriteIdOn || !isWatchface || (!idInvalid && !idTaken);
+            const originalTaken = isWatchface && !!p.originalId && !!deviceIdList?.includes(p.originalId);
+            const kindLabel =
+              p.kind === "quickapp" ? "快应用" : p.kind === "watchface" ? "表盘" : "未识别的文件";
+            const TypeIcon = isWatchface ? Watch : FileText;
+            return (
+              <div className="flex-1 flex flex-col overflow-hidden bg-[#F5F6F9] page-enter-anim select-none relative">
+                {/* 顶栏：返回 / 标题（与制作壁纸页同一套） */}
+                <div className="relative flex items-center justify-between px-4 safe-top pb-1 z-20 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => goBackOr("main/home")}
+                    className="h-9 px-4 rounded-full bg-black/5 hover:bg-black/10 active:scale-95 transition-all text-black/80 text-[14px] font-semibold cursor-pointer flex items-center justify-center"
+                  >
+                    返回
+                  </button>
+                  <span className="absolute left-1/2 -translate-x-1/2 text-[17px] font-bold tracking-tight text-black">
+                    确认安装
+                  </span>
+                  <span className="w-[60px]" />
+                </div>
+
+                {/* 内容整体在中部偏上：min-h-full + 居中，展开复写框时仍可滚动 */}
+                <div className="flex-1 overflow-y-auto px-5">
+                  <div className="min-h-full flex flex-col justify-center py-4 pb-32">
+                    {/* 大卡：文件信息（主视觉）。表盘名做标题放最顶上 */}
+                    <div className="bg-white rounded-2xl p-5 shadow-[0_2px_10px_rgba(0,0,0,0.03)] border border-black/[0.02]">
+                      <div className="flex items-start gap-3">
+                        <div className="min-w-0 flex-1">
+                          <p className="text-[24px] font-bold leading-[1.25] text-black break-words">
+                            {p.name}
+                          </p>
+                          <div className="flex items-center gap-2 mt-2.5">
+                            <span className="inline-flex items-center h-[22px] px-2 rounded-md bg-[#4361EE]/[0.07] text-[12px] font-semibold text-[#4361EE]">
+                              {kindLabel}
+                            </span>
+                            <span className="text-[13px] font-medium text-black/45">
+                              {formatBytes(p.size)}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="w-12 h-12 rounded-2xl bg-[#4361EE]/[0.07] flex items-center justify-center shrink-0">
+                          <TypeIcon className="w-6 h-6 text-[#4361EE]" weight="duotone" />
+                        </div>
+                      </div>
+
+                      {isWatchface && (
+                        <div className="mt-4 pt-4 border-t border-black/5">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-[13px] font-medium text-black/45">表盘 ID</span>
+                            <span className="text-[14px] font-mono font-semibold tracking-wider text-black/80 truncate">
+                              {p.originalId || "读不出来"}
+                            </span>
+                          </div>
+                          {/* 原 ID 已存在：直接装会替换手环上那张（这正是要复写 ID 的场景） */}
+                          {originalTaken && !rewriteIdOn && (
+                            <div className="flex items-start gap-2 rounded-xl bg-[#FFF7E8] px-3 py-2.5 mt-3">
+                              <Info className="w-4 h-4 text-[#B7791F] shrink-0 mt-[1px]" weight="fill" />
+                              <p className="text-[12px] font-medium text-[#8A5A12] leading-relaxed">
+                                手环上已有同 ID 的表盘，直接安装会替换它；不想替换就打开「复写表盘 ID」
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {p.kind === "unknown" && (
+                        <div className="flex items-start gap-2 rounded-xl bg-[#FFF7E8] px-3 py-2.5 mt-4">
+                          <Info className="w-4 h-4 text-[#B7791F] shrink-0 mt-[1px]" weight="fill" />
+                          <p className="text-[12px] font-medium text-[#8A5A12] leading-relaxed">
+                            没认出这个文件类型，仍可尝试安装
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* 小卡：复写表盘 ID（只有表盘才有；快应用没有表盘 ID 语义） */}
+                    {isWatchface && (
+                      <div className="bg-white rounded-2xl p-4 mt-3 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/[0.02]">
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="min-w-0">
+                            <p className="text-[15px] font-semibold text-black">复写表盘 ID</p>
+                            <p className="text-[12px] font-medium text-black/45 mt-1 leading-relaxed">
+                              换一个新 ID 安装，不会覆盖手环上已有的同名表盘
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={rewriteIdOn && !!p.originalId}
+                            disabled={!p.originalId}
+                            onClick={() => setRewriteIdOn(v => !v)}
+                            className={`w-[52px] h-[30px] rounded-full p-1 transition-colors duration-200 flex items-center shrink-0 ${
+                              !p.originalId
+                                ? "bg-black/5 opacity-40 cursor-not-allowed"
+                                : rewriteIdOn
+                                  ? "bg-[#34C759] cursor-pointer"
+                                  : "bg-black/10 cursor-pointer"
+                            }`}
+                          >
+                            <div
+                              className={`w-[22px] h-[22px] rounded-full bg-white shadow-xs transition-transform duration-200 ${
+                                rewriteIdOn && p.originalId ? "translate-x-[22px]" : "translate-x-0"
+                              }`}
+                            />
+                          </button>
+                        </div>
+
+                        {!p.originalId ? (
+                          <p className="text-[12px] font-medium text-black/40 mt-2">
+                            读不出这个文件的表盘 ID，无法复写
+                          </p>
+                        ) : rewriteIdOn && (
+                          <div className="mt-3 pt-3 border-t border-black/5">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <input
+                                value={rewriteId}
+                                onChange={e =>
+                                  setRewriteId(e.target.value.replace(/[^0-9A-Za-z]/g, "").slice(0, 12))
+                                }
+                                maxLength={12}
+                                inputMode="text"
+                                autoCapitalize="characters"
+                                spellCheck={false}
+                                placeholder="9 或 12 位字母数字"
+                                className="flex-1 min-w-0 h-11 rounded-xl bg-black/[0.04] px-3 text-[15px] font-mono tracking-wider text-black outline-none focus:ring-2 focus:ring-[#4361EE]/25"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => setRewriteId(nextFreeRandomId())}
+                                className="h-11 px-3 rounded-xl bg-[#4361EE]/10 hover:bg-[#4361EE]/15 active:scale-95 transition-all text-[#4361EE] text-[13px] font-semibold flex items-center gap-1 cursor-pointer shrink-0"
+                              >
+                                <ArrowsClockwise className="w-3.5 h-3.5" />
+                                随机
+                              </button>
+                            </div>
+                            <p
+                              className={`text-[12px] font-medium mt-2 ${
+                                idInvalid || idTaken ? "text-[#E63946]" : "text-black/40"
+                              }`}
+                            >
+                              {idInvalid
+                                ? "表盘 ID 需要 9 或 12 位字母数字"
+                                : idTaken
+                                  ? "这个 ID 手环上已经有了，换一个再装"
+                                  : deviceIdFailed
+                                    ? "暂时读不到手环上的表盘列表，安装时还会再查一遍"
+                                    : deviceIdList
+                                      ? "已避开手环上已有的 ID"
+                                      : "正在核对手环上已有的 ID…"}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* 底部主按钮：确认后才真正开始推送 */}
+                <div
+                  data-pf-bottombar
+                  className="absolute bottom-0 left-0 right-0 p-5 safe-bottom-bar bg-white border-t border-black/5 flex flex-col pt-3 z-30"
+                >
+                  <p className="text-center text-[12px] font-medium text-black/40 mb-2.5">
+                    将推送到 {connected.current.name || "手环"}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={confirmLocalInstall}
+                    disabled={!canInstall}
+                    className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/15 disabled:text-black/40 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center"
+                  >
+                    开始安装
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+
           {/* 5. 连续安装进度页 */}
           {currentStep === "redeem_installing" && (
             <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim">
@@ -6827,12 +6833,12 @@ export default function App() {
                 {/* 2. 手风琴式展开配置区（收紧版间距） */}
                 <div className="flex flex-col gap-2.5">
                   
-                  {/* 上传壁纸卡片（仅照片表盘显示，支持 10+ 张正方形预览与快捷点击切换） */}
+                  {/* 壁纸卡片（仅照片表盘显示，支持 10+ 张正方形预览与快捷点击切换） */}
                   {editingDial.isPhotoDial && (
                     <div className="bg-white rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex flex-col gap-2.5">
                       <div className="flex items-center justify-between">
                         <span className="text-[16px] font-bold text-black tracking-tight">
-                          {genPlan?.config ? "制作壁纸" : "上传壁纸"}
+                          制作壁纸
                         </span>
 
                         {/* 上传新增入口 */}
@@ -6842,7 +6848,7 @@ export default function App() {
                           className="flex items-center gap-1.5 px-3.5 h-[32px] rounded-full bg-[#4361EE]/10 text-[#4361EE] hover:bg-[#4361EE]/15 active:scale-95 transition-all text-[13px] font-bold cursor-pointer"
                         >
                           <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
-                          <span>{genPlan?.config ? "去制作" : "添加照片"}</span>
+                          <span>去制作</span>
                         </button>
                       </div>
 
@@ -6850,16 +6856,14 @@ export default function App() {
                       {wallpapers.length === 0 ? (
                         <div className="py-6 flex flex-col items-center justify-center text-center">
                           <p className="text-[14px] font-medium text-black/40 mb-3">
-                            {genPlan?.config
-                              ? "还没有壁纸，点下面去做一张"
-                              : "还没有照片，点下方「添加照片」开始"}
+                            {genPlanError || "还没有壁纸，点下面去做一张"}
                           </p>
                           <button
                             type="button"
                             onClick={handleAddWallpaper}
                             className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[14px] active:scale-95 transition-all cursor-pointer"
                           >
-                            {genPlan?.config ? "去制作壁纸" : "添加照片"}
+                            去制作壁纸
                           </button>
                         </div>
                       ) : (
@@ -7185,176 +7189,6 @@ export default function App() {
             </div>
           )}
 
-          {/* 7.5 图片裁剪与旋转页面 */}
-          {currentStep === "crop_image" && (
-            <div className="flex-1 flex flex-col justify-between overflow-hidden bg-[#0A0A0C] text-white page-enter-anim select-none relative">
-              {/* 顶部轻质导航栏 */}
-              <div className="flex items-center justify-between px-5 safe-top pb-3 z-20 bg-linear-to-b from-[#0A0A0C] via-[#0A0A0C]/90 to-transparent">
-                <button
-                  type="button"
-                  onClick={() => goBackOr("main/manage")}
-                  className="h-9 px-4 rounded-full bg-white/10 hover:bg-white/15 active:scale-95 transition-all text-white/90 hover:text-white text-[14px] font-semibold cursor-pointer flex items-center justify-center backdrop-blur-md"
-                >
-                  取消
-                </button>
-                <div className="flex flex-col items-center">
-                  <span className="text-[16px] font-bold tracking-tight text-white">
-                    移动和缩放
-                  </span>
-                  <span className="text-[11px] text-white/40 font-medium">
-                    拖动画面调整表盘显示
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleCropConfirm}
-                  className="h-9 px-4 rounded-full bg-[#4361EE] hover:bg-[#3651D4] text-white text-[14px] font-bold cursor-pointer active:scale-95 transition-all shadow-[0_2px_8px_rgba(67,97,238,0.35)] flex items-center justify-center"
-                >
-                  完成
-                </button>
-              </div>
-
-              {/* 核心视口与裁剪遮罩 */}
-              <div 
-                ref={cropViewRef}
-                className="flex-1 relative flex items-center justify-center overflow-hidden cursor-grab active:cursor-grabbing touch-none"
-                onMouseDown={(e) => {
-                  isCropDragging.current = true;
-                  cropDragStart.current = { x: e.clientX - cropOffset.x, y: e.clientY - cropOffset.y };
-                }}
-                onMouseMove={(e) => {
-                  if (!isCropDragging.current) return;
-                  setCropOffset({
-                    x: e.clientX - cropDragStart.current.x,
-                    y: e.clientY - cropDragStart.current.y
-                  });
-                }}
-                onMouseUp={() => { isCropDragging.current = false; }}
-                onMouseLeave={() => { isCropDragging.current = false; }}
-                onTouchStart={(e) => {
-                  isCropDragging.current = true;
-                  cropDragStart.current = { 
-                    x: e.touches[0].clientX - cropOffset.x, 
-                    y: e.touches[0].clientY - cropOffset.y 
-                  };
-                }}
-                onTouchMove={(e) => {
-                  if (!isCropDragging.current) return;
-                  setCropOffset({
-                    x: e.touches[0].clientX - cropDragStart.current.x,
-                    y: e.touches[0].clientY - cropDragStart.current.y
-                  });
-                }}
-                onTouchEnd={() => { isCropDragging.current = false; }}
-              >
-                {/* 底图：canvas 2D 绘制（支持拖拽平移、无极旋转及无极缩放；
-                    安卓/vivo WebView 上 <img> + CSS transform 会黑屏，故用 canvas） */}
-                <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                  <canvas
-                    ref={cropCanvasRef}
-                    className="block pointer-events-none select-none"
-                    style={{
-                      width: `${cropFrame.w}px`,
-                      height: `${cropFrame.h}px`,
-                      borderRadius: `${cropFrame.radius}px`
-                    }}
-                  />
-                </div>
-
-                {/* 半透明蒙层 + 按设备屏幕比例的视口镂空框 */}
-                <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                  <div
-                    className="w-[208px] h-[248px] rounded-[30px] ring-[999px] ring-black/80 relative shadow-[inset_0_0_0_1.5px_rgba(255,255,255,0.7)]"
-                    style={{
-                      width: `${cropFrame.w}px`,
-                      height: `${cropFrame.h}px`,
-                      borderRadius: `${cropFrame.radius}px`
-                    }}
-                  >
-                    {/* 九宫格辅助参考线 */}
-                    <div className="absolute inset-0 grid grid-cols-3 grid-rows-3 pointer-events-none opacity-40">
-                      <div className="border-r border-b border-white/30" />
-                      <div className="border-r border-b border-white/30" />
-                      <div className="border-b border-white/30" />
-                      <div className="border-r border-b border-white/30" />
-                      <div className="border-r border-b border-white/30" />
-                      <div className="border-b border-white/30" />
-                      <div className="border-r border-white/30" />
-                      <div className="border-r border-white/30" />
-                      <div />
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* 底部无极进度条控制面板 */}
-              <div data-pf-bottombar className="px-6 pt-4 safe-bottom-panel bg-linear-to-t from-black via-[#0A0A0C]/95 to-transparent flex flex-col gap-4 z-20">
-                {/* 控制条 1：无极缩放 Slider */}
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center gap-1.5 w-16 shrink-0 text-white/60">
-                    <MagnifyingGlassPlus className="w-3.5 h-3.5" />
-                    <span className="text-[12px] font-medium">缩放</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0.8"
-                    max="3.0"
-                    step="0.01"
-                    value={cropScale}
-                    onChange={(e) => setCropScale(parseFloat(e.target.value))}
-                    className="flex-1 h-1.5 bg-white/20 rounded-lg appearance-none cursor-pointer accent-[#4361EE]"
-                  />
-                  <span className="text-[12px] font-mono font-medium text-white/80 w-12 text-right">
-                    {cropScale.toFixed(2)}x
-                  </span>
-                </div>
-
-                {/* 控制条 2：无极旋转 Slider */}
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center gap-1.5 w-16 shrink-0 text-white/60">
-                    <ArrowClockwise className="w-3.5 h-3.5" />
-                    <span className="text-[12px] font-medium">旋转</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="-180"
-                    max="180"
-                    step="1"
-                    value={cropRotation}
-                    onChange={(e) => setCropRotation(parseInt(e.target.value, 10))}
-                    className="flex-1 h-1.5 bg-white/20 rounded-lg appearance-none cursor-pointer accent-[#4361EE]"
-                  />
-                  <span className="text-[12px] font-mono font-medium text-white/80 w-12 text-right">
-                    {cropRotation > 0 ? `+${cropRotation}°` : `${cropRotation}°`}
-                  </span>
-                </div>
-
-                {/* 独立重置按钮栏 */}
-                <div className="flex items-center justify-between pt-1">
-                  <div className="text-[11px] text-white/40 font-medium">
-                    双手双指或滑块无极调节
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setCropOffset({ x: 0, y: 0 });
-                      setCropRotation(0);
-                      setCropScale(1);
-                    }}
-                    className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-white/10 hover:bg-white/15 active:scale-95 transition-all text-white/80 hover:text-white text-[12px] font-semibold cursor-pointer"
-                  >
-                    <ArrowCounterClockwise className="w-3.5 h-3.5" />
-                    <span>重置参数</span>
-                  </button>
-                </div>
-
-                <div className="h-1.5 flex items-center justify-center pt-2">
-                  <div className="w-32 h-1 bg-white/20 rounded-full" />
-                </div>
-              </div>
-            </div>
-          )}
-
           {/* 7.6 壁纸制作页（照片表盘专用；方案来自服务端 → 模板/控件都不写死）。
               浅色，与外面一致；预览用画布直接画（拖动/滑杆要跟手），成品走 Rust。 */}
           {currentStep === "photo_generator" && genPlan?.config && (() => {
@@ -7670,7 +7504,7 @@ export default function App() {
                     盘坊
                   </h2>
                   <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.36"}
+                    v{appVersion ?? "0.3.40"}
                   </span>
                 </div>
 
@@ -7714,7 +7548,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.36"}`}
+                            : `当前版本 v${appVersion ?? "0.3.40"}`}
                         </p>
                       </div>
                     </div>

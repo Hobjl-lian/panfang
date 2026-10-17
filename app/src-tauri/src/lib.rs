@@ -135,6 +135,7 @@ pub fn run() {
             paid::paid_latest_file,
             paid::paid_install,
             bridge::device_install_payload,
+            bridge::local_payload_probe,
             bridge::bin_inspect_info,
             bridge::watchface_get_list,
             bridge::watchface_set_current,

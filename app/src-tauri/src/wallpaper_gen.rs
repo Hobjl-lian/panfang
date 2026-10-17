@@ -50,7 +50,8 @@ impl Default for NumCtl {
     fn default() -> Self {
         NumCtl {
             default: 1.0,
-            min: 0.5,
+            // 缩放下限 0.2：横向照片在竖长画布上要能退到「看得到整张」（0.5 只够看到一半）
+            min: 0.2,
             max: 3.0,
             step: 0.01,
             adjustable: true,
@@ -104,7 +105,7 @@ impl Default for GenControls {
         GenControls {
             scale: NumCtl {
                 default: 1.0,
-                min: 0.5,
+                min: 0.2,
                 max: 3.0,
                 step: 0.01,
                 adjustable: true,

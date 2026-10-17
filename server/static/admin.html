@@ -975,7 +975,7 @@ const SCREEN_RADIUS = { "192x490": 96, "212x520": 106, "336x480": 45, "432x514":
 
 function planSkeleton(kind, w, h, win){
   const ctl = (darken, blur) => ({
-    scale:    { default: 1,  min: 0.5, max: 3,   step: 0.01, adjustable: true },
+    scale:    { default: 1,  min: 0.2, max: 3,   step: 0.01, adjustable: true },
     rotation: { default: 0,  min: -180, max: 180, step: 1,    adjustable: true },
     darken:   { default: darken, min: 0, max: 1, step: 0.01, adjustable: true },
     blur:     { default: blur,   min: 0, max: 40, step: 1,   adjustable: true },
@@ -1240,13 +1240,35 @@ function renderMessages(){
     <div class="page-head">
       <div><h1 class="page-title">私信</h1>
         <p class="page-desc">爱发电私信。登录态只保存在服务端（主密钥加密），页面不会回显。
-          这里是「人工收发台」：自动回复要等通道稳定后再开。</p></div>
+          下面的关键词自动回复默认关闭，规则和话术由你维护。</p></div>
       <span class="sp"></span>
       <button class="btn btn-ghost" onclick="refreshChat()">刷新</button>
     </div>
     <div class="panel">
       <div class="panel-head"><h2 class="panel-title">连接爱发电</h2><span class="sp"></span><span id="chat-conn-badge"></span></div>
       <div class="chat-conn" id="chat-conn"><span class="meta">检查中…</span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">关键词自动回复</h2>
+        <span class="sp"></span>
+        <label class="check"><input type="checkbox" id="ar-enabled" onchange="chatToggleAutoReply()"/> 开启自动回复</label>
+        <button class="btn btn-ghost btn-sm" onclick="chatAddRule()">新增规则</button>
+        <button class="btn btn-primary btn-sm" onclick="chatSaveRules()">保存规则</button>
+      </div>
+      <div class="panel-hint" style="margin:-6px 0 12px">
+        买家最后一段话里命中关键词时，自动用下面的固定话术回复。规则按从上到下的顺序匹配，第一条命中的生效；
+        你手动回过的会话不会再自动回；同一会话 10 分钟内只自动回一次。开启后每 60 秒检查一次。
+      </div>
+      <div class="meta" id="ar-state" style="margin-bottom:10px"></div>
+      <div id="ar-rules"></div>
+      <div class="form-row" style="margin-top:14px">
+        <input id="ar-test" placeholder="粘贴一句买家可能说的话，测试会命中哪条" style="flex:1;max-width:520px"/>
+        <button class="btn btn-ghost" onclick="chatTestRule()">测试匹配</button>
+      </div>
+      <div class="panel-hint tight" id="ar-test-result"></div>
+      <div class="panel-head" style="margin:20px 0 8px"><h2 class="panel-title">最近自动回复</h2></div>
+      <div id="ar-logs"><span class="meta">还没有自动回复记录</span></div>
     </div>
     <div class="chat-split">
       <div class="panel">
@@ -1260,6 +1282,7 @@ function renderMessages(){
     </div>`;
   CHAT = { activeUserId: '', activeName: '', dialogs: [] };
   setTimeout(async ()=>{
+    void loadChatRules();
     const s = await loadChatStatus();
     if(s && s.configured) await loadChatDialogs();
     else {
@@ -1429,6 +1452,176 @@ async function refreshChat(){
   if(!s || !s.configured) return;
   await loadChatDialogs();
   if(CHAT.activeUserId) await loadChatThread();
+}
+
+// ---------- 关键词自动回复
+let AR = { enabled: false, rules: [] };
+
+async function loadChatRules(){
+  const box = $('ar-rules');
+  if(!box) return;
+  try{
+    const d = await api('/admin/afdian/chat/rules');
+    AR = { enabled: d.enabled === true, rules: d.rules || [] };
+    const cb = $('ar-enabled');
+    if(cb) cb.checked = AR.enabled;
+    renderArState(d);
+    renderArRules(AR.rules);
+    renderArLogs(d.logs || []);
+  }catch(e){
+    box.innerHTML = `<span class="meta" style="color:var(--danger)">${esc(e.message)}</span>`;
+  }
+}
+
+function renderArState(d){
+  const el = $('ar-state');
+  if(!el) return;
+  if(!d.enabled){
+    el.innerHTML = '<span class="badge">已关闭</span> 打开右侧开关后才会自动回复';
+    return;
+  }
+  const when = d.lastPollAt ? esc(fmtSentAt(d.lastPollAt)) : '还没检查过';
+  if(d.lastPollError){
+    el.innerHTML = `<span class="badge badge-err">需要留意</span> ${esc(d.lastPollError)} · ${when}`;
+  }else if(!d.initialized){
+    el.innerHTML = `<span class="badge badge-primary">等待首次检查</span> 下一轮只记录当前进度，不会回复历史消息 · ${when}`;
+  }else{
+    el.innerHTML = `<span class="badge badge-ok">运行中</span> 上次检查 ${when}`;
+  }
+}
+
+function renderArRules(rules){
+  const box = $('ar-rules');
+  if(!box) return;
+  if(!rules.length){
+    box.innerHTML = '<div class="chat-empty">还没有规则。点右上角「新增规则」开始。</div>';
+    return;
+  }
+  box.innerHTML = `<table class="tbl">
+    <thead><tr>
+      <th style="width:54px">启用</th><th style="width:24%">关键词（逗号分隔）</th>
+      <th style="width:12%">匹配</th><th>回复内容</th><th class="col-actions" style="width:64px"></th>
+    </tr></thead>
+    <tbody>${rules.map(r=>`<tr data-rule-id="${esc(r.id)}">
+      <td><input type="checkbox" class="ar-on" ${r.enabled?'checked':''}/></td>
+      <td><input class="ar-kw" value="${esc((r.keywords||[]).join('，'))}" placeholder="安装, 怎么装" style="width:100%"/></td>
+      <td><select class="ar-mode">
+        <option value="any" ${r.matchMode==='any'?'selected':''}>包含任意</option>
+        <option value="all" ${r.matchMode==='all'?'selected':''}>包含全部</option>
+        <option value="exact" ${r.matchMode==='exact'?'selected':''}>完全等于</option>
+      </select></td>
+      <td><textarea class="ar-reply" style="width:100%;min-height:64px" placeholder="命中后自动发送的话术">${esc(r.reply||'')}</textarea></td>
+      <td class="col-actions"><button class="btn btn-danger btn-sm" onclick="chatRemoveRule(this)">删除</button></td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+function chatAddRule(){
+  const box = $('ar-rules');
+  if(!box) return;
+  if(!box.querySelector('tbody')){
+    box.innerHTML = `<table class="tbl">
+      <thead><tr>
+        <th style="width:54px">启用</th><th style="width:24%">关键词（逗号分隔）</th>
+        <th style="width:12%">匹配</th><th>回复内容</th><th class="col-actions" style="width:64px"></th>
+      </tr></thead><tbody></tbody></table>`;
+  }
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td><input type="checkbox" class="ar-on" checked/></td>
+    <td><input class="ar-kw" placeholder="安装, 怎么装" style="width:100%"/></td>
+    <td><select class="ar-mode">
+      <option value="any">包含任意</option><option value="all">包含全部</option><option value="exact">完全等于</option>
+    </select></td>
+    <td><textarea class="ar-reply" style="width:100%;min-height:64px" placeholder="命中后自动发送的话术"></textarea></td>
+    <td class="col-actions"><button class="btn btn-danger btn-sm" onclick="chatRemoveRule(this)">删除</button></td>`;
+  box.querySelector('tbody').appendChild(tr);
+}
+
+function chatRemoveRule(btn){
+  const tr = btn.closest('tr');
+  if(tr) tr.remove();
+}
+
+function chatCollectRules(){
+  return Array.from(document.querySelectorAll('#ar-rules tr')).map(tr=>{
+    const id = tr.getAttribute('data-rule-id') || '';
+    const on = tr.querySelector('.ar-on');
+    const kw = tr.querySelector('.ar-kw');
+    const mode = tr.querySelector('.ar-mode');
+    const reply = tr.querySelector('.ar-reply');
+    return {
+      id: id || null,
+      enabled: !!(on && on.checked),
+      keywords: (kw ? kw.value : '').split(/[，,]/).map(s=>s.trim()).filter(Boolean),
+      matchMode: mode ? mode.value : 'any',
+      reply: reply ? reply.value.trim() : '',
+    };
+  });
+}
+
+async function chatSaveRules(){
+  try{
+    await api('/admin/afdian/chat/rules', {method:'POST', body:JSON.stringify({rules: chatCollectRules()})});
+    toast('规则已保存');
+    await loadChatRules();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function chatToggleAutoReply(){
+  const cb = $('ar-enabled');
+  const want = !!(cb && cb.checked);
+  if(want){
+    const usable = chatCollectRules().filter(r=>r.enabled && r.keywords.length && r.reply).length;
+    if(!usable){
+      if(cb) cb.checked = false;
+      toast('先保存至少一条可用规则，再开启自动回复', true);
+      return;
+    }
+    if(!confirm('开启后，命中关键词的新私信会自动回复固定话术（不可撤回）。确定开启？')){
+      if(cb) cb.checked = false;
+      return;
+    }
+  }
+  try{
+    await api('/admin/afdian/chat/auto-reply', {method:'POST', body:JSON.stringify({enabled: want})});
+    toast(want ? '自动回复已开启' : '自动回复已关闭');
+    await loadChatRules();
+  }catch(e){
+    if(cb) cb.checked = !want;
+    toast(e.message, true);
+  }
+}
+
+async function chatTestRule(){
+  const el = $('ar-test');
+  const out = $('ar-test-result');
+  const text = el ? el.value.trim() : '';
+  if(!out) return;
+  if(!text){ out.innerHTML = '<span style="color:var(--danger)">先输入一句话再测试</span>'; return; }
+  try{
+    const d = await api('/admin/afdian/chat/rules/test', {method:'POST', body:JSON.stringify({text})});
+    out.innerHTML = d.matched
+      ? `命中「${esc(d.keyword)}」，将发送：<br/><span class="mono">${esc(d.reply)}</span>`
+      : '没有命中任何规则（不会自动回复）';
+  }catch(e){
+    out.innerHTML = `<span style="color:var(--danger)">${esc(e.message)}</span>`;
+  }
+}
+
+function renderArLogs(logs){
+  const box = $('ar-logs');
+  if(!box) return;
+  if(!logs.length){
+    box.innerHTML = '<span class="meta">还没有自动回复记录</span>';
+    return;
+  }
+  box.innerHTML = `<table class="tbl">
+    <thead><tr><th style="width:20%">买家</th><th>发送内容</th><th style="width:14%">命中</th><th style="width:16%">时间</th></tr></thead>
+    <tbody>${logs.map(l=>`<tr>
+      <td>${esc(l.userName||'爱发电用户')}</td>
+      <td class="meta" style="white-space:pre-wrap">${esc(l.content||'')}</td>
+      <td>${esc(l.keyword||'')}</td>
+      <td class="meta">${esc(fmtSentAt(l.ts))}</td>
+    </tr>`).join('')}</tbody></table>`;
 }
 
 // ---------- 客户端诊断
