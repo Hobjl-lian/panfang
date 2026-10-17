@@ -40,6 +40,13 @@ struct StartArg<'a> {
     addr: &'a str,
 }
 
+/// 手机型号/系统（诊断打点用；不含账号信息）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PhoneInfo {
+    pub model: String,
+    pub os: String,
+}
+
 /// 插件句柄（主 crate 通过 `app.conn_keep()` 拿到它）。
 pub struct ConnKeep<R: Runtime> {
     handle: PluginHandle<R>,
@@ -99,6 +106,13 @@ impl<R: Runtime> ConnKeep<R> {
             .map_err(|e| e.to_string())
     }
 
+    /// 手机厂商/型号与系统版本（只给失败打点区分设备用）。
+    pub fn device_info(&self) -> Result<PhoneInfo, String> {
+        self.handle
+            .run_mobile_plugin::<PhoneInfo>("deviceInfo", ())
+            .map_err(|e| e.to_string())
+    }
+
     /// 打开本应用的「应用信息」系统页（电池 / 后台运行设置都在里面）。
     pub fn open_app_settings(&self) -> Result<(), String> {
         self.handle
@@ -136,6 +150,9 @@ impl<R: Runtime> ConnKeep<R> {
     }
     pub fn ensure_bt_permissions(&self) -> Result<bool, String> {
         Ok(true)
+    }
+    pub fn device_info(&self) -> Result<PhoneInfo, String> {
+        Ok(PhoneInfo::default())
     }
     pub fn open_app_settings(&self) -> Result<(), String> {
         Err("连接保活仅安卓可用".into())

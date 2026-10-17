@@ -110,7 +110,16 @@ impl Ctx {
                 s
             }
         };
-        let fp = sha256_hex(uuid.as_bytes());
+        let fp = match std::fs::read_to_string(dir.join("android_id"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            // 跨卸载重装稳定：Kotlin 插件启动时把系统的 ANDROID_ID 写到 paid/android_id，
+            // 原始值只在本机参与哈希，服务端只见到 sha256 结果。
+            Some(id) => sha256_hex(format!("android:{id}").as_bytes()),
+            None => sha256_hex(uuid.as_bytes()),
+        };
 
         let base = std::fs::read_to_string(dir.join("base.txt"))
             .ok()
@@ -380,6 +389,17 @@ pub fn service_base(state: &AppState) -> Result<String, String> {
 
 // ---------------------------------------------------------------- 服务端交互
 
+/// 服务端错误体是 `{ error, message }`：`message` 是给买家的中文说明，`error` 是稳定的机器码
+/// （前端 `humanize` 靠它选文案/分类）。只取 message 会让 `device_limit`、`license_revoked`
+/// 这类已知失败退化成「操作失败，请重试」——2026-10-17 真机上踩过。
+fn api_error_text(v: &Value, fallback: &str) -> String {
+    let msg = v["message"].as_str().unwrap_or(fallback);
+    match v["error"].as_str() {
+        Some(code) if !code.is_empty() => format!("{msg}（{code}）"),
+        _ => msg.to_string(),
+    }
+}
+
 /// GET /v1/bind/mode —— 绑定页显示什么（oauth / dev / none）+ 店铺链接
 pub async fn bind_mode(base: &str) -> Result<Value> {
     let r = http()?
@@ -404,10 +424,7 @@ pub async fn bind_dev(base: &str, mi_user_id: &str, pub_b64: &str, device_name: 
     let status = r.status();
     let v: Value = r.json().await.unwrap_or_else(|_| json!({}));
     if !status.is_success() {
-        bail!(
-            "绑定失败：{}",
-            v["message"].as_str().unwrap_or("服务端未开放联调绑定")
-        );
+        bail!("绑定失败：{}", api_error_text(&v, "服务端未开放联调绑定"));
     }
     Ok(Session {
         license_token: v["license_token"].as_str().unwrap_or_default().to_string(),
@@ -429,7 +446,7 @@ async fn get_json(base: &str, path: &str, token: Option<&str>) -> Result<Value> 
         bail!("登录已过期，请重新绑定");
     }
     if !status.is_success() {
-        bail!("{}", v["message"].as_str().unwrap_or("请求失败"));
+        bail!("{}", api_error_text(&v, "请求失败"));
     }
     Ok(v)
 }
@@ -531,7 +548,7 @@ pub async fn fetch_decrypt(
     let status = r.status();
     let d: Value = r.json().await.unwrap_or_else(|_| json!({}));
     if !status.is_success() {
-        bail!("{}", d["message"].as_str().unwrap_or("获取下载凭证失败"));
+        bail!("{}", api_error_text(&d, "获取下载凭证失败"));
     }
     let url = d["url"].as_str().ok_or_else(|| anyhow!("响应缺少下载地址"))?;
     let sha_plain = d["file"]["sha256_plain"].as_str().unwrap_or_default().to_string();
@@ -739,10 +756,7 @@ pub async fn bind_oauth_start(
     let status = r.status();
     let v: Value = r.json().await.unwrap_or_else(|_| json!({}));
     if !status.is_success() {
-        bail!(
-            "{}",
-            v["message"].as_str().unwrap_or("暂时无法发起爱发电授权")
-        );
+        bail!("{}", api_error_text(&v, "暂时无法发起爱发电授权"));
     }
     Ok(v)
 }

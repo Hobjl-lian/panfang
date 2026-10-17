@@ -7,7 +7,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
-use wf_auth_server::{afdian, api_admin, api_client, crypto, db, state::AppState};
+use wf_auth_server::{afdian, afdian_chat, api_admin, api_client, crypto, db, state::AppState};
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 
@@ -72,6 +72,15 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(2);
+    // 名额满时自动回收「多久没出现过」的旧激活：设备指纹是 App 里的随机 uuid，
+    // 卸载重装/清数据会变成新设备，老记录仍占名额 → 买家重装两次就装不上了。
+    // 默认 7 天；设 0 关闭（回到「满了就直接报 device_limit」的旧行为）。
+    let device_stale_secs = std::env::var("WF_DEVICE_STALE_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(7)
+        .max(0)
+        * 86400;
 
     let conn = db::open(&data_dir.join("wf.db"))?;
     let state = AppState {
@@ -83,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         admin_token: admin_token.clone(),
         public_base: public_base.clone(),
         device_limit,
+        device_stale_secs,
         token_ttl: 30 * 24 * 3600,
     };
     let bg_state = state.clone();
@@ -147,6 +157,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/afdian/spec-report", get(api_admin::afdian_spec_report))
         .route("/afdian/bind", post(api_admin::afdian_bind))
         .route("/afdian/simulate", post(api_admin::afdian_simulate))
+        // 爱发电私信助手：登录态 / 会话列表 / 对话 / 手动发送（内部接口，非开放平台）
+        .route("/afdian/chat/status", get(afdian_chat::chat_status))
+        .route(
+            "/afdian/chat/token",
+            post(afdian_chat::chat_token_save).delete(afdian_chat::chat_token_clear),
+        )
+        .route("/afdian/chat/dialogs", get(afdian_chat::chat_dialogs))
+        .route("/afdian/chat/messages", get(afdian_chat::chat_messages))
+        .route("/afdian/chat/send", post(afdian_chat::chat_send))
         // 授权与统计
         .route("/activations", get(api_admin::activations_list))
         .route("/revoke", post(api_admin::revoke))

@@ -642,6 +642,47 @@ pub struct Activate {
     pub device_name: Option<String>,
 }
 
+/// 名额满时的宽限：把「最久没出现、且已超过宽限期」的那条激活置为 revoked，腾一个位置。
+///
+/// 为什么需要：`device_fp` 是 App 内随机生成的设备 uuid，卸载重装/清数据就会变成新指纹，
+/// 老记录仍留在库里占名额 → 买家重装两次就被锁死（2026-10-17 真机踩到）。
+/// 只回收确实很久没出现的设备；两台都在用时不回收，仍按原样报 device_limit。
+fn reclaim_stale_activation(
+    conn: &rusqlite::Connection,
+    subject_id: &str,
+    product_id: &str,
+    stale_secs: i64,
+) -> ApiResult<bool> {
+    if stale_secs <= 0 {
+        return Ok(false);
+    }
+    let oldest: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT device_fp, COALESCE(last_seen_at, created_at, 0) AS seen FROM activations
+             WHERE subject_id=?1 AND product_id=?2 AND status='active'
+             ORDER BY seen ASC LIMIT 1",
+            params![subject_id, product_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((fp, seen)) = oldest else {
+        return Ok(false);
+    };
+    if seen > now() - stale_secs {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE activations SET status='revoked'
+         WHERE subject_id=?1 AND product_id=?2 AND device_fp=?3",
+        params![subject_id, product_id, fp],
+    )?;
+    eprintln!(
+        "[device_limit] 回收久未使用的激活 subject={subject_id} product={product_id} fp={} last_seen={seen}（宽限 {stale_secs} 秒）",
+        &fp[..fp.len().min(12)]
+    );
+    Ok(true)
+}
+
 pub async fn activate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -674,7 +715,15 @@ pub async fn activate(
         params![auth.subject_id, body.product_id],
         |r| r.get(0),
     )?;
-    if exists.is_none() && used >= state.device_limit {
+    if exists.is_none()
+        && used >= state.device_limit
+        && !reclaim_stale_activation(
+            &conn,
+            &auth.subject_id,
+            &body.product_id,
+            state.device_stale_secs,
+        )?
+    {
         return Err(ApiError::forbidden(
             "device_limit",
             format!("已有 {} 台设备装了这份表盘（上限 {} 台）。换手机或重装后需要清掉旧设备记录，请联系开发者处理", state.device_limit, state.device_limit),
@@ -898,7 +947,14 @@ pub async fn download(
                 params![auth.subject_id, product_id],
                 |r| r.get(0),
             )?;
-            if used >= state.device_limit {
+            if used >= state.device_limit
+                && !reclaim_stale_activation(
+                    &conn,
+                    &auth.subject_id,
+                    &product_id,
+                    state.device_stale_secs,
+                )?
+            {
                 return Err(ApiError::forbidden(
                     "device_limit",
                     format!("已有 {} 台设备装了这份表盘（上限 {} 台）。换手机或重装后需要清掉旧设备记录，请联系开发者处理", state.device_limit, state.device_limit),
@@ -1324,8 +1380,15 @@ pub struct EventItem {
     pub message: Option<String>,
     #[serde(default)]
     pub device_model: Option<String>,
+    /// App 安装时本地随机生成的设备指纹（同一台手机重装会变）
     #[serde(default)]
     pub device_fp: Option<String>,
+    /// 手机厂商 + 型号（如 OnePlus PJZ110）——第一次连不上时手环型号为空，靠它区分是谁
+    #[serde(default)]
+    pub phone_model: Option<String>,
+    /// 手机系统（如 Android 17 (SDK 37)）
+    #[serde(default)]
+    pub phone_os: Option<String>,
     #[serde(default)]
     pub app_version: Option<String>,
 }
@@ -1418,8 +1481,8 @@ pub async fn report_events(
             let ok = conn
                 .execute(
                     "INSERT INTO client_events(ts, kind, step, code, message, device_model,
-                         device_fp, app_version, subject_id, ip, ua)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                         device_fp, phone_model, phone_os, app_version, subject_id, ip, ua)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                     params![
                         ts,
                         clip(e.kind.as_deref(), 16).unwrap_or_else(|| "fail".to_string()),
@@ -1428,6 +1491,8 @@ pub async fn report_events(
                         clip(msg.as_deref(), 500),
                         clip(e.device_model.as_deref(), 60),
                         clip(e.device_fp.as_deref(), 80),
+                        clip(e.phone_model.as_deref(), 60),
+                        clip(e.phone_os.as_deref(), 40),
                         clip(e.app_version.as_deref(), 20),
                         subject.as_deref(),
                         clip(Some(ip.as_str()), 60),
@@ -1471,6 +1536,54 @@ mod tests {
             "订单 202610070148365297524823631 还没绑定账号"
         );
         assert_eq!(scrub_secretish("蓝牙未开启，请先打开蓝牙"), "蓝牙未开启，请先打开蓝牙");
+    }
+
+    #[test]
+    fn reclaims_only_stale_activation() {
+        // 回归（2026-10-17）：随机 device_uuid 在重装后会变，名额满时必须能回收久未使用的旧记录，
+        // 但两台都还在用时不能乱踢。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE activations(
+                 subject_id TEXT NOT NULL, product_id TEXT NOT NULL, device_fp TEXT NOT NULL,
+                 device_pubkey TEXT NOT NULL, device_name TEXT,
+                 status TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen_at INTEGER,
+                 PRIMARY KEY(subject_id, product_id, device_fp));",
+        )
+        .unwrap();
+        let now = crate::db::now();
+        let ins = |fp: &str, seen: i64| {
+            conn.execute(
+                "INSERT INTO activations(subject_id,product_id,device_fp,device_pubkey,device_name,
+                     status,created_at,last_seen_at)
+                 VALUES('s','p',?1,'pk',NULL,'active',?2,?2)",
+                rusqlite::params![fp, seen],
+            )
+            .unwrap();
+        };
+        ins("old", now - 40 * 86400); // 40 天没出现
+        ins("live", now - 3600); // 1 小时前还在用
+
+        assert!(reclaim_stale_activation(&conn, "s", "p", 7 * 86400).unwrap());
+        let mut st = conn
+            .prepare("SELECT device_fp || ':' || status FROM activations ORDER BY device_fp")
+            .unwrap();
+        let rows: Vec<String> = st
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, vec!["live:active", "old:revoked"]);
+
+        // 剩下那台在宽限期内 → 不许回收
+        assert!(!reclaim_stale_activation(&conn, "s", "p", 7 * 86400).unwrap());
+        // 宽限期设为 0 = 关闭回收
+        conn.execute(
+            "UPDATE activations SET last_seen_at=?1 WHERE device_fp='live'",
+            [now - 40 * 86400],
+        )
+        .unwrap();
+        assert!(!reclaim_stale_activation(&conn, "s", "p", 0).unwrap());
     }
 
     #[test]

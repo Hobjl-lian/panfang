@@ -19,6 +19,8 @@ pub struct AppState {
     pub public_base: String,
     /// 每 subject 可激活的设备数上限（契约：默认 2）
     pub device_limit: i64,
+    /// 名额满时，多久没出现过的激活可以自动回收（秒；0 = 不回收）
+    pub device_stale_secs: i64,
     /// license_token 有效期（秒）
     pub token_ttl: i64,
 }

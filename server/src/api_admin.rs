@@ -1346,6 +1346,19 @@ fn valid_watchface_id(s: &str) -> bool {
     !s.is_empty() && s != "000000000000"
 }
 
+/// 严格校验（上传入口用）：表盘 id 必须是 **9 或 12 位字母数字**，且不能是全零。
+///
+/// 为什么不能放宽：App 端安装前用 corelib 的 `get_watchface_id` 解析，它只认 9/12 位；
+/// 10/11 位（以及全零）会被判成 `invalid watchface id`，包传到手环前就失败。
+/// 2026-10-17 线上有 6 个这种包（设计师导出时 ID 生成错了），所以在上传入口直接拦住，
+/// 并把「哪个包、什么 id、多少位」写清楚，避免再让买家当试错的人。
+fn valid_watchface_id_strict(s: &str) -> bool {
+    let s = s.trim();
+    matches!(s.chars().count(), 9 | 12)
+        && s.bytes().all(|b| b.is_ascii_alphanumeric())
+        && s != "000000000000"
+}
+
 /// `incoming` 已按文件名自然排序。
 fn plan_merge(
     existing: &[ExistingFile],
@@ -1565,6 +1578,28 @@ pub async fn upload_version(
         let info = crate::bin_inspect::inspect(&p.bytes)
             .map_err(|e| ApiError::bad_request(format!("{}: {e}", p.fname)))?;
         infos.push(info);
+    }
+    // 上传入口就拦住「装不上的包」：App 安装前用 corelib 解析表盘 id，只认 9/12 位；
+    // 10/11 位或全零会被判成 invalid watchface id。空 id 仍放行（老包/特殊工程的历史兼容）。
+    for (p, info) in parts.iter().zip(infos.iter()) {
+        let wid = info.watchface_id.trim();
+        if wid.is_empty() || valid_watchface_id_strict(wid) {
+            continue;
+        }
+        let reason = if wid == "000000000000" {
+            "是全零（导出时没有生成表盘 id）".to_string()
+        } else {
+            format!(
+                "是 {} 位（{}），不是合法的 9/12 位字母数字",
+                wid.chars().count(),
+                wid
+            )
+        };
+        return Err(ApiError::bad_request(format!(
+            "包 {} 的表盘 id {}；这种包装到手环上会报 invalid watchface id、装不上。\
+             请在设计工具里重新导出（表盘 id 应为 9 或 12 位）后再上传。",
+            p.fname, reason
+        )));
     }
     let info = infos[0].clone();
     let fname = parts[0].fname.clone();
@@ -2298,10 +2333,39 @@ pub async fn revoke(
     Ok(Json(json!({ "ok": true, "revoked": revoked })))
 }
 
+/// 「过程事件」：链路中间态或部署自检探针，不代表这次操作最终失败。
+///
+/// 为什么单列：上线首日 `lost_auto`（掉线后自动重连）一条码就占了诊断量的一半、
+/// 24 台设备里 18 台都有——它和「装不上」混在同一个 `kind='fail'` 里，首页那条
+/// 「N 条客户端失败」会一直虚高，真正的失败反而被淹没。原始数据照旧保留，
+/// 只是统计口径分开（管理页勾选「包含过程事件」仍能看到全部）。
+///
+/// 判定与 SQL 里的 `PROGRESS_EVENT_SQL` 必须一致。
+pub fn is_progress_event(step: &str, code: &str) -> bool {
+    matches!(code, "lost_auto" | "timeout15s" | "lost")
+        || step.starts_with("scrub-check")
+        || step.starts_with("post-hardening-check")
+}
+
+/// 与 [`is_progress_event`] 同一套判定的 SQL 片段（stats 用聚合查询，不能逐行回 Rust）。
+const PROGRESS_EVENT_SQL: &str = "(COALESCE(code,'') IN ('lost_auto','timeout15s','lost') \
+     OR step LIKE 'scrub-check%' OR step LIKE 'post-hardening-check%')";
+
 pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_admin(&state, &headers)?;
     let conn = state.conn();
     let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    let since7d = "ts >= strftime('%s','now') - 7*86400";
+    let fail_sql = format!(
+        "SELECT COUNT(*) FROM client_events WHERE kind='fail' AND {since7d} AND NOT {PROGRESS_EVENT_SQL}"
+    );
+    // 按「台设备」而不是「条数」报：一台手机反复重试 8 次，不等于 8 个人装不上。
+    let fail_devices_sql = format!(
+        "SELECT COUNT(DISTINCT COALESCE(NULLIF(device_fp,''), NULLIF(ip,''), 'unknown')) \
+         FROM client_events WHERE kind='fail' AND {since7d} AND NOT {PROGRESS_EVENT_SQL}"
+    );
+    let progress_sql =
+        format!("SELECT COUNT(*) FROM client_events WHERE kind='fail' AND {since7d} AND {PROGRESS_EVENT_SQL}");
     Ok(Json(json!({
         "resources": one("SELECT COUNT(*) FROM products"),
         "deviceRows": one("SELECT COUNT(*) FROM variants"),
@@ -2310,8 +2374,11 @@ pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> ApiResu
         "activeLicenses": one("SELECT COUNT(*) FROM licenses WHERE status='active'"),
         "activeActivations": one("SELECT COUNT(*) FROM activations WHERE status='active'"),
         "downloads": one("SELECT COUNT(*) FROM download_logs"),
-        // 近 7 天客户端失败打点：>0 时首页会亮一条（以前这类信号在 App 里就没了）
-        "failEvents7d": one("SELECT COUNT(*) FROM client_events WHERE kind='fail' AND ts >= strftime('%s','now') - 7*86400"),
+        // 近 7 天客户端**真失败**打点：>0 时首页会亮一条（以前这类信号在 App 里就没了）。
+        // 过程事件（自动重连/15 秒中间态/自检探针）单列成 progressEvents7d，不再撑大失败数。
+        "failEvents7d": one(&fail_sql),
+        "failDevices7d": one(&fail_devices_sql),
+        "progressEvents7d": one(&progress_sql),
         // 联调开关状态（管理页顶部据此挂警示条：开着时任何人调 /v1/bind/dev 都能白拿全部资源）
         "devBind": crate::afdian::dev_status(),
     })))
@@ -2325,11 +2392,97 @@ pub struct EventsQuery {
     pub days: Option<i64>,
     #[serde(default)]
     pub limit: Option<i64>,
+    /// `count`（默认，按次数）| `time`（按最近发生时间）
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// 1 = 连过程事件一起返回（自动重连 / 15 秒中间态 / 自检探针）；默认 0 = 只看真失败。
+    /// 用 i64 而不是 bool：前端拼查询串时 `1/0` 最省事，serde_urlencoded 对 bool 只认 true/false。
+    #[serde(default)]
+    pub include_progress: Option<i64>,
+}
+
+/// 一条打点（含「是谁」的字段）。
+struct EventRow {
+    ts: i64,
+    kind: String,
+    step: String,
+    code: String,
+    message: String,
+    device_model: String,
+    app_version: String,
+    device_fp: String,
+    subject: String,
+    ip: String,
+    phone_model: String,
+    phone_os: String,
+}
+
+impl EventRow {
+    /// 区分「谁」的键：优先用 App 安装时生成的设备指纹（同一台手机稳定、不同手机必不同）；
+    /// 老版本没上报指纹时退回出口 IP（CGNAT 下可能把两个人并成一个，但总比没有好）。
+    fn device_key(&self) -> String {
+        if !self.device_fp.is_empty() {
+            format!("fp:{}", self.device_fp)
+        } else if !self.ip.is_empty() {
+            format!("ip:{}", self.ip)
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    fn phone(&self) -> String {
+        match (self.phone_model.is_empty(), self.phone_os.is_empty()) {
+            (false, false) => format!("{} · {}", self.phone_model, self.phone_os),
+            (false, true) => self.phone_model.clone(),
+            (true, false) => self.phone_os.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// 单行显示用的「人」标签：设备指纹前 8 位（或 IP）+ 手机型号 + 账号。
+    fn who(&self) -> String {
+        let dev = if !self.device_fp.is_empty() {
+            format!(
+                "设备 {}",
+                self.device_fp.chars().take(8).collect::<String>()
+            )
+        } else if !self.ip.is_empty() {
+            format!("IP {}", self.ip)
+        } else {
+            "未知设备".to_string()
+        };
+        let mut parts = vec![dev];
+        let phone = self.phone();
+        if !phone.is_empty() {
+            parts.push(phone);
+        }
+        if !self.subject.is_empty() {
+            parts.push(format!("账号 {}", self.subject));
+        }
+        parts.join(" · ")
+    }
+}
+
+struct StepAgg<'a> {
+    count: i64,
+    devices: HashSet<String>,
+    /// rows 已按时间倒序，第一次遇到的就是最近一条
+    latest: &'a EventRow,
+}
+
+struct DeviceAgg<'a> {
+    count: i64,
+    first_ts: i64,
+    last_ts: i64,
+    latest: &'a EventRow,
+    steps: HashMap<(String, String), i64>,
 }
 
 /// GET /admin/events —— App 上报的失败打点（近 N 天）。
 ///
-/// 回答两个问题：① 该先修哪个（按「步骤 + 错误码」聚合的次数）② 到底报了什么（最近几条原文）。
+/// 回答三个问题：① 该先修哪个（按「步骤 + 错误码」聚合）② 到底报了什么（最近几条原文）
+/// ③ **是谁报的**（按设备指纹聚合；老数据没有指纹时退回 IP）。
+/// `sort=count` 按次数（默认，适合「先修最多的」）；`sort=time` 按最近发生时间（适合「看最新问题」）。
 /// 聚合在 Rust 里做：量小（个人项目），比一条花哨的 SQL 好读、好改。
 pub async fn events_summary(
     State(state): State<AppState>,
@@ -2339,58 +2492,159 @@ pub async fn events_summary(
     require_admin(&state, &headers)?;
     let days = q.days.unwrap_or(7).clamp(1, 90);
     let limit = q.limit.unwrap_or(30).clamp(1, 200) as usize;
+    let sort = if q.sort.as_deref() == Some("time") {
+        "time"
+    } else {
+        "count"
+    };
+    let include_progress = q.include_progress.unwrap_or(0) != 0;
     let since = now() - days * 86_400;
     let conn = state.conn();
 
-    let total: i64 = conn.query_row(
+    let total_all: i64 = conn.query_row(
         "SELECT COUNT(*) FROM client_events WHERE ts >= ?1",
         [since],
         |r| r.get(0),
     )?;
-
-    let mut stmt = conn.prepare(
-        "SELECT ts, step, COALESCE(code,''), COALESCE(message,''), COALESCE(device_model,''),
-                COALESCE(app_version,'')
-         FROM client_events WHERE ts >= ?1 ORDER BY ts DESC LIMIT 1000",
+    // 过程事件的总数要单独报给页面：默认折叠时用户得知道「藏了多少条」。
+    let progress_total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM client_events WHERE ts >= ?1 AND {PROGRESS_EVENT_SQL}"),
+        [since],
+        |r| r.get(0),
     )?;
-    let rows: Vec<(i64, String, String, String, String, String)> = stmt
+    let total = if include_progress {
+        total_all
+    } else {
+        total_all - progress_total
+    };
+
+    // 5000 条足够覆盖个人项目一个月的量；聚合只在这批里做（更早的只影响分页外的长尾）。
+    let mut stmt = conn.prepare(
+        "SELECT ts, COALESCE(kind,''), step, COALESCE(code,''), COALESCE(message,''),
+                COALESCE(device_model,''), COALESCE(app_version,''), COALESCE(device_fp,''),
+                COALESCE(subject_id,''), COALESCE(ip,''), COALESCE(phone_model,''), COALESCE(phone_os,'')
+         FROM client_events WHERE ts >= ?1 ORDER BY ts DESC LIMIT 5000",
+    )?;
+    let mut rows: Vec<EventRow> = stmt
         .query_map([since], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok(EventRow {
+                ts: r.get(0)?,
+                kind: r.get(1)?,
+                step: r.get(2)?,
+                code: r.get(3)?,
+                message: r.get(4)?,
+                device_model: r.get(5)?,
+                app_version: r.get(6)?,
+                device_fp: r.get(7)?,
+                subject: r.get(8)?,
+                ip: r.get(9)?,
+                phone_model: r.get(10)?,
+                phone_os: r.get(11)?,
+            })
         })?
         .filter_map(|r| r.ok())
         .collect();
-
-    // 按「步骤 + 错误码」聚合；rows 已按时间倒序，第一次遇到的就是最近一条
-    let mut agg: HashMap<(String, String), (i64, i64, String, String, String)> = HashMap::new();
-    for (ts, step, code, msg, model, ver) in &rows {
-        let e = agg
-            .entry((step.clone(), code.clone()))
-            .or_insert((0, 0, String::new(), String::new(), String::new()));
-        e.0 += 1;
-        if *ts > e.1 {
-            e.1 = *ts;
-            e.2 = msg.clone();
-            e.3 = model.clone();
-            e.4 = ver.clone();
-        }
+    // 默认只看真失败：自动重连/15 秒中间态会把「按设备」「最近原文」全刷满。
+    // 原始数据不删，勾选「包含过程事件」随时能看。
+    if !include_progress {
+        rows.retain(|r| !is_progress_event(&r.step, &r.code));
     }
-    let mut by_step: Vec<(String, String, i64, i64, String, String, String)> = agg
-        .into_iter()
-        .map(|((step, code), (n, last, msg, model, ver))| (step, code, n, last, msg, model, ver))
-        .collect();
-    by_step.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let mut step_map: HashMap<(String, String), StepAgg> = HashMap::new();
+    let mut device_map: HashMap<String, DeviceAgg> = HashMap::new();
+    for r in &rows {
+        let se = step_map
+            .entry((r.step.clone(), r.code.clone()))
+            .or_insert_with(|| StepAgg {
+                count: 0,
+                devices: HashSet::new(),
+                latest: r,
+            });
+        se.count += 1;
+        se.devices.insert(r.device_key());
+
+        let de = device_map
+            .entry(r.device_key())
+            .or_insert_with(|| DeviceAgg {
+                count: 0,
+                first_ts: r.ts,
+                last_ts: r.ts,
+                latest: r,
+                steps: HashMap::new(),
+            });
+        de.count += 1;
+        de.first_ts = de.first_ts.min(r.ts);
+        de.last_ts = de.last_ts.max(r.ts);
+        *de.steps.entry((r.step.clone(), r.code.clone())).or_insert(0) += 1;
+    }
+
+    let mut by_step: Vec<((String, String), StepAgg)> = step_map.into_iter().collect();
+    if sort == "time" {
+        by_step.sort_by(|a, b| {
+            b.1.latest
+                .ts
+                .cmp(&a.1.latest.ts)
+                .then(b.1.count.cmp(&a.1.count))
+        });
+    } else {
+        by_step.sort_by(|a, b| {
+            b.1.count
+                .cmp(&a.1.count)
+                .then(b.1.latest.ts.cmp(&a.1.latest.ts))
+        });
+    }
+
+    let mut by_device: Vec<(String, DeviceAgg)> = device_map.into_iter().collect();
+    if sort == "time" {
+        by_device.sort_by(|a, b| b.1.last_ts.cmp(&a.1.last_ts));
+    } else {
+        by_device.sort_by(|a, b| {
+            b.1.count
+                .cmp(&a.1.count)
+                .then(b.1.last_ts.cmp(&a.1.last_ts))
+        });
+    }
 
     Ok(Json(json!({
         "days": days,
         "since": since,
         "total": total,
-        "byStep": by_step.iter().take(40).map(|(step, code, n, last, msg, model, ver)| json!({
-            "step": step, "code": code, "count": n, "lastTs": last,
-            "message": msg, "deviceModel": model, "appVersion": ver,
+        "sort": sort,
+        "includeProgress": include_progress,
+        "progressTotal": progress_total,
+        "devices": by_device.len(),
+        "byStep": by_step.iter().take(40).map(|((step, code), a)| json!({
+            "step": step, "code": code, "count": a.count,
+            "deviceCount": a.devices.len(), "lastTs": a.latest.ts,
+            "progress": is_progress_event(step, code),
+            "message": a.latest.message, "deviceModel": a.latest.device_model,
+            "appVersion": a.latest.app_version, "phone": a.latest.phone(),
+            "deviceFp": a.latest.device_fp, "subject": a.latest.subject,
+            "ip": a.latest.ip, "who": a.latest.who(),
         })).collect::<Vec<_>>(),
-        "recent": rows.iter().take(limit).map(|(ts, step, code, msg, model, ver)| json!({
-            "ts": ts, "step": step, "code": code, "message": msg,
-            "deviceModel": model, "appVersion": ver,
+        "byDevice": by_device.iter().take(40).map(|(key, a)| {
+            let mut steps: Vec<(&String, &String, &i64)> = a.steps.iter()
+                .map(|((s, c), n)| (s, c, n)).collect();
+            steps.sort_by(|x, y| y.2.cmp(x.2));
+            json!({
+                "key": key, "count": a.count,
+                "firstTs": a.first_ts, "lastTs": a.last_ts,
+                "deviceFp": a.latest.device_fp, "subject": a.latest.subject,
+                "ip": a.latest.ip, "phone": a.latest.phone(),
+                "deviceModel": a.latest.device_model, "appVersion": a.latest.app_version,
+                "lastStep": a.latest.step, "lastCode": a.latest.code,
+                "lastMessage": a.latest.message, "who": a.latest.who(),
+                "steps": steps.iter().take(6).map(|(s, c, n)| json!({
+                    "step": s, "code": c, "count": n,
+                })).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+        "recent": rows.iter().take(limit).map(|r| json!({
+            "ts": r.ts, "kind": r.kind, "step": r.step, "code": r.code,
+            "progress": is_progress_event(&r.step, &r.code),
+            "message": r.message, "deviceModel": r.device_model,
+            "appVersion": r.app_version, "deviceFp": r.device_fp,
+            "subject": r.subject, "ip": r.ip, "phone": r.phone(), "who": r.who(),
         })).collect::<Vec<_>>(),
     })))
 }
@@ -2628,6 +2882,50 @@ pub async fn app_release_delete(
 mod tests {
     use super::*;
 
+    fn ev(fp: &str, ip: &str, subject: &str, phone: &str, os: &str) -> EventRow {
+        EventRow {
+            ts: 0,
+            kind: "fail".into(),
+            step: "connect".into(),
+            code: "failed".into(),
+            message: String::new(),
+            device_model: String::new(),
+            app_version: String::new(),
+            device_fp: fp.into(),
+            subject: subject.into(),
+            ip: ip.into(),
+            phone_model: phone.into(),
+            phone_os: os.into(),
+        }
+    }
+
+    #[test]
+    fn event_identity_prefers_fingerprint_over_ip() {
+        // 两台不同手机共用出口 IP（CGNAT）：必须靠设备指纹区分成两个人。
+        // 2026-10-17 真实踩过：两个买家同一分钟在同一个段里报错，按 IP 看像同一个人。
+        let a = ev("aaaaaaaaaaaaaaaa", "1.1.1.1", "", "", "");
+        let b = ev("bbbbbbbbbbbbbbbb", "1.1.1.1", "", "", "");
+        assert_ne!(a.device_key(), b.device_key());
+        assert!(a.who().starts_with("设备 aaaaaaaa"));
+
+        // 老版本没上报指纹 → 退回 IP（至少还能归并）
+        let old = ev("", "2.2.2.2", "", "", "");
+        assert_eq!(old.device_key(), "ip:2.2.2.2");
+        assert!(old.who().contains("IP 2.2.2.2"));
+
+        // 手机型号/系统合并显示（第一次连不上时手环型号为空，靠它认人）
+        let p = ev(
+            "cccccccccccccccc",
+            "",
+            "s_abc",
+            "OnePlus PJZ110",
+            "Android 17 (SDK 37)",
+        );
+        assert_eq!(p.phone(), "OnePlus PJZ110 · Android 17 (SDK 37)");
+        assert!(p.who().contains("OnePlus PJZ110"));
+        assert!(p.who().contains("账号 s_abc"));
+    }
+
     fn ex(id: &str, sha: &str, sort: i64, wid: &str, ver: &str) -> ExistingFile {
         ExistingFile {
             id: id.into(),
@@ -2770,6 +3068,35 @@ mod tests {
         let plan = plan_merge(&existing, &incoming, Some("1.0.2"), false).unwrap();
         assert_eq!(plan.slots[0].action, PkgAction::Unchanged);
         assert_eq!(plan.slots[1].action, PkgAction::Replace);
+    }
+
+    #[test]
+    fn progress_events_do_not_count_as_real_failures() {
+        // 掉线自动重连 / 15 秒中间态 / 自检探针 → 过程事件，不撑大首页失败数
+        assert!(is_progress_event("connect", "lost_auto"));
+        assert!(is_progress_event("connect", "timeout15s"));
+        assert!(is_progress_event("connect", "lost"));
+        assert!(is_progress_event("scrub-check", "E1"));
+        assert!(is_progress_event("post-hardening-check", ""));
+        // 真正的失败必须留在统计里
+        assert!(!is_progress_event("connect", "failed"));
+        assert!(!is_progress_event("connect", "giveup45s"));
+        assert!(!is_progress_event("install_paid", "link_lost"));
+        assert!(!is_progress_event("paid_list", "other"));
+        assert!(!is_progress_event("login", "2fa_failed"));
+    }
+
+    #[test]
+    fn upload_rejects_wrong_length_watchface_ids() {
+        // 合法：9/12 位字母数字
+        assert!(valid_watchface_id_strict("156780069701"));
+        assert!(valid_watchface_id_strict("123456789"));
+        // 2026-10-17 线上踩到的两类坏包：10/11 位、全零
+        assert!(!valid_watchface_id_strict("15675874000"));
+        assert!(!valid_watchface_id_strict("1791000001"));
+        assert!(!valid_watchface_id_strict("000000000000"));
+        assert!(!valid_watchface_id_strict(""));
+        assert!(!valid_watchface_id_strict("12345678_01"));
     }
 
     #[test]

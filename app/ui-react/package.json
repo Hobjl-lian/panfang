@@ -1,7 +1,7 @@
 {
   "name": "figma-make-app",
   "private": true,
-  "version": "0.3.32",
+  "version": "0.3.36",
   "type": "module",
   "scripts": {
     "dev": "vite",

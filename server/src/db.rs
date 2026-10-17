@@ -79,6 +79,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     // 出事时能据此定位是哪一次绑定被借用（2026-10-17 上线前审查加）。
     add("afdian_oauth", "start_ip", "start_ip TEXT")?;
     add("afdian_oauth", "callback_ip", "callback_ip TEXT")?;
+    // 客户端诊断：手机型号/系统版本，用来区分「同一台手环、两个人/两台手机」
+    // （以前只有手环型号，第一次连不上时它还是空的，后台根本看不出是谁报的）。
+    add("client_events", "phone_model", "phone_model TEXT")?;
+    add("client_events", "phone_os", "phone_os TEXT")?;
 
     // 诊断信息保留 90 天 —— 《隐私政策》里写明了，就得真删，否则政策是假的
     let cutoff = now() - 90 * 86_400;
@@ -467,8 +471,10 @@ CREATE TABLE IF NOT EXISTS client_events(
   step TEXT NOT NULL,                  -- connect/scan/permission/login/bind/download/decrypt/install/archive/edit/apply
   code TEXT,                           -- 设备或接口返回码（如 code=3、prepare_downgrade、timeout）
   message TEXT,                        -- 技术细节：只给开发者看，买家那边仍是一句操作指引
-  device_model TEXT,                   -- 手环/手表型号
-  device_fp TEXT,
+  device_model TEXT,                   -- 手环/手表型号（连上过才知道；第一次连不上时为空）
+  device_fp TEXT,                      -- App 安装时本地随机生成的设备指纹（区分「不同手机/不同人」）
+  phone_model TEXT,                    -- 手机厂商 + 型号（如 OnePlus PJZ110）
+  phone_os TEXT,                       -- 手机系统（如 Android 17 (SDK 37)）
   app_version TEXT,
   subject_id TEXT,
   ip TEXT,
@@ -494,4 +500,67 @@ CREATE TABLE IF NOT EXISTS app_releases(
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_app_releases_current ON app_releases(is_current);
+
+-- 爱发电私信助手：创作者网页登录态（auth_token），用来读写私信。
+-- 爱发电开放平台没有私信能力，只能走网页版内部接口，因此这里存一份登录态；
+-- 它等价于「创作者本人的登录凭据」，必须用 KEK 加密后落库（密文 + nonce），
+-- 且只允许管理端读写，任何接口都不回显明文。
+CREATE TABLE IF NOT EXISTS afdian_chat_session(
+  id INTEGER PRIMARY KEY CHECK(id = 1),      -- 单行表：只保存当前登录态
+  token_nonce BLOB NOT NULL,
+  token_cipher BLOB NOT NULL,
+  display_name TEXT,                          -- 探活时取回的昵称/邮箱（只用于界面显示）
+  afdian_user_id TEXT,                        -- 创作者自己的爱发电 user_id（能取到就记）
+  checked_at INTEGER,                         -- 上次探活成功时间
+  check_error TEXT,                           -- 上次探活失败原因；NULL = 正常
+  updated_at INTEGER NOT NULL
+);
+
+-- 关键词自动回复：规则由管理员在管理页维护。
+-- 匹配的是「对方发来的最后一段连续文字」，命中后发固定话术；
+-- 默认关闭，开启后服务端每 60 秒检查一次（只拉会话列表，变了才拉内容）。
+CREATE TABLE IF NOT EXISTS afdian_chat_rules(
+  id TEXT PRIMARY KEY,
+  keywords TEXT NOT NULL,                    -- JSON 数组：["安装","怎么装"]
+  match_mode TEXT NOT NULL DEFAULT 'any',    -- any / all / exact
+  reply TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  sort INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS afdian_chat_settings(
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  auto_reply_enabled INTEGER NOT NULL DEFAULT 0,
+  initialized INTEGER NOT NULL DEFAULT 0,    -- 0 = 下次轮询只建基线、不回历史消息
+  last_poll_at INTEGER,
+  last_poll_error TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+-- 每个会话的轮询状态：last_seen 用来判断「有没有新消息」，
+-- last_replied 用来防止同一条消息被回复两次（服务重启也不会重复）。
+CREATE TABLE IF NOT EXISTS afdian_chat_autoreply_state(
+  user_id TEXT PRIMARY KEY,
+  last_seen_msg_id TEXT,
+  last_replied_msg_id TEXT,
+  last_reply_at INTEGER,
+  last_error TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+-- 自动回复审计：管理页「最近自动回复」直接读这张表（只保留最近 200 条）。
+CREATE TABLE IF NOT EXISTS afdian_chat_autoreply_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  user_name TEXT,
+  inbound_msg_id TEXT,
+  outbound_msg_id TEXT,
+  rule_id TEXT,
+  matched_keyword TEXT,
+  content TEXT NOT NULL,
+  ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_afdian_chat_log_ts ON afdian_chat_autoreply_log(ts);
 "#;

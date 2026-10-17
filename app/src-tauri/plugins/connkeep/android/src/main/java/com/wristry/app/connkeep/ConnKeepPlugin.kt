@@ -120,6 +120,23 @@ class ConnKeepPlugin(private val activity: Activity) : Plugin(activity) {
         if (Looper.myLooper() == Looper.getMainLooper()) request() else activity.runOnUiThread(request)
     }
 
+    /**
+     * 手机型号与系统版本（只给失败打点用）。
+     *
+     * 为什么需要：第一次连不上手环时，诊断里的「手环型号」是空的 —— 后台只能看到
+     * 一串 IP，CGNAT 下不同买家会同 IP，根本分不清是谁。手机型号 + App 安装标识
+     * 才能把「同一台手环、不同手机/不同人」区分开。不含任何账号信息。
+     */
+    @Command
+    fun deviceInfo(invoke: Invoke) {
+        val manufacturer = (Build.MANUFACTURER ?: "").trim()
+        val model = (Build.MODEL ?: "").trim()
+        val ret = JSObject()
+        ret.put("model", listOf(manufacturer, model).filter { it.isNotEmpty() }.joinToString(" "))
+        ret.put("os", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
+        invoke.resolve(ret)
+    }
+
     /** Android 12 以下没有 BLUETOOTH_SCAN/CONNECT；那套系统上 SPP 连接不需要运行时权限。 */
     private fun missingBtPermissions(): Array<String> {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptyArray()

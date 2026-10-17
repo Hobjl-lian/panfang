@@ -1,6 +1,7 @@
 //! 盘坊授权服务（库入口）：模块划分见 README。
 
 pub mod afdian;
+pub mod afdian_chat;
 pub mod api_admin;
 pub mod api_client;
 pub mod backfill;

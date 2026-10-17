@@ -33,6 +33,23 @@ class InstallArg {
 @TauriPlugin
 class ApkInstallerPlugin(private val activity: Activity) : Plugin(activity) {
 
+    init {
+        // 把跨卸载重装稳定的系统设备标识写到应用数据目录，Rust 侧启动时直接读文件
+        // （不走命令桥：fat LTO 下曾出现命令名字面量没落进 .so，而这条路径只是一次文件读）。
+        // 路径必须与 Tauri 的 app_data_dir 对齐：安卓上它就是 activity.dataDir（不拼包名）。
+        // ⚠️ 原始 ANDROID_ID 只落在本机私有目录，上传的是 Rust 侧 sha256 之后的值。
+        try {
+            val id = Settings.Secure.getString(activity.contentResolver, Settings.Secure.ANDROID_ID)
+            if (!id.isNullOrEmpty()) {
+                val dir = File(activity.dataDir, "paid")
+                if (!dir.exists()) dir.mkdirs()
+                File(dir, "android_id").writeText(id)
+            }
+        } catch (_: Exception) {
+            // 读不到就保持默认：Rust 侧退回原来的随机 uuid
+        }
+    }
+
     @Command
     fun status(invoke: Invoke) {
         val ret = JSObject()

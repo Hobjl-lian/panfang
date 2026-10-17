@@ -42,6 +42,12 @@ android {
             optimization {
                enable = true
             }
+            packaging {
+                // 原生库默认在 APK 里不压缩存放（extractNativeLibs=false），21.4MB 的 .so 直接占满包体。
+                // 改成 legacy 打包后按 deflate 压进包（实测该 .so 可压到 7.7MB），
+                // 代价是安装时解压一次、应用多占一份磁盘；启动路径仍是本地文件，不影响使用。
+                jniLibs.useLegacyPackaging = true
+            }
             proguardFiles(
                 *fileTree(".") {
                   include("**/*.pro")

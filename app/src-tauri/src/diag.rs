@@ -23,6 +23,11 @@ const THROTTLE_SECS: i64 = 30;
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 static RECENT: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
 static LAST_SENT: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+/// 本机安装标识：App 第一次启动时随机生成后落盘，之后每次上报都带。
+/// 用途只有一个 —— 后台把「同一台手机的一次安装」和别的手机分开，不至于把两个人看成一个人。
+static DEVICE_FP: OnceLock<String> = OnceLock::new();
+/// 手机厂商/型号与系统（启动时由 connkeep 插件从 Build 里取；取不到就留空）。
+static PHONE: OnceLock<(String, String)> = OnceLock::new();
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -32,8 +37,27 @@ fn unix_now() -> i64 {
 }
 
 /// 启动时登记数据目录（命令行诊断信息也在付费模块的 ctx 里取 base/token）。
+///
+/// 顺带准备「本机安装标识」：已有就复用，没有就随机生成后落盘。
+/// 只用于后台区分不同手机，不含任何账号信息；重装 App 会变成新标识（这是预期）。
 pub fn init(dir: PathBuf) {
+    let path = dir.join("diag_device_fp");
+    let fp = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let generated = format!("{:016x}", rand::random::<u64>());
+            let _ = std::fs::write(&path, &generated);
+            generated
+        });
+    let _ = DEVICE_FP.set(fp);
     let _ = DIR.set(dir);
+}
+
+/// 启动时登记手机型号/系统（安卓由 connkeep 插件读 Build.*；桌面不调）。
+pub fn set_phone_info(model: &str, os: &str) {
+    let _ = PHONE.set((model.to_string(), os.to_string()));
 }
 
 fn recent_buf() -> &'static Mutex<Vec<Value>> {
@@ -106,12 +130,22 @@ pub fn report_kind(kind: &str, step: &str, code: &str, message: &str, device_mod
         return;
     }
     let Some((base, token)) = transport() else { return };
+    // 「是谁」：设备指纹 + 手机型号/系统。第一次连不上时 device_model 还是空的，
+    // 以前后台只能靠 IP 猜人（CGNAT 下两个买家会同 IP）——现在至少分得开不同手机。
+    let device_fp = DEVICE_FP.get().map(|s| s.as_str());
+    let (phone_model, phone_os) = PHONE
+        .get()
+        .map(|(m, o)| (Some(m.as_str()), Some(o.as_str())))
+        .unwrap_or((None, None));
     let body = json!({ "events": [ {
         "kind": kind,
         "step": step,
         "code": code,
         "message": message,
         "device_model": device_model,
+        "device_fp": device_fp,
+        "phone_model": phone_model,
+        "phone_os": phone_os,
         "app_version": env!("CARGO_PKG_VERSION"),
     } ] })
     .to_string();

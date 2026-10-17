@@ -266,6 +266,33 @@
     transition:color .12s ease,border-color .12s ease;white-space:nowrap;
   }
   .theme-btn:hover{color:var(--ink);border-color:var(--ink-3)}
+
+  /* ===== 私信 ===== */
+  .chat-split{display:grid;grid-template-columns:340px minmax(0,1fr);gap:16px;align-items:start}
+  @media (max-width:1100px){.chat-split{grid-template-columns:1fr}}
+  .chat-list{max-height:560px;overflow:auto;margin:0 -8px}
+  .chat-row{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:10px 12px;border-radius:8px;
+            cursor:pointer;transition:background .12s ease}
+  .chat-row:hover{background:var(--hover-bg)}
+  .chat-row.active{background:var(--primary-weak)}
+  .chat-row-name{font-size:13.5px;font-weight:600;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chat-row-preview{grid-column:1/2;font-size:12.5px;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chat-row-side{grid-row:1/3;grid-column:2/3;display:flex;flex-direction:column;align-items:flex-end;gap:5px}
+  .chat-row-time{font-size:11.5px;color:var(--ink-3);white-space:nowrap}
+  .chat-unread{min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--primary);color:var(--on-primary);
+               font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center}
+  .chat-thread{display:flex;flex-direction:column;gap:10px;max-height:440px;overflow:auto;padding:2px 2px 6px}
+  .chat-msg{display:flex;flex-direction:column;max-width:78%}
+  .chat-msg.out{align-self:flex-end;align-items:flex-end}
+  .chat-bubble{padding:9px 12px;border-radius:10px;background:var(--chip-bg);color:var(--ink);
+               font-size:13.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+  .chat-msg.out .chat-bubble{background:var(--primary-weak)}
+  .chat-msg-time{font-size:11.5px;color:var(--ink-3);margin-top:4px}
+  .chat-empty{padding:28px 0;text-align:center;color:var(--ink-3);font-size:13px}
+  .chat-compose{display:flex;gap:10px;align-items:flex-end;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+  .chat-compose textarea{flex:1;min-height:72px;max-height:200px;resize:vertical;line-height:1.6}
+  .chat-compose textarea:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-weak)}
+  .chat-conn{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -290,6 +317,9 @@
     <a class="nav-item" data-route="#/afdian" href="#/afdian">
       <svg class="ic" viewBox="0 0 16 16"><path d="M6.6 9.4 9.4 6.6"/><path d="M7.2 4.4 8.9 2.7a2.3 2.3 0 0 1 3.2 3.2l-1.7 1.7"/><path d="M8.8 11.6 7.1 13.3a2.3 2.3 0 0 1-3.2-3.2l1.7-1.7"/></svg>
       爱发电</a>
+    <a class="nav-item" data-route="#/messages" href="#/messages">
+      <svg class="ic" viewBox="0 0 16 16"><path d="M2.2 3.6h11.6v8.2H6.4L3.2 14V3.6z"/><path d="M5 6.6h6M5 9h4"/></svg>
+      私信</a>
     <a class="nav-item" data-route="#/events" href="#/events">
       <svg class="ic" viewBox="0 0 16 16"><path d="M1.5 8h2.8L6 4.2 8.4 11.8 10.4 8h4.1"/></svg>
       客户端诊断</a>
@@ -369,6 +399,7 @@ async function render(){
     if(h==='#/editor-plans') return renderEditorPlans();
     if(h==='#/devices' || h==='#/settings') return renderDeviceGroups();
     if(h==='#/afdian') return renderAfdian();
+    if(h==='#/messages') return renderMessages();
     if(h==='#/events') return renderEvents();
     if(h==='#/app') return renderAppPage();
     return renderCards();
@@ -1199,20 +1230,234 @@ async function renderAfdian(){
     </div>`;
 }
 
+// ---------- 私信
+// 爱发电私信走网页版内部接口（开放平台没有），登录态存服务端、KEK 加密、不回显。
+// 这一版只做「看 + 手动发」；自动回复等通道稳定后再接。
+let CHAT = { activeUserId: '', activeName: '', dialogs: [] };
+
+function renderMessages(){
+  $('app').innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">私信</h1>
+        <p class="page-desc">爱发电私信。登录态只保存在服务端（主密钥加密），页面不会回显。
+          这里是「人工收发台」：自动回复要等通道稳定后再开。</p></div>
+      <span class="sp"></span>
+      <button class="btn btn-ghost" onclick="refreshChat()">刷新</button>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">连接爱发电</h2><span class="sp"></span><span id="chat-conn-badge"></span></div>
+      <div class="chat-conn" id="chat-conn"><span class="meta">检查中…</span></div>
+    </div>
+    <div class="chat-split">
+      <div class="panel">
+        <div class="panel-head"><h2 class="panel-title">会话</h2><span class="sp"></span><span class="meta" id="chat-count"></span></div>
+        <div class="chat-list" id="chat-list"><span class="chat-empty">加载中…</span></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2 class="panel-title" id="chat-title">对话</h2></div>
+        <div id="chat-thread-box"><div class="chat-empty">从左侧选择一个会话</div></div>
+      </div>
+    </div>`;
+  CHAT = { activeUserId: '', activeName: '', dialogs: [] };
+  setTimeout(async ()=>{
+    const s = await loadChatStatus();
+    if(s && s.configured) await loadChatDialogs();
+    else {
+      const box = $('chat-list');
+      if(box) box.innerHTML = '<span class="chat-empty">先连接爱发电</span>';
+    }
+  }, 0);
+}
+
+/** 时间戳可能是秒/毫秒数字，也可能是字符串；统一显示成本地时间 */
+function fmtSentAt(v){
+  if(v===null || v===undefined || v==='') return '';
+  let d = null;
+  if(typeof v==='number' || /^\d+$/.test(String(v))){
+    const n = Number(v);
+    d = new Date(n < 1e12 ? n*1000 : n);
+  }else{
+    d = new Date(v);
+  }
+  if(isNaN(d.getTime())) return String(v);
+  const p = x => String(x).padStart(2,'0');
+  return `${d.getMonth()+1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function loadChatStatus(){
+  const box = $('chat-conn');
+  if(!box) return;
+  try{
+    const s = await api('/admin/afdian/chat/status');
+    const badge = $('chat-conn-badge');
+    if(s.configured){
+      if(badge) badge.innerHTML = s.lastError
+        ? '<span class="badge badge-err">登录态失效</span>'
+        : '<span class="badge badge-ok">已连接</span>';
+      box.innerHTML = `
+        <div style="flex:1;min-width:240px">
+          <div class="row-name">${esc(s.displayName || '爱发电账号')}</div>
+          <div class="meta">${s.lastError ? esc(s.lastError) : '上次检查 ' + esc(fmtSentAt(s.checkedAt))}</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="chatClearToken()">断开</button>`;
+    }else{
+      if(badge) badge.innerHTML = '<span class="badge">未连接</span>';
+      box.innerHTML = `
+        <div style="flex:1;min-width:280px">
+          <input id="chat-token" type="password" autocomplete="off" placeholder="粘贴爱发电 auth_token" style="width:100%;max-width:460px"/>
+          <div class="panel-hint tight">在浏览器登录 afdian.com，F12 → Application → Cookies → 复制 <span class="mono">auth_token</span> 的值。
+            它等价于你的登录凭据，只保存在服务端（主密钥加密），保存后页面不再显示。</div>
+        </div>
+        <button class="btn btn-primary" onclick="chatSaveToken()">验证并保存</button>`;
+    }
+    return s;
+  }catch(e){
+    box.innerHTML = `<span class="meta" style="color:var(--danger)">${esc(e.message)}</span>`;
+    return null;
+  }
+}
+
+async function chatSaveToken(){
+  const el = $('chat-token');
+  const value = el ? el.value.trim() : '';
+  if(!value){ toast('请先粘贴 auth_token', true); return; }
+  try{
+    await api('/admin/afdian/chat/token', {method:'POST', body:JSON.stringify({token:value})});
+    toast('已连接爱发电');
+    await loadChatStatus();
+    await loadChatDialogs();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function chatClearToken(){
+  if(!confirm('断开后将无法在这里读写私信，确定？')) return;
+  try{
+    await api('/admin/afdian/chat/token', {method:'DELETE'});
+    toast('已断开');
+  }catch(e){ toast(e.message, true); }
+  CHAT = { activeUserId: '', activeName: '', dialogs: [] };
+  await loadChatStatus();
+  const list = $('chat-list');
+  if(list) list.innerHTML = '<span class="chat-empty">先连接爱发电</span>';
+  const count = $('chat-count');
+  if(count) count.textContent = '';
+  const box = $('chat-thread-box');
+  if(box) box.innerHTML = '<div class="chat-empty">从左侧选择一个会话</div>';
+}
+
+async function loadChatDialogs(){
+  const box = $('chat-list');
+  if(!box) return;
+  try{
+    const d = await api('/admin/afdian/chat/dialogs?page=1');
+    CHAT.dialogs = d.items || [];
+    const count = $('chat-count');
+    if(count) count.textContent = CHAT.dialogs.length ? `${CHAT.dialogs.length} 个会话` : '';
+    if(!CHAT.dialogs.length){
+      box.innerHTML = '<span class="chat-empty">还没有私信</span>';
+      return;
+    }
+    box.innerHTML = CHAT.dialogs.map(x=>`
+      <div class="chat-row ${x.userId===CHAT.activeUserId?'active':''}" data-uid="${esc(x.userId)}" onclick="chatOpen('${esc(x.userId)}')">
+        <div class="chat-row-name">${esc(x.name)}</div>
+        <div class="chat-row-preview">${esc(String(x.preview||'').replace(/\s+/g,' '))}</div>
+        <div class="chat-row-side">
+          <span class="chat-row-time">${esc(fmtSentAt(x.sentAt))}</span>
+          ${x.unreadCount ? `<span class="chat-unread">${x.unreadCount}</span>` : ''}
+        </div>
+      </div>`).join('');
+  }catch(e){
+    box.innerHTML = `<span class="chat-empty" style="color:var(--danger)">${esc(e.message)}</span>`;
+  }
+}
+
+async function chatOpen(userId){
+  const dlg = CHAT.dialogs.find(x=>x.userId===userId);
+  CHAT.activeUserId = userId;
+  CHAT.activeName = dlg ? dlg.name : '';
+  document.querySelectorAll('.chat-row').forEach(el=>{
+    el.classList.toggle('active', el.getAttribute('data-uid')===userId);
+  });
+  const title = $('chat-title');
+  if(title) title.textContent = CHAT.activeName || '对话';
+  const box = $('chat-thread-box');
+  if(box) box.innerHTML = '<div class="chat-empty">加载中…</div>';
+  await loadChatThread();
+}
+
+async function loadChatThread(){
+  if(!CHAT.activeUserId) return;
+  const box = $('chat-thread-box');
+  if(!box) return;
+  try{
+    const d = await api('/admin/afdian/chat/messages?user_id=' + encodeURIComponent(CHAT.activeUserId) + '&type=new');
+    const items = d.items || [];
+    box.innerHTML = `
+      <div class="chat-thread" id="chat-thread">${items.length ? items.map(m=>`
+        <div class="chat-msg ${m.direction==='send'?'out':''}">
+          <div class="chat-bubble">${esc(m.content || '[非文本消息]')}</div>
+          <div class="chat-msg-time">${m.messageType && m.messageType !== 1 ? '系统消息 · ' : ''}${esc(fmtSentAt(m.sentAt))}</div>
+        </div>`).join('') : '<div class="chat-empty">这个会话还没有可显示的文字消息</div>'}</div>
+      <div class="chat-compose">
+        <textarea id="chat-input" placeholder="输入回复内容…"></textarea>
+        <button class="btn btn-primary" onclick="chatSend()">发送</button>
+      </div>
+      <div class="panel-hint tight">发送即以你的爱发电账号回复，对方会收到私信。</div>`;
+    const thread = $('chat-thread');
+    if(thread) thread.scrollTop = thread.scrollHeight;
+  }catch(e){
+    box.innerHTML = `<div class="chat-empty" style="color:var(--danger)">${esc(e.message)}</div>`;
+  }
+}
+
+async function chatSend(){
+  const el = $('chat-input');
+  const content = el ? el.value.trim() : '';
+  if(!content){ toast('消息不能为空', true); return; }
+  if(Array.from(content).length > 1500){ toast('消息太长（上限 1500 字）', true); return; }
+  try{
+    await api('/admin/afdian/chat/send', {method:'POST', body:JSON.stringify({user_id:CHAT.activeUserId, content})});
+    toast('已发送');
+    if(el) el.value = '';
+    await loadChatThread();
+    await loadChatDialogs();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function refreshChat(){
+  const s = await loadChatStatus();
+  if(!s || !s.configured) return;
+  await loadChatDialogs();
+  if(CHAT.activeUserId) await loadChatThread();
+}
+
 // ---------- 客户端诊断
+const EV_SORT_KEY = 'wf_admin_ev_sort';
+const EV_DAYS_KEY = 'wf_admin_ev_days';
+const EV_PROGRESS_KEY = 'wf_admin_ev_progress';
 async function renderEvents(){
   setTimeout(()=>void loadEvents(), 0);
+  const sort = localStorage.getItem(EV_SORT_KEY) || 'count';
+  const days = localStorage.getItem(EV_DAYS_KEY) || '7';
+  const progress = localStorage.getItem(EV_PROGRESS_KEY) === '1';
   $('app').innerHTML = `
     <div class="page-head">
       <div><h1 class="page-title">客户端诊断</h1>
-        <p class="page-desc">App 里「哪一步失败了、什么机型、什么错误码」。买家那边只看到一句操作指引，细节只到这里。</p></div>
+        <p class="page-desc">App 里「哪一步失败了、哪台手机、什么错误码」。买家那边只看到一句操作指引，细节只到这里。
+          同一台手机的每次安装有独立设备指纹；老版本没上报指纹时按 IP 归并。
+          默认不显示「过程事件」（掉线自动重连、15 秒中间态）——它们不是最终失败，勾选后可查看。</p></div>
       <span class="sp"></span>
       <div class="form-row" style="margin:0">
         <select id="ev-days" onchange="loadEvents()">
-          <option value="7">近 7 天</option>
-          <option value="30">近 30 天</option>
-          <option value="1">近 24 小时</option>
+          <option value="7" ${days==='7'?'selected':''}>近 7 天</option>
+          <option value="30" ${days==='30'?'selected':''}>近 30 天</option>
+          <option value="1" ${days==='1'?'selected':''}>近 24 小时</option>
         </select>
+        <select id="ev-sort" onchange="loadEvents()">
+          <option value="count" ${sort==='count'?'selected':''}>按次数排序</option>
+          <option value="time" ${sort==='time'?'selected':''}>按时间排序</option>
+        </select>
+        <label class="check"><input type="checkbox" id="ev-progress" ${progress?'checked':''} onchange="loadEvents()"/> 包含过程事件</label>
         <button class="btn btn-ghost" onclick="loadEvents()">刷新</button>
       </div>
     </div>
@@ -1450,14 +1695,18 @@ async function loadStats(){
   try{ const s = await api('/admin/stats');
     $('statLine').innerHTML = `<span class="stat">${s.resources} 个资源</span><span class="stat">${s.packages} 个包体</span><span class="stat">${s.activeLicenses} 个授权</span>`;
     renderDevBanner(s.devBind);
-    renderDiagLine(s.failEvents7d|0);
+    renderDiagLine(s.failDevices7d|0, s.failEvents7d|0, s.progressEvents7d|0);
   }catch(e){}
 }
 
 /** 失败打点提示：>0 就在顶栏亮一条（以前这类信号在 App 里就断了，卖家看不到） */
-function renderDiagLine(n){
+function renderDiagLine(devices, events, progress){
   const el = $('diagLine'); if(!el) return;
-  if(n > 0){ el.style.display=''; el.textContent = `近 7 天 ${n} 条客户端失败 ›`; }
+  if(devices > 0){
+    el.style.display='';
+    el.textContent = `近 7 天 ${devices} 台设备报告 ${events} 条客户端失败`
+      + (progress>0 ? `（另有 ${progress} 条过程事件已折起）` : '') + ' ›';
+  }
   else { el.style.display='none'; }
 }
 
@@ -1467,26 +1716,63 @@ function fmtTs(ts){
   return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** 客户端诊断：App 上报的失败打点（按步骤+错误码聚合，再给最近几条原文） */
+/** 客户端诊断：按设备分组（区分不同人）+ 按步骤聚合（可切换按次数/按时间）+ 最近原文 */
 async function loadEvents(){
   const box = $('ev-box'); if(!box) return;
   const days = ($('ev-days')||{}).value || 7;
+  const sort = ($('ev-sort')||{}).value || 'count';
+  const includeProgress = !!($('ev-progress')||{}).checked;
+  localStorage.setItem(EV_DAYS_KEY, days);
+  localStorage.setItem(EV_SORT_KEY, sort);
+  localStorage.setItem(EV_PROGRESS_KEY, includeProgress ? '1' : '0');
   box.innerHTML = '<div class="meta">读取中…</div>';
   try{
-    const d = await api(`/admin/events?days=${encodeURIComponent(days)}&limit=20`);
-    if(!d.total){ box.innerHTML = `<div class="meta">近 ${days} 天没有失败上报 👍</div>`; return; }
+    const d = await api(`/admin/events?days=${encodeURIComponent(days)}&limit=30&sort=${encodeURIComponent(sort)}&include_progress=${includeProgress?1:0}`);
+    if(!d.total){
+      box.innerHTML = `<div class="meta">近 ${days} 天没有真失败`
+        + (d.progressTotal ? `；另有 ${d.progressTotal} 条过程事件已折起` : '') + ' 👍</div>';
+      return;
+    }
+    const devRows = (d.byDevice||[]).map(x=>{
+      const dev = x.deviceFp
+        ? `设备 <span class="mono">${esc(String(x.deviceFp).slice(0,8))}</span>`
+        : `IP <span class="mono">${esc(x.ip||'—')}</span>`;
+      const acc = x.subject ? `<span class="mono">${esc(x.subject)}</span>` : '<span class="meta">未登录</span>';
+      const last = [x.lastStep, x.lastCode, x.lastMessage].filter(Boolean).join(' · ');
+      return `<tr>
+        <td>${dev}</td>
+        <td class="meta">${esc(x.phone||'—')}</td>
+        <td class="meta">${esc(x.deviceModel||'—')}</td>
+        <td>${acc}</td>
+        <td class="meta mono">${esc(x.ip||'—')}</td>
+        <td><span class="num">${x.count} 次</span></td>
+        <td class="meta num">${fmtTs(x.lastTs)}</td>
+        <td class="meta">${esc(last)}</td>
+      </tr>`;
+    }).join('');
+    const byDev = `<table class="tbl">
+      <thead><tr><th style="width:110px">设备（人）</th><th>手机 / 系统</th><th style="width:140px">手环</th><th style="width:170px">账号</th><th style="width:130px">IP</th><th style="width:70px">次数</th><th style="width:110px">最近一次</th><th>最近问题</th></tr></thead>
+      <tbody>${devRows}</tbody></table>`;
     const agg = `<table class="tbl">
-      <thead><tr><th style="width:110px">步骤</th><th style="width:140px">错误码</th><th style="width:70px">次数</th><th>详情</th><th style="width:120px">最近一次</th></tr></thead>
+      <thead><tr><th style="width:110px">步骤</th><th style="width:150px">错误码</th><th style="width:70px">次数</th><th style="width:80px">涉及设备</th><th style="width:110px">最近一次</th><th>详情（最近一台）</th></tr></thead>
       <tbody>${(d.byStep||[]).map(x=>`<tr>
-        <td><span class="mono">${esc(x.step)}</span></td>
+        <td><span class="mono">${esc(x.step)}</span>${x.progress?' <span class="meta">过程</span>':''}</td>
         <td><span class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(x.code||'—')}</span></td>
         <td><span class="num">${x.count} 次</span></td>
-        <td class="meta">${esc([x.deviceModel, x.appVersion?('v'+x.appVersion):'', x.message].filter(Boolean).join(' · '))}</td>
+        <td><span class="num">${x.deviceCount||1}</span></td>
         <td class="meta num">${fmtTs(x.lastTs)}</td>
+        <td class="meta">${esc([x.who, x.deviceModel, x.appVersion?('v'+x.appVersion):'', x.message].filter(Boolean).join(' · '))}</td>
       </tr>`).join('')}</tbody></table>`;
     const recent = (d.recent||[]).map(x=>
-      `<div class="meta num" style="padding:3px 0">${fmtTs(x.ts)} · ${esc(x.step)} · ${esc(x.code||'—')} · ${esc([x.deviceModel, x.message].filter(Boolean).join(' · '))}</div>`).join('');
-    box.innerHTML = `<div class="meta" style="margin-bottom:10px">近 ${days} 天共 ${d.total} 条；按次数排序，先修第一条</div>
+      `<div class="meta num" style="padding:3px 0">${fmtTs(x.ts)} · ${x.progress?'[过程] ':''}${esc(x.who||'')} · ${esc(x.step)} · ${esc(x.code||'—')} · ${esc([x.deviceModel, x.message].filter(Boolean).join(' · '))}</div>`).join('');
+    const sortLabel = sort === 'time' ? '按时间排序（最新的在上面）' : '按次数排序（最多的在上面）';
+    const hiddenNote = (!includeProgress && d.progressTotal)
+      ? ` · 另有 ${d.progressTotal} 条过程事件已折起（勾选「包含过程事件」可查看）` : '';
+    const scopeNote = includeProgress ? '（含过程事件）' : '真失败记录';
+    box.innerHTML = `<div class="meta" style="margin-bottom:10px">近 ${days} 天共 ${d.total} 条${scopeNote}，来自 ${d.devices||0} 台设备 · ${sortLabel}${hiddenNote}</div>
+      <h2 class="panel-title" style="margin:2px 0 8px">按设备（人）</h2>
+      ${byDev}
+      <h2 class="panel-title" style="margin:18px 0 8px">按步骤</h2>
       ${agg}
       <details style="margin-top:12px"><summary>最近 ${(d.recent||[]).length} 条原文</summary><div style="margin-top:6px">${recent}</div></details>`;
   }catch(e){ box.innerHTML = `<div class="meta">读取失败：${esc(e.message)}</div>`; }

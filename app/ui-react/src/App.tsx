@@ -356,6 +356,31 @@ function storeList(key: string, list: string[]) {
   }
 }
 
+/** 「稍后」记住的版本（同一版本静默 24 小时，强制更新不受限） */
+const APP_UPDATE_SNOOZE_KEY = "panfang.updateSnoozed";
+const APP_UPDATE_SNOOZE_MS = 24 * 3600 * 1000;
+
+function readUpdateSnooze(): { version: string; at: number } | null {
+  try {
+    const raw = localStorage.getItem(APP_UPDATE_SNOOZE_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw) as { version?: unknown; at?: unknown };
+    if (typeof v.version !== "string" || typeof v.at !== "number") return null;
+    return { version: v.version, at: v.at };
+  } catch {
+    return null;
+  }
+}
+
+function snoozeUpdate(version: string | undefined) {
+  if (!version) return;
+  try {
+    localStorage.setItem(APP_UPDATE_SNOOZE_KEY, JSON.stringify({ version, at: Date.now() }));
+  } catch {
+    /* 存不下就本次会话生效，下次开屏会再弹一次 */
+  }
+}
+
 // ================= 页面栈 / 页面恢复（逐级返回 + 退出 App 后回到上次页面） =================
 
 /** 主界面 Tab（与 activeTab 同口径） */
@@ -698,6 +723,29 @@ export default function App() {
   const CONNECT_HINT = "请在手环设置-系统管理中点击连接新手机，进入该模式后，才可扫描到手环";
 
   /**
+   * 连接失败时上屏的**一句操作指引**（按原因给，不再一律「请进连接新手机」）：
+   * 超时 / 没发现设备 / 认证没通过，这三种情况用户要做的事不一样。
+   * 技术细节（MAC、后端原文、堆栈）仍然只进 console 与后台打点。
+   */
+  const connectHintFor = (raw: string): string => {
+    if (raw.includes("认证") || raw.includes("创建设备") || raw.includes("session-not-ready")) {
+      return "已连上蓝牙但手环认证没通过，请重启手环后重新进入「连接新手机」再试";
+    }
+    if (raw.includes("未发现") || raw.includes("device not found") || raw.includes("Invalid MAC")) {
+      return "没发现这台手环，请确认它停在「连接新手机」界面，并且已允许「附近的设备」权限";
+    }
+    if (
+      raw.includes("超时") ||
+      raw.includes("timeout") ||
+      raw.includes("没有接受连接") ||
+      raw.includes("target rejected")
+    ) {
+      return "连接超时：手环没有回应，请确认它没被别的手机或小米运动健康占用";
+    }
+    return CONNECT_HINT;
+  };
+
+  /**
    * 失败打点：把「哪一步失败了、后端原话是什么」送给开发者后台（管理页「客户端诊断」）。
    * 屏幕上的文案完全不变（仍是 humanize 那句），这里只是让卖家第一次能看见失败——
    * 以前这类信号只进这台手机的 console，卖家那边什么都收不到。
@@ -765,6 +813,22 @@ export default function App() {
     } else if (raw.includes("device_limit")) {
       code = "device_limit";
       msg = "已达到设备数量上限，请联系开发者解绑";
+    } else if (
+      raw.includes("license_revoked") ||
+      raw.includes("没有该产品的授权") ||
+      raw.includes("授权已被回收")
+    ) {
+      code = "not_licensed";
+      msg = "这份表盘不在你的授权里，请确认已用购买它的爱发电账号完成绑定";
+    } else if (raw.includes("快应用文件不完整")) {
+      code = "quickapp_invalid";
+      msg = "这个快应用文件不完整，请重新下载后再试";
+    } else if (raw.includes("third-party app install failed")) {
+      // 手环对快应用的两种拒绝：校验不通过（签名/包体不适配）与安装失败
+      code = "quickapp_install";
+      msg = raw.includes("VerifyFailed")
+        ? "手环没有通过这个快应用的校验，请换一个适配你设备的文件"
+        : "快应用安装失败，请确认这个文件适配你的手环";
     } else if (raw.includes("ExceedQuantityLimit")) {
       // 手环侧表盘数量上限（prepare 状态码 7）：重试没用，得先腾位置
       code = "dial_limit";
@@ -870,7 +934,7 @@ export default function App() {
   }, [currentStep, activeTab]);
 
   // 设置项状态（本地持久化：localStorage）
-  // 「本地表盘安装」入口默认关闭（用户要求：首页默认只显示兑换付费表盘）
+  // 「本地资源安装」入口默认关闭（用户要求：首页默认只显示兑换付费表盘）
   const [enableLocalInstall, setEnableLocalInstall] = useState(() => readStoredFlag("panfang.enableLocalInstall", false));
   const [isPrimaryLocal, setIsPrimaryLocal] = useState(() => readStoredFlag("panfang.primaryLocal", false)); // false: 付费表盘为主；true: 本地表盘为主
   /** 首页「4 步上手」入口是否已看过（真实状态判断：走过一次就不再打扰） */
@@ -919,6 +983,8 @@ export default function App() {
   /** 点了安装、正在读包体列表的资源（按钮转「准备中…」；与 installBusyRef 一起挡连点） */
   const [installPreparing, setInstallPreparing] = useState<string | null>(null);
   const installBusyRef = useRef(false);
+  /** 这次本地安装装的是什么：表盘有「设为当前」那一步，快应用没有 → 进度文案要分开 */
+  const installKindRef = useRef<"watchface" | "quickapp">("watchface");
   const [installProgress, setInstallProgress] = useState(0);
   const [progressPhase, setProgressPhase] = useState("正在验证兑换凭证...");
   const [dialName, setDialName] = useState("雾屿蓝·动态");
@@ -952,8 +1018,13 @@ export default function App() {
     }
   });
 
-  /** 检查更新。silent=true（启动后台查）时只弹一条浮窗，不打断当前操作。 */
-  const runAppUpdateCheck = async (silent: boolean) => {
+  /**
+   * 检查更新。
+   * - startup：开屏自动查，查到新版本直接弹窗（就是「开屏更新通知」）；查不到或失败都不打扰
+   * - manual：关于页手动点，没新版本也给一条浮窗
+   */
+  const runAppUpdateCheck = async (mode: "startup" | "manual") => {
+    const silent = mode === "startup";
     if (!invoke) {
       if (!silent) showToast("浏览器预览里没有更新检查", "error");
       return;
@@ -983,23 +1054,12 @@ export default function App() {
       } catch {
         /* 同上 */
       }
-      if (silent) {
-        // 同一个版本只打扰一次（不然每次冷启动都弹）
-        let notified = false;
-        try {
-          notified = localStorage.getItem("panfang.updateNotified") === vn;
-        } catch {
-          /* 同上 */
+      // 开屏弹窗：刚点过「稍后」的同一版本 24 小时内不再打扰（强制更新每次都弹）
+      if (silent && !r.mandatory) {
+        const snoozed = readUpdateSnooze();
+        if (snoozed && snoozed.version === vn && Date.now() - snoozed.at < APP_UPDATE_SNOOZE_MS) {
+          return;
         }
-        if (!notified && vn) {
-          try {
-            localStorage.setItem("panfang.updateNotified", vn);
-          } catch {
-            /* 同上 */
-          }
-          showToast(`发现新版本 v${vn}，在「设置 → 关于应用」里更新`);
-        }
-        return;
       }
       setAppUpdatePrompt(true);
     } catch (err) {
@@ -1040,8 +1100,9 @@ export default function App() {
     }
   };
 
-  // 启动后静默检查一次更新（24 小时节流）：只为在「关于应用」上挂个「有新版本」提示，
-  // 不打断任何操作。判断依据是**服务端发布的版本**，不是本机版本。
+  // 开屏检查更新：每次启动都问一次（10 分钟节流只为挡同一进程内的重挂载）。
+  // 查到新版本直接弹「发现新版本」——这是买家侧最主要的更新提醒入口；
+  // 之前只往「关于应用」挂一个小角标，买家基本看不到。
   useEffect(() => {
     if (!invoke) return;
     let last = 0;
@@ -1050,12 +1111,13 @@ export default function App() {
     } catch {
       /* 读不到就当没查过 */
     }
-    if (Date.now() - last < 24 * 3600 * 1000) return;
+    if (Date.now() - last < 10 * 60 * 1000) return;
+    // 等首屏出来再查：弹窗要落在登录页/首页之上，而不是和启动恢复抢同一帧
     const t = window.setTimeout(() => {
-      void runAppUpdateCheck(true);
-    }, 5000);
+      void runAppUpdateCheck("startup");
+    }, 1200);
     return () => window.clearTimeout(t);
-    // 只在启动时挂一次：检查本身有 24h 节流，重复挂没有意义
+    // 只在启动时挂一次：节流与「稍后」都在检查逻辑里
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -2382,7 +2444,7 @@ export default function App() {
           if (text) setProgressPhase(text);
         })
       );
-      // 本地表盘安装进度：Rust 侧 install_file_bytes 推的 SendMassCallbackData
+      // 本地资源安装进度：Rust 侧 install_file_bytes 推的 SendMassCallbackData
       // （字段是 snake_case：progress 0~1、total_parts / current_part_num 分片号、
       //  actual_data_payload_len 本次分片字节数；语义与兑换流程的假进度完全不同）
       track(
@@ -2399,7 +2461,9 @@ export default function App() {
           const pct = Math.max(0, Math.min(100, Math.round(ratio * 100)));
           if (pct >= 100) {
             setInstallProgress(100);
-            setProgressPhase("安装完成，正在激活...");
+            setProgressPhase(
+              installKindRef.current === "quickapp" ? "安装完成" : "安装完成，正在激活..."
+            );
             return;
           }
           setInstallProgress(pct);
@@ -2741,6 +2805,10 @@ export default function App() {
     const cloud = invoke ? accountDevices.current.find(d => d.mac === device.id) : undefined;
     const addr = cloud?.mac || device.id;
     const authkey = cloud?.authkey || "";
+    /** 诊断用：这次连的是哪台（屏幕上不显示 MAC，但后台需要知道「在连哪台」） */
+    const diagTarget = `${cloud?.name || device.name}（${addr}）`;
+    /** 诊断用：目标手环型号——第一次连不上时 connected.current.model 是空的，必须从这里带 */
+    const targetModel = cloud?.model || device.model || null;
     // 连接前先尽力清掉同一个地址上的残留会话：上一次失败可能留下系统层半开 SPP 连接，
     // 会让新连接「不发给手环、直接失败/挂住」。失败无所谓，清理本身不会报错。
     if (invoke) {
@@ -2824,7 +2892,12 @@ export default function App() {
         if (!isLive()) return;
         hideSpinner();
         console.warn("[device_connect] 15 秒未返回：先给引导，后台继续尝试");
-        diagReport("connect", "timeout15s", "连接 15 秒未返回（后台继续试到 45 秒）");
+        diagReport(
+          "connect",
+          "timeout15s",
+          `连接 15 秒未返回：目标 ${diagTarget}（后台继续试到 45 秒）`,
+          targetModel
+        );
         setConnectError(CONNECT_HINT);
         setFailedDevice(device);
         showToast("连接未完成，请在手环上进入「连接新手机」后重试", "error");
@@ -2836,6 +2909,14 @@ export default function App() {
         connectTimer.current = window.setTimeout(() => {
           if (!settle()) return;
           console.warn("[device_connect] 宽限期结束，判定失败");
+          // 这一条以前是**空的**：45 秒放弃时不打点，后台永远只看到 timeout15s，
+          // 既不知道到底卡了多久，也不知道连的是哪台。现在补上（带目标机型）。
+          diagReport(
+            "connect",
+            "giveup45s",
+            `45 秒宽限期结束仍未连上：目标 ${diagTarget}（本次会话已释放）`,
+            targetModel
+          );
           void releaseStaleConnection(addr);
           setIsDeviceConnected(false);
           setLinkRetrying(false); // 这次连接已经判失败：别留着「重连中…」（那个是掉线自动重连的态）
@@ -2892,15 +2973,22 @@ export default function App() {
             void refreshDials(addr);
           }, 1500);
         } catch (err) {
-          if (!settle()) return; // 过期尝试的失败一律忽略（不打断当前目标）
-          // 技术细节（真实错误对象 / 后端那串 ①②③ 与 MAC）只进 console，不上屏
+          const raw = String(err);
+          // 技术细节（真实错误对象 / 后端原文与 MAC）只进 console，不上屏
           console.error("[device_connect] 连接失败：", err);
-          diagReport("connect", "failed", String(err));
+          if (!settle()) {
+            // 过期尝试的失败：界面不再改，但**真实原因必须送后台**——
+            // 以前这里直接 return，后台永远只看到 timeout15s，根本不知道底层报了什么。
+            diagReport("connect", "failed_late", `目标 ${diagTarget}：${raw}`, targetModel);
+            return;
+          }
+          const hint = connectHintFor(raw);
+          diagReport("connect", "failed", `目标 ${diagTarget}：${raw}`, targetModel);
           hideSpinner();
-          setConnectError(CONNECT_HINT);
+          setConnectError(hint);
           setFailedDevice(device);
           // 抽屉可能是被自动收起的（假成功路径），这里再明确提示一次
-          showToast("连接未完成，请在手环上进入「连接新手机」后重试", "error");
+          showToast(hint, "error");
           connectFailStreak.current += 1;
           if (connectFailStreak.current >= 3) {
             connectFailStreak.current = 0;
@@ -3248,7 +3336,21 @@ export default function App() {
       handlePaidOauth();
       return;
     }
-    handlePaidBind();
+    if (paidMode === "dev") {
+      handlePaidBind();
+      return;
+    }
+    if (paidMode === null) {
+      // 绑定方式还没读回来（网络慢 / 刚进页面就点了）：这里以前会落进联调分支，
+      // 调已关闭的 /v1/bind/dev 拿到「该接口未启用」，买家只看到「操作失败，请重试」。
+      // 补读一次，让用户再点；不自动发起授权，避免误触。
+      setPaidError(null);
+      void loadPaidMode();
+      showToast("正在读取绑定方式，请稍候再点一次", "error");
+      return;
+    }
+    // paidMode === "none"：服务端没有开通绑定
+    showToast("当前暂未开放绑定，请稍后再试", "error");
   };
 
   /**
@@ -3591,6 +3693,7 @@ export default function App() {
     installBusyRef.current = true;
     paidTarget.current = { product, variant, fileIds };
     setInstallSource("paid");
+    installKindRef.current = "watchface";
     setDialName(product.name);
     setInstallError(null);
     setInstallProgress(2);
@@ -3665,10 +3768,12 @@ export default function App() {
     if (!inv) return;
     localInstall.current = { addr: payload.addr, b64: payload.b64, ext: payload.ext };
     setInstallSource("local");
+    const isQuickApp = payload.ext === "rpk";
+    installKindRef.current = isQuickApp ? "quickapp" : "watchface";
     setDialName(payload.name);
     setInstallError(null);
     setInstallProgress(6);
-    setProgressPhase("正在校验表盘文件...");
+    setProgressPhase(isQuickApp ? "正在校验快应用文件..." : "正在校验表盘文件...");
     // 进安装进度页（与兑换流程同一套页面；返回键可退回进来之前那一页）
     if (currentRoute() === "install") setCurrentStep("redeem_installing");
     else pushRoute("install");
@@ -3720,7 +3825,7 @@ export default function App() {
           )
         )) as string | null;
         setInstallProgress(100);
-        setProgressPhase("安装完成，正在激活...");
+        setProgressPhase(isQuickApp ? "安装完成" : "安装完成，正在激活...");
         // 装完刷新表盘列表（首页/管理页跟着更新；新装的表盘也会有留档 → 可编辑）
         await refreshDials(payload.addr);
         setCurrentStep("redeem_success");
@@ -3740,7 +3845,7 @@ export default function App() {
   };
 
   /**
-   * 首页「本地表盘安装」：选 .bin / .mwz / .rpk → device_install_payload（字节直传，安卓通用）。
+   * 首页「本地资源安装」：选 .bin / .mwz / .rpk → device_install_payload（字节直传，安卓通用）。
    * 真机走上面的安装进度页；浏览器演示没有真实链路，保持原来的提示文案。
    */
   const handleLocalInstall = () => {
@@ -3769,7 +3874,9 @@ export default function App() {
           const u8 = new Uint8Array(await file.arrayBuffer());
           const ext = (file.name.split(".").pop() || "").toLowerCase();
           // 进度页标题用文件名（去掉扩展名），与兑换流程显示表盘名同一个位置
-          const name = (file.name || "").replace(/\.[^.]+$/, "") || "本地表盘";
+          const name =
+            (file.name || "").replace(/\.[^.]+$/, "") ||
+            (ext === "rpk" ? "本地快应用" : "本地表盘");
           runLocalInstall({ addr, b64: bytesToB64(u8), ext, name });
         } catch (err) {
           showToast(humanize(err, "pick_file"), "error");
@@ -5007,13 +5114,13 @@ export default function App() {
 
                           <div className="flex items-baseline justify-between w-full">
                             <h2 className="text-[22px] font-bold text-black tracking-tight leading-tight">
-                              本地表盘安装
+                              本地资源安装
                             </h2>
                             <CaretRight className="w-6 h-6 text-black/25 group-hover:text-black/45 group-hover:translate-x-0.5 transition-all" />
                           </div>
 
                           <p className="text-[14px] font-medium text-black/45 mt-1.5">
-                            选择 .bin 文件直接安装
+                            选择表盘或者快应用文件
                           </p>
                         </button>
 
@@ -5097,7 +5204,7 @@ export default function App() {
                           </p>
                         </button>
 
-                        {/* 本地表盘安装次级入口（受开关控制） */}
+                        {/* 本地资源安装次级入口（受开关控制） */}
                         {enableLocalInstall && (
                           <div className="mt-3">
                             <button
@@ -5108,11 +5215,11 @@ export default function App() {
                               <div className="flex items-center gap-3">
                                 <FolderOpen className="w-5 h-5 text-black/40 stroke-[2]" />
                                 <span className="text-[16px] font-bold text-black/80">
-                                  本地表盘安装
+                                  本地资源安装
                                 </span>
                               </div>
                               <span className="text-[13px] font-medium text-black/40">
-                                .bin 文件
+                                表盘 / 快应用
                               </span>
                             </button>
                           </div>
@@ -5389,14 +5496,14 @@ export default function App() {
 
                     {/* 功能设置组 */}
                     <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-black/5">
-                      {/* 1. 本地表盘安装开关：52×30 · 开 #34C759 · 关 black/10 */}
+                      {/* 1. 本地资源安装开关：52×30 · 开 #34C759 · 关 black/10 */}
                       <div className="py-[18px] px-5 flex items-center justify-between">
                         <div className="pr-3">
                           <h4 className="text-[16px] font-bold text-black leading-tight">
-                            本地表盘安装
+                            本地资源安装
                           </h4>
                           <p className="text-[13px] font-medium text-black/40 mt-1">
-                            开启后首页显示 .bin 文件安装入口
+                            开启后首页显示表盘和快应用安装入口
                           </p>
                         </div>
 
@@ -5410,7 +5517,7 @@ export default function App() {
                               setIsPrimaryLocal(false);
                               storeFlag("panfang.primaryLocal", false);
                             }
-                            showToast(next ? "已开启本地表盘安装入口" : "已隐藏本地表盘安装入口");
+                            showToast(next ? "已开启本地资源安装入口" : "已隐藏本地资源安装入口");
                           }}
                           className={`w-[52px] h-[30px] rounded-full p-1 transition-colors duration-200 cursor-pointer flex items-center shrink-0 ${
                             enableLocalInstall ? "bg-[#34C759]" : "bg-black/10"
@@ -5432,7 +5539,7 @@ export default function App() {
                               首页卡片主次切换
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-1">
-                              当前主卡片：{isPrimaryLocal ? "本地表盘安装" : "安装已购表盘"}
+                              当前主卡片：{isPrimaryLocal ? "本地资源安装" : "安装已购表盘"}
                             </p>
                           </div>
 
@@ -5441,7 +5548,7 @@ export default function App() {
                             onClick={() => {
                               setIsPrimaryLocal(!isPrimaryLocal);
                               storeFlag("panfang.primaryLocal", !isPrimaryLocal);
-                              showToast(`已设「${!isPrimaryLocal ? "本地表盘安装" : "安装已购表盘"}」为主卡片`);
+                              showToast(`已设「${!isPrimaryLocal ? "本地资源安装" : "安装已购表盘"}」为主卡片`);
                             }}
                             className="flex items-center gap-1.5 px-3.5 h-[32px] rounded-full bg-black/5 hover:bg-black/10 active:bg-black/15 text-black font-bold text-[13px] cursor-pointer transition-all active:scale-95 shrink-0"
                           >
@@ -5525,7 +5632,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.32"} · 开源许可与开发者
+                              盘坊 v{appVersion ?? "0.3.36"} · 开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -5538,7 +5645,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 · 版本 {appVersion ?? "0.3.32"}
+                      盘坊 · 版本 {appVersion ?? "0.3.36"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -6453,7 +6560,7 @@ export default function App() {
                   {dialName}
                 </h2>
                 <p className="text-[17px] font-medium text-black/45 mt-2">
-                  已应用到你的手环
+                  {installKindRef.current === "quickapp" ? "已装到你的手环" : "已应用到你的手环"}
                 </p>
               </div>
 
@@ -6473,7 +6580,11 @@ export default function App() {
                   type="button"
                   onClick={() => {
                     goBackOr("main/home"); // 回进兑换页之前那一页
-                    showToast(`「${dialName}」已生效`);
+                    showToast(
+                      installKindRef.current === "quickapp"
+                        ? `「${dialName}」已安装`
+                        : `「${dialName}」已生效`
+                    );
                   }}
                   className="w-full h-[52px] rounded-full bg-black text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
                 >
@@ -7559,7 +7670,7 @@ export default function App() {
                     盘坊
                   </h2>
                   <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.32"}
+                    v{appVersion ?? "0.3.36"}
                   </span>
                 </div>
 
@@ -7585,7 +7696,7 @@ export default function App() {
                   {/* 一级入口：检查更新（App 自更新通道；发现新版本时副标题变蓝） */}
                   <button
                     type="button"
-                    onClick={() => void runAppUpdateCheck(false)}
+                    onClick={() => void runAppUpdateCheck("manual")}
                     className="w-full p-4.5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
                   >
                     <div className="flex items-center gap-3.5 min-w-0">
@@ -7603,7 +7714,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.32"}`}
+                            : `当前版本 v${appVersion ?? "0.3.36"}`}
                         </p>
                       </div>
                     </div>
@@ -8318,11 +8429,14 @@ export default function App() {
           </div>
         )}
 
-        {/* App 更新：发现新版本（样式与「退出登录确认」同一套 Apple 风格） */}
+        {/* App 更新：发现新版本（开屏自动弹出；样式与「退出登录确认」同一套 Apple 风格） */}
         {appUpdatePrompt && appUpdate && (
           <div
             className="absolute inset-0 z-[60] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
-            onClick={() => setAppUpdatePrompt(false)}
+            onClick={() => {
+              snoozeUpdate(appUpdate.version_name);
+              setAppUpdatePrompt(false);
+            }}
           >
             <div
               className="bg-white/95 backdrop-blur-2xl w-full max-w-[320px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5 text-center"
@@ -8349,7 +8463,10 @@ export default function App() {
               <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
                 <button
                   type="button"
-                  onClick={() => setAppUpdatePrompt(false)}
+                  onClick={() => {
+                    snoozeUpdate(appUpdate.version_name);
+                    setAppUpdatePrompt(false);
+                  }}
                   className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
                 >
                   稍后

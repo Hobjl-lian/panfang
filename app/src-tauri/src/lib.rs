@@ -80,7 +80,23 @@ pub fn run() {
                 // **启动时就用正确目录把付费上下文钉死**：它是进程级 OnceLock，
                 // 谁先初始化谁定音——若让诊断打点抢先用了别的目录，留档/登录态会全部解不开
                 // （2026-10-08 真机踩过）。这里先初始化一次，之后所有调用者都不可能改变它。
+                //
+                // 设备指纹在这之前已经由 apkinstaller 插件的 Kotlin 侧写好
+                // （`paid/android_id`），Ctx 加载时直接读文件派生稳定指纹。
                 let _ = paid::ctx(&paid::paid_dir(&dir));
+            }
+
+            // 手机型号/系统：只给失败打点区分设备用（第一次连不上手环时手环型号为空，
+            // 后台光看 IP 会把两个买家并成一个人）。取不到就当没有，不影响任何功能。
+            #[cfg(target_os = "android")]
+            {
+                use connkeep::ConnKeepExt;
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Ok(info) = handle.conn_keep().device_info() {
+                        diag::set_phone_info(&info.model, &info.os);
+                    }
+                });
             }
 
             app.manage(AppState {

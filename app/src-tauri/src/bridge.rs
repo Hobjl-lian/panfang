@@ -137,6 +137,57 @@ pub async fn device_ensure_bt_permissions(app: tauri::AppHandle) -> Result<bool,
     }
 }
 
+/// 单次 SPP 建链的失败：超时和普通失败分开。
+/// 超时意味着底层阻塞调用可能还在系统栈里跑，**不能立刻再发第二次**（会互相踩 socket）。
+enum ConnectFail {
+    Timeout(String),
+    Failed(String),
+}
+
+/// 单次 SPP 建链（带硬超时）。
+///
+/// 底层 Kotlin 有 12 秒建链预算（到点 close socket 真正打断阻塞的 connect），
+/// 这里再加 20 秒保险：即使插件没按预期返回，前端也能拿到一句明确的错误，而不是永远转圈。
+/// `unpair_first = true` 表示先解除系统里的旧配对再连（换机/手环重置后的失效 bond 会卡住连接）。
+async fn transport_connect(
+    addr: String,
+    connect_type: ConnectType,
+    unpair_first: bool,
+) -> Result<(), ConnectFail> {
+    let display_addr = addr.clone();
+    let display_addr_in = display_addr.clone();
+    let call = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let iface = bt().map_err(|e| format!("蓝牙接口未初始化：{e}"))?;
+        iface
+            .connect(addr, connect_type, vec![], Some(unpair_first))
+            .map_err(|e| match e {
+                btinterface::ConnectError::DeviceNotFound => format!(
+                    "手机没有发现这台手环（{display_addr_in}）。\
+                     请确认手环停在「连接新手机」界面，并且本应用的「附近的设备」权限已允许"
+                ),
+                btinterface::ConnectError::TargetRejected => format!(
+                    "手环没有接受连接（{display_addr_in}）。\
+                     请确认手环仍停在「连接新手机」界面，且没有别的手机或小米运动健康占着它"
+                ),
+                // Kotlin 插件给的具体原因（超时 / 权限 / 无可用通道）——原样带上去
+                btinterface::ConnectError::Failed(msg) => {
+                    format!("蓝牙连接失败（{display_addr_in}）：{msg}")
+                }
+            })
+    });
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(20), call)
+        .await
+        .map_err(|_| {
+            ConnectFail::Timeout(format!(
+                "连接超时（20 秒）：手机没有完成与手环（{display_addr}）的蓝牙通道。\
+                 请确认手环停在「连接新手机」界面，且没有别的手机占用它"
+            ))
+        })?;
+    joined
+        .map_err(|e| ConnectFail::Failed(e.to_string()))?
+        .map_err(ConnectFail::Failed)
+}
+
 /// 连接一个设备（**手动连接与自动重连共用这一条路径**）。
 /// stdimp 内部使用 tauri::async_runtime::block_on，必须在阻塞线程上调用。
 pub(crate) async fn connect_inner(
@@ -150,27 +201,28 @@ pub(crate) async fn connect_inner(
     // （此前尝试的 BLE 路径为弯路：上游安卓 BLE 实现存在多处缺陷。）
     let connect_type = ConnectType::SPP;
 
-    let connect_addr = addr.clone();
-    let display_addr = addr.clone();
     log::info!("[device_connect] begin addr={addr} type={connect_type:?}");
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        let iface = bt().map_err(|e| e.to_string())?;
-        // Some(false)=保留已有配对关系直接连接（环表工具箱同款行为，免重新配对）
-        iface
-            .connect(connect_addr, connect_type, vec![], Some(false))
-            .map_err(|e| match e {
-                btinterface::ConnectError::DeviceNotFound => format!(
-                    "蓝牙连接失败: 未发现设备 {display_addr}。\
-                     请依次确认：① 手环处于「连接新手机」界面（经典蓝牙可被发现）；\
-                     ② 手机上的小米运动健康已退出、没占着手环；\
-                     ③ 本应用的「附近的设备」权限已允许（系统设置 → 应用 → 盘坊 → 权限）。\
-                     第 ③ 条最容易被忽略：Android 12 起没有该权限时扫描结果恒为空，表现就是「哪个手环都连不上」。"
-                ),
-                other => format!("蓝牙连接失败: {other}"),
-            })
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    // 第一次保留已有配对直接连（正常路径最快，免重新配对）；
+    // 失败后再试一次「先解除旧配对」——换机 / 手环重置后系统里常留着一份失效的 bond，
+    // 它会让 RFCOMM 一直卡住（2026-10-17 一位一加 13 用户连续 7 次都卡在这一步）。
+    if let Err(first) = transport_connect(addr.clone(), connect_type, false).await {
+        match first {
+            // 底层调用可能还卡在系统栈里，这时再发第二次只会互相踩 socket
+            ConnectFail::Timeout(msg) => return Err(msg),
+            ConnectFail::Failed(msg) => {
+                log::warn!("[device_connect] 保留配对连接失败：{msg}；改为解除旧配对后重试");
+                match transport_connect(addr.clone(), connect_type, true).await {
+                    Ok(()) => log::info!("[device_connect] 解除旧配对后连接成功"),
+                    Err(second) => {
+                        let msg2 = match second {
+                            ConnectFail::Timeout(m) | ConnectFail::Failed(m) => m,
+                        };
+                        return Err(format!("{msg2}（已自动尝试解除旧配对）"));
+                    }
+                }
+            }
+        }
+    }
     log::info!("[device_connect] transport connected");
 
     // 订阅通知 → 喂给 corelib 分发器（认证握手在 create_device 内自动发起）
@@ -229,10 +281,11 @@ pub(crate) async fn connect_inner(
     let (ct_core, chunk_spp, chunk_ble) = (CoreConnectType::SPP, Some(977usize), None);
 
     log::info!("[device_connect] creating corelib device");
-    // create_device 内部会等待认证握手完成；认证包发送失败时上游不通知等待者会永久挂起，
-    // 这里加 30 秒超时兜底，避免连接命令永不返回（前端按钮永久禁用）。
+    // create_device 内部会等待认证握手完成；认证包发送失败时上游不通知等待者会永久挂起。
+    // 15 秒兜底：前两步建链（保留配对 + 解配对重试）各最多 12 秒，加上这里仍小于前端的
+    // 45 秒宽限 —— 否则前端已经判失败并 releaseStaleConnection，后面即使连上也白连。
     let info = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(15),
         create_device(
             core_handle,
             DeviceKind::Xiaomi,
@@ -249,8 +302,10 @@ pub(crate) async fn connect_inner(
         ),
     )
     .await
-    .map_err(|_| "认证握手超时（30 秒内设备未完成认证，请重试）".to_string())?
-    .map_err(|e| format!("创建设备失败: {e}"))?;
+    .map_err(|_| {
+        "已连上蓝牙，但手环 15 秒内没有完成认证。请在手环上重新进入「连接新手机」后重试".to_string()
+    })?
+    .map_err(|e| format!("已连上蓝牙但认证失败：{e}"))?;
     log::info!("[device_connect] corelib device ready, auth done");
     Ok(info)
 }
@@ -426,6 +481,56 @@ fn extract_install_watchface_bin(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// 从快应用 .rpk（zip）里的 manifest.json 读出包名。
+/// 设备安装快应用时「准备安装」请求必须带 package_name（corelib 的 ThirdPartyApp 分支
+/// 拿不到就直接拒绝），包名不对也一样装不上。
+fn rpk_package_name(data: &[u8]) -> Option<String> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data)).ok()?;
+    let mut nested = None;
+    let mut root = None;
+    for i in 0..archive.len().min(500) {
+        let Ok(mut file) = archive.by_index(i) else {
+            continue;
+        };
+        if file.size() > 1024 * 1024 {
+            continue;
+        }
+        let is_manifest = std::path::Path::new(file.name())
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("manifest.json"))
+            .unwrap_or(false);
+        if !is_manifest {
+            continue;
+        }
+        let at_root = file.name().eq_ignore_ascii_case("manifest.json");
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        // 导出工具偶尔带 BOM，serde_json 不认
+        let body = buf.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&buf);
+        let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(body) else {
+            continue;
+        };
+        let Some(pkg) = manifest
+            .get("package")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if at_root {
+            root = Some(pkg.to_string());
+            break;
+        }
+        nested.get_or_insert(pkg.to_string());
+    }
+    root.or(nested)
+}
+
 async fn resolve_watchface_id(addr: &str, file_data: &[u8]) -> Option<String> {
     let install_data =
         extract_install_watchface_bin(file_data).unwrap_or_else(|| file_data.to_vec());
@@ -465,8 +570,12 @@ pub(crate) async fn install_file_bytes_id(
     let _busy = crate::conn::busy_guard();
 
     // 内容级文件类型识别（zip 容器按扩展名/内容细分，与 app_wasm 一致）
+    // .rpk = 快应用：内容特征（toolkit / manifest-watch.json）不总命中，按扩展名兜底，
+    // 否则会落到「普通 zip」被 MassDataType 判成非法类型。
     let mut file_type = get_file_type(&file_data);
-    if file_type == FileType::Zip {
+    if ext.eq_ignore_ascii_case("rpk") {
+        file_type = FileType::ThirdPartyApp;
+    } else if file_type == FileType::Zip {
         if ext.eq_ignore_ascii_case("mwz") {
             file_type = FileType::WatchFace;
         } else if extract_install_watchface_bin(&file_data).is_some() {
@@ -475,6 +584,18 @@ pub(crate) async fn install_file_bytes_id(
     }
     log::info!("[install] detected type={file_type:?}");
     let data_type = MassDataType::try_from(file_type as u8).map_err(|e| e.to_string())?;
+    // 快应用必须带包名（从 manifest.json 的 package 读）；读不到就是这个包不完整
+    let package_name = if matches!(data_type, MassDataType::ThirdPartyApp) {
+        Some(
+            rpk_package_name(&file_data)
+                .ok_or_else(|| "快应用文件不完整（缺少包信息），请重新下载".to_string())?,
+        )
+    } else {
+        None
+    };
+    if let Some(pkg) = package_name.as_deref() {
+        log::info!("[install] quickapp package={pkg}");
+    }
     let watchface_id = if matches!(data_type, MassDataType::Watchface) {
         resolve_watchface_id(addr, &file_data).await
     } else {
@@ -518,11 +639,12 @@ pub(crate) async fn install_file_bytes_id(
 
     let addr_owned = addr.to_string();
     let wf_id_for_install = watchface_id.clone();
+    let pkg_for_install = package_name.clone();
     let install_future = with_device_system::<InstallSystem, _, _>(&addr_owned, move |sys| {
         sys.send_install_request_with_progress(
             data_type,
             file_data,
-            None,
+            pkg_for_install.as_deref(),
             progress_cb,
             wf_id_for_install.as_deref(),
         )
@@ -1526,4 +1648,50 @@ fn canvas_of(d: &[u8], h: &crate::watchface_bin::BinHeader) -> Option<(u32, u32)
         }
     }
     best
+}
+
+#[cfg(test)]
+mod rpk_tests {
+    use super::rpk_package_name;
+    use std::io::Write;
+
+    /// 造一个最小 rpk（zip）：entry_name 写入 manifest 内容
+    fn make_rpk(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::FileOptions::default();
+            for (name, body) in entries {
+                writer.start_file(*name, opts).unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn reads_package_from_root_manifest() {
+        let data = make_rpk(&[(
+            "manifest.json",
+            r#"{"package":"com.wristry.demo","versionName":"1.0","versionCode":1}"#,
+        )]);
+        assert_eq!(rpk_package_name(&data).as_deref(), Some("com.wristry.demo"));
+    }
+
+    #[test]
+    fn prefers_root_manifest_and_ignores_bom() {
+        let data = make_rpk(&[
+            ("assets/manifest.json", r#"{"package":"com.nested.app"}"#),
+            ("manifest.json", "\u{feff}{\"package\":\"com.root.app\"}"),
+        ]);
+        assert_eq!(rpk_package_name(&data).as_deref(), Some("com.root.app"));
+    }
+
+    #[test]
+    fn missing_package_yields_none() {
+        let data = make_rpk(&[("manifest.json", r#"{"name":"no-package"}"#)]);
+        assert_eq!(rpk_package_name(&data), None);
+        assert_eq!(rpk_package_name(b"not a zip"), None);
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "wf_installer"
-version = "0.3.32"
+version = "0.3.36"
 description = "小米 Vela 设备表盘安装工具（个人/私域使用）"
 edition = "2024"
 default-run = "wf_installer"
@@ -57,4 +57,8 @@ android_logger = "0.14"
 
 [profile.release]
 strip = true
-lto = false
+# 瘦身：跨 crate 内联 + 全局死代码消除 + 单 codegen unit（不降 opt-level，壁纸生成逐像素运算不能慢）
+lto = "fat"
+codegen-units = 1
+# 掉 unwind 表；移动端进程崩溃本来也是整进程退出，没有可捕获的恢复路径
+panic = "abort"

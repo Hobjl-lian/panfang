@@ -212,6 +212,29 @@ pub fn decrypt_file(cek: &[u8; 32], nonce: &[u8], cipher: &[u8]) -> Result<Vec<u
         .map_err(|_| anyhow!("文件解密失败"))
 }
 
+// ---------------------------------------------------------------- 小密钥（直接 KEK 封装）
+
+/// 加密一段小秘密（如第三方服务的 auth_token）：KEK 直接做 AES-256-GCM，
+/// 返回 (nonce, 密文)。与文件加密分开是因为小密钥不需要 CEK 那一层包裹。
+/// `aad` 用来把密文绑定到用途上：同一把 KEK 下不同用途的密文不能互换。
+pub fn seal_secret(kek: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let cipher = cipher_for(kek)?
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .map_err(|_| anyhow!("小密钥加密失败"))?;
+    Ok((nonce.to_vec(), cipher))
+}
+
+pub fn open_secret(kek: &[u8; 32], nonce: &[u8], cipher: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    if nonce.len() != 12 {
+        bail!("小密钥 nonce 长度错误");
+    }
+    cipher_for(kek)?
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: cipher, aad })
+        .map_err(|_| anyhow!("小密钥解密失败（KEK 不匹配或数据损坏）"))
+}
+
 // ---------------------------------------------------------------- 设备包裹（ECIES）
 
 pub struct KeyWrap {
@@ -350,5 +373,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cek2, cek.to_vec());
+    }
+
+    #[test]
+    fn secret_roundtrip_binds_to_aad() {
+        let kek = [5u8; 32];
+        let (nonce, cipher) = seal_secret(&kek, b"auth-token-abc", b"purpose-a").unwrap();
+        assert_eq!(
+            open_secret(&kek, &nonce, &cipher, b"purpose-a").unwrap(),
+            b"auth-token-abc"
+        );
+        // 换用途就必须解不开（防止同一把 KEK 下的密文被挪用到别处）
+        assert!(open_secret(&kek, &nonce, &cipher, b"purpose-b").is_err());
+        // 换一把 KEK 也解不开
+        assert!(open_secret(&[6u8; 32], &nonce, &cipher, b"purpose-a").is_err());
     }
 }

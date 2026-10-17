@@ -1070,6 +1070,7 @@ mod tests {
             admin_token: "t".into(),
             public_base: "http://test".into(),
             device_limit: 2,
+            device_stale_secs: 7 * 86400,
             token_ttl: 100,
         };
         bind_afdian(&state, "afdian-buyer-1", "mi-test-1").unwrap();
@@ -1141,6 +1142,7 @@ mod tests {
             admin_token: "t".into(),
             public_base: "http://test".into(),
             device_limit: 2,
+            device_stale_secs: 7 * 86400,
             token_ttl: 100,
         };
         let subj_of = |mi: &str| -> String {
