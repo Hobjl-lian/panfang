@@ -1016,33 +1016,27 @@ pub async fn app_latest(State(state): State<AppState>) -> ApiResult<Json<Value>>
 /// 只保留下载所需的最小信息：版本 + 微信/QQ 打开提示 + 三条下载相关问题。
 /// 安装步骤放在 App 内的「使用指引」里，页面不再重复。
 pub async fn get_page(State(state): State<AppState>) -> Response {
-    let row: Option<(String, i64, i64)> = {
+    let row: Option<(String, i64)> = {
         let conn = state.conn();
         conn.query_row(
-            "SELECT version_name, size, created_at
+            "SELECT version_name, size
              FROM app_releases WHERE is_current=1 ORDER BY id DESC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .unwrap_or(None)
     };
-    let (version, size, created) = row.unwrap_or_else(|| ("—".to_string(), 0, 0));
+    let (version, size) = row.unwrap_or_else(|| ("—".to_string(), 0));
     let size_mb = if size > 0 {
         // 与浏览器下载时显示的口径一致（十进制 MB），避免出现「24 MB 的包写成 23.1 MB」
         format!("{:.1}", size as f64 / 1_000_000.0)
     } else {
         "—".to_string()
     };
-    let updated = if created > 0 {
-        ymd_from_unix(created)
-    } else {
-        "—".to_string()
-    };
     let html = GET_PAGE_HTML
         .replace("{{VERSION}}", &escape_html(&version))
-        .replace("{{SIZE_MB}}", &size_mb)
-        .replace("{{UPDATED_AT}}", &updated);
+        .replace("{{SIZE_MB}}", &size_mb);
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -1066,23 +1060,6 @@ fn escape_html(input: &str) -> String {
         }
     }
     out
-}
-
-/// Unix 时间戳 → `YYYY-MM-DD`（按东八区）。服务端没有 chrono，这里用历法算法，
-/// 不值得为一个日期展示加一个依赖。
-fn ymd_from_unix(ts: i64) -> String {
-    let days = (ts + 8 * 3600).div_euclid(86_400);
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// 对外文件名只允许这些字符：它同时是 URL 段与库内查询键，不给路径穿越留缝。
@@ -1406,14 +1383,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn get_page_helpers_escape_and_format_date() {
+    fn get_page_helpers_escape_html() {
         assert_eq!(
             escape_html("<b>\"x\"&'y'</b>"),
             "&lt;b&gt;&quot;x&quot;&amp;&#39;y&#39;&lt;/b&gt;"
         );
-        // 1792202771 = 2026-10-17 10:06（东八区）
-        assert_eq!(ymd_from_unix(1_792_202_771), "2026-10-17");
-        assert_eq!(ymd_from_unix(951_782_400), "2000-02-29");
     }
 
     #[test]

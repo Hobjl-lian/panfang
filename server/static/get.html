@@ -15,35 +15,32 @@
   body{margin:0;background:var(--bg);color:var(--ink);
        font:16px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
        -webkit-font-smoothing:antialiased}
-  main{max-width:560px;margin:0 auto;padding:40px 24px 56px}
+  main{max-width:480px;margin:0 auto;padding:48px 24px 56px;text-align:center}
   h1{font-size:32px;line-height:1.25;letter-spacing:-.02em;margin:0 0 8px;font-weight:700}
-  .lead{color:var(--sub);font-size:15px;font-weight:500;margin:0}
-  .dl{display:flex;align-items:center;justify-content:space-between;gap:14px;
-      background:var(--blue);color:#fff;text-decoration:none;border-radius:999px;
-      padding:16px 24px;margin:28px 0 0;font-weight:700;font-size:17px}
+  .lead{color:var(--sub);font-size:15px;font-weight:500;margin:0 auto;max-width:320px}
+  .dl{display:block;background:var(--blue);color:#fff;text-decoration:none;
+      border-radius:24px;padding:18px 20px;margin:28px 0 0;text-align:center}
   .dl:hover{filter:brightness(1.05)}
-  .dl small{display:block;font-weight:500;font-size:12px;opacity:.8;margin-top:1px}
-  .dl .arrow{font-size:22px;line-height:1}
-  .tip{display:flex;align-items:flex-start;gap:12px;background:var(--warn-bg);
-       border:1px solid rgba(212,151,59,.18);border-radius:18px;
-       padding:14px 16px;margin:16px 0 0;font-size:14px;line-height:1.55;color:var(--ink)}
-  .tip b{font-weight:700}
-  .tip .mark{flex-shrink:0;width:20px;height:20px;border-radius:50%;
-             background:var(--warn);color:#fff;font-size:12px;font-weight:700;
-             display:flex;align-items:center;justify-content:center;margin-top:1px}
-  h2{font-size:17px;font-weight:700;margin:36px 0 12px}
+  .dl .main{display:block;font-size:17px;font-weight:700;line-height:1.3}
+  .dl small{display:block;font-size:12px;font-weight:500;opacity:.8;margin-top:3px}
+  .tip{background:var(--warn-bg);border:1px solid rgba(212,151,59,.18);
+       border-radius:18px;padding:14px 18px;margin:16px 0 0;
+       font-size:14px;line-height:1.6;color:var(--ink);text-align:center}
+  .tip b{display:block;font-weight:700;margin-bottom:2px}
+  h2{font-size:17px;font-weight:700;margin:36px 0 12px;text-align:center}
   .faq{background:var(--card);border-radius:24px;padding:4px 20px;
-       box-shadow:0 1px 3px rgba(0,0,0,.02)}
+       box-shadow:0 1px 3px rgba(0,0,0,.02);text-align:center}
   details{border-top:1px solid var(--line);padding:16px 0}
   details:first-of-type{border-top:0}
-  summary{cursor:pointer;font-weight:700;font-size:15px;line-height:1.5;list-style:none}
+  summary{cursor:pointer;font-weight:700;font-size:15px;line-height:1.5;
+          list-style:none;text-align:center}
   summary::-webkit-details-marker{display:none}
-  summary::after{content:"+";float:right;color:var(--sub);font-weight:400}
-  details[open] summary::after{content:"−"}
-  details p{margin:8px 0 2px;color:var(--sub);font-size:14px;line-height:1.65}
+  summary::after{content:" +";color:var(--sub);font-weight:400}
+  details[open] summary::after{content:" −"}
+  details p{margin:8px 0 2px;color:var(--sub);font-size:14px;line-height:1.65;text-align:center}
   a{color:var(--blue);text-decoration:none}
   a:hover{text-decoration:underline}
-  footer{margin-top:36px;color:var(--sub);font-size:13px;line-height:1.9}
+  footer{margin-top:36px;color:var(--sub);font-size:13px;line-height:1.9;text-align:center}
   footer .links{margin-bottom:6px}
 </style>
 </head>
@@ -53,15 +50,13 @@
   <p class="lead">在安卓手机上安装你已购买的小米手环 / 红米手表表盘。</p>
 
   <a class="dl" href="/app/latest.apk">
-    <span>下载安卓版
-      <small>v{{VERSION}} · {{SIZE_MB}} MB · 更新于 {{UPDATED_AT}}</small>
-    </span>
-    <span class="arrow">↓</span>
+    <span class="main">下载安卓版</span>
+    <small>v{{VERSION}} · {{SIZE_MB}} MB</small>
   </a>
 
   <div class="tip">
-    <span class="mark">!</span>
-    <span><b>在微信 / QQ 里打开本页？</b><br/>请点右上角「…」→「在浏览器打开」再下载，否则安装包会被拦截。</span>
+    <b>在微信 / QQ 里打开本页？</b>
+    请点右上角「…」→「在浏览器打开」再下载，否则安装包会被拦截。
   </div>
 
   <h2>常见问题</h2>
