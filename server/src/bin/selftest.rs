@@ -555,6 +555,22 @@ fn main() {
         band10.map(|v| v["latest_version"] == serde_json::json!("1.0.4")).unwrap_or(false),
         "每个设备行带最新版本号（手环10/11 → 1.0.4）",
     );
+    // 逐包指纹：App 精确判断「哪个包有更新」靠它（watchface_id + sha256_plain）
+    let pkgs = band10
+        .and_then(|v| v["packages"].as_array().cloned())
+        .unwrap_or_default();
+    ok(
+        pkgs.len() == 1
+            && pkgs[0]["watchface_id"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+            && pkgs[0]["sha256_plain"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+        "设备行带逐包指纹（watchface_id + sha256_plain）",
+    );
     let r = http.get("/v1/me", None);
     ok(r.status == 401, "无登录态拿不到列表（401）");
 

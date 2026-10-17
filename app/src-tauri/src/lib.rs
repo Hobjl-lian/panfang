@@ -99,6 +99,7 @@ pub fn run() {
             bridge::start_scan,
             bridge::stop_scan,
             bridge::device_connect,
+            bridge::device_ensure_bt_permissions,
             bridge::device_disconnect,
             bridge::device_get_data,
             bridge::device_link_state,

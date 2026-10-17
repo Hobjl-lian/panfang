@@ -12,6 +12,7 @@
 //!  - isRunning：服务在不在（查询用）
 //!  - openAppSettings：打开本应用的应用详情页（国产 ROM 的后台/电池设置入口）
 //!  - requestIgnoreBattery：尝试弹「不限制电池优化」系统对话框；弹不出来返回 false
+//!  - ensureBtPermissions：连接前把「附近的设备」权限（SCAN + CONNECT）要齐
 //!
 //! 桌面端：整套只在安卓上有意义 —— 插件在桌面构建里编译通过但不注册句柄。
 
@@ -83,6 +84,21 @@ impl<R: Runtime> ConnKeep<R> {
             .map_err(|e| e.to_string())
     }
 
+    /// 连接前确保「附近的设备」权限齐全（Android 12+）。
+    ///
+    /// 会一直等到用户对系统弹窗作出选择才返回 —— 调用方必须放在阻塞线程里（见 bridge）。
+    /// 返回 false = 用户拒绝或系统没给（上层据此给一句操作指引，不要继续建链）。
+    pub fn ensure_bt_permissions(&self) -> Result<bool, String> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            granted: bool,
+        }
+        self.handle
+            .run_mobile_plugin::<P>("ensureBtPermissions", ())
+            .map(|p| p.granted)
+            .map_err(|e| e.to_string())
+    }
+
     /// 打开本应用的「应用信息」系统页（电池 / 后台运行设置都在里面）。
     pub fn open_app_settings(&self) -> Result<(), String> {
         self.handle
@@ -117,6 +133,9 @@ impl<R: Runtime> ConnKeep<R> {
     }
     pub fn is_running(&self) -> Result<bool, String> {
         Ok(false)
+    }
+    pub fn ensure_bt_permissions(&self) -> Result<bool, String> {
+        Ok(true)
     }
     pub fn open_app_settings(&self) -> Result<(), String> {
         Err("连接保活仅安卓可用".into())

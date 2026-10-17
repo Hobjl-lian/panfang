@@ -116,6 +116,27 @@ pub async fn device_connect(
     Ok(info)
 }
 
+/// 连接前确保「附近的设备」权限齐全（Android 12+ 的 SCAN + CONNECT）。
+///
+/// 单独一条命令、在 device_connect 之前调：系统权限弹窗等待用户选择期间不计入
+/// 前端的 15 秒连接超时，用户慢慢点也不会被误判成「连接失败」。
+/// 桌面端没有这套权限，直接返回 true。
+#[tauri::command]
+pub async fn device_ensure_bt_permissions(app: tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        use connkeep::ConnKeepExt;
+        tauri::async_runtime::spawn_blocking(move || app.conn_keep().ensure_bt_permissions())
+            .await
+            .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(true)
+    }
+}
+
 /// 连接一个设备（**手动连接与自动重连共用这一条路径**）。
 /// stdimp 内部使用 tauri::async_runtime::block_on，必须在阻塞线程上调用。
 pub(crate) async fn connect_inner(

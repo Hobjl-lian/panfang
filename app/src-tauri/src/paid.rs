@@ -197,16 +197,119 @@ pub fn paid_dir(app_data_dir: &Path) -> PathBuf {
 /// 一次安装的账：某个设备行（variant）上次装到手环上的**是哪个版本**。
 /// `sha` = 那次装的包体内容指纹（与服务端 `/v1/me` 的 `latest_sha` 同算法），判「可更新」比它；
 /// `version` 只用于界面显示 —— 版本号是人工填的字符串，管理页「强制替换」可以不改版本号换内容。
+/// 安装时某个包的内容指纹。身份优先用**表盘 id**（跨版本稳定；重传/换包都不会变），
+/// 无 id（空或全零）的老包退回文件名。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct InstalledPackage {
+    #[serde(default)]
+    pub watchface_id: String,
+    #[serde(default)]
+    pub file_name: String,
+    /// 这个包在安装时的 `sha256_plain`
+    #[serde(default)]
+    pub sha: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InstallRecord {
     pub product_id: String,
     pub variant_id: String,
     pub version: String,
+    /// 整行内容指纹（全量包体聚合）。老 App/老记录用它；新逻辑优先用 `packages`。
     pub sha: String,
     /// 这次装上车机（手环）的表盘 id：管理页标「可更新」时按它对上
+    #[serde(default)]
     pub dials: Vec<String>,
+    /// 安装时**最新版全部包**的快照（不只是这次勾选安装的几个）：
+    /// 逐包判断「哪个包有更新」用。老记录没有这个字段 → 空，
+    /// `paid_list` 会尝试用本机留档还原；还原不到再退回整行 `sha` 比较。
+    #[serde(default)]
+    pub packages: Vec<InstalledPackage>,
     /// 安装时间（unix 秒）
     pub at: i64,
+}
+
+/// 包的身份键：有有效表盘 id 用 id，否则用文件名。
+fn package_key(watchface_id: Option<&str>, file_name: &str) -> String {
+    let wid = watchface_id.unwrap_or("").trim();
+    if wid.is_empty() || wid == "000000000000" {
+        format!("name:{file_name}")
+    } else {
+        format!("id:{wid}")
+    }
+}
+
+fn installed_package_key(p: &InstalledPackage) -> String {
+    package_key(Some(&p.watchface_id), &p.file_name)
+}
+
+/// 老安装记录没有逐包快照：用本机留档（安装成功时按表盘 id 各存一份）还原
+/// 「当时装进去的内容指纹」。找不到/解不开返回 None（这个包按「需要安装」处理，
+/// 宁可多传一次也不漏更新）。
+fn installed_sha_from_archive(
+    app_data_dir: &Path,
+    paid_dir: &Path,
+    watchface_id: &str,
+) -> Option<String> {
+    let wid = watchface_id.trim();
+    if wid.is_empty() || wid == "000000000000" {
+        return None;
+    }
+    let root = app_data_dir.join("watchface_archive");
+    // 同一块表盘可能装过两台设备（留档按 MAC 分目录）：取**最近一次**安装的那份
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for dev in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = dev.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.split('.').next() != Some(wid) {
+                continue;
+            }
+            let Ok(raw) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(plain) = open_archive(paid_dir, &raw) else {
+                continue;
+            };
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let sha = hex::encode(Sha256::digest(&plain));
+            if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                best = Some((mtime, sha));
+            }
+        }
+    }
+    best.map(|(_, sha)| sha)
+}
+
+/// 逐包比较：返回与 `latest` 一一对应的 `(needs_update, is_new)`。
+/// `installed` 为空时调用方应退回整行指纹比较（老记录且留档还原失败）。
+fn package_flags(latest: &[Value], installed: &[InstalledPackage]) -> Vec<(bool, bool)> {
+    latest
+        .iter()
+        .map(|p| {
+            let key = package_key(
+                p["watchface_id"].as_str(),
+                p["file_name"].as_str().unwrap_or(""),
+            );
+            let latest_sha = p["sha256_plain"].as_str().unwrap_or("");
+            match installed.iter().find(|x| installed_package_key(x) == key) {
+                Some(old) => (old.sha != latest_sha, false),
+                None => (true, true),
+            }
+        })
+        .collect()
 }
 
 fn installs_path(dir: &Path) -> PathBuf {
@@ -758,6 +861,12 @@ pub async fn paid_list(state: tauri::State<'_, AppState>) -> Result<Value, Strin
     let token = token.ok_or_else(|| "NOT_BOUND".to_string())?;
     let mut v = me(&base, &token).await.map_err(|e| e.to_string())?;
     let records = with_ctx(&state, |c| Ok(load_installs(&c.dir))).map_err(|e| e.to_string())?;
+    let paid_dir = dir_of(&state);
+    let app_data_dir = paid_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    let mut upgraded: Vec<InstallRecord> = Vec::new();
     if let Some(products) = v["products"].as_array_mut() {
         for p in products.iter_mut() {
             let pid = p["product_id"].as_str().unwrap_or("").to_string();
@@ -766,17 +875,99 @@ pub async fn paid_list(state: tauri::State<'_, AppState>) -> Result<Value, Strin
                 let vid = var["variant_id"].as_str().unwrap_or("").to_string();
                 let rec = records
                     .iter()
-                    .find(|r| r.product_id == pid && r.variant_id == vid);
+                    .find(|r| r.product_id == pid && r.variant_id == vid)
+                    .cloned();
+                // 服务端下发的逐包指纹（老服务端没有这个字段）
+                let latest_pkgs = var["packages"].as_array().cloned().unwrap_or_default();
                 let (installed, installed_version, has_update) = match rec {
                     None => (false, Value::Null, false),
-                    Some(r) => {
+                    Some(mut r) => {
                         let latest_sha = var["latest_sha"].as_str().unwrap_or("");
                         let latest_ver = var["latest_version"].as_str().unwrap_or("");
-                        // 优先比内容指纹（sha）；服务端没给 latest_sha 时退回比版本号
-                        let up = if !latest_sha.is_empty() && !r.sha.is_empty() {
-                            latest_sha != r.sha
+
+                        // 老记录没有逐包快照：先用本机留档还原「每个包当时装的内容」。
+                        // 这样升级 App 后第一次检查就能精确到包，不用把没变的包再传一遍。
+                        if r.packages.is_empty() && !latest_pkgs.is_empty() {
+                            let mut rebuilt = Vec::new();
+                            for lp in &latest_pkgs {
+                                let wid = lp["watchface_id"].as_str().unwrap_or("");
+                                let fname = lp["file_name"].as_str().unwrap_or("");
+                                if let Some(sha) =
+                                    installed_sha_from_archive(&app_data_dir, &paid_dir, wid)
+                                {
+                                    rebuilt.push(InstalledPackage {
+                                        watchface_id: wid.to_string(),
+                                        file_name: fname.to_string(),
+                                        sha,
+                                    });
+                                }
+                            }
+                            if !rebuilt.is_empty() {
+                                r.packages = rebuilt;
+                                upgraded.push(r.clone());
+                            }
+                        }
+
+                        // 老口径：整行内容指纹（或版本号）比较
+                        let fallback_up = || {
+                            if !latest_sha.is_empty() && !r.sha.is_empty() {
+                                latest_sha != r.sha
+                            } else {
+                                !latest_ver.is_empty() && latest_ver != r.version
+                            }
+                        };
+
+                        let up = if !latest_pkgs.is_empty() && !r.packages.is_empty() {
+                            // 精确到包：只有 sha 变了的包才需要更新；新包也算需要安装
+                            let flags = package_flags(&latest_pkgs, &r.packages);
+                            let has = flags.iter().any(|(needs, _)| *needs);
+                            let pkgs: Vec<Value> = latest_pkgs
+                                .iter()
+                                .zip(flags.iter())
+                                .map(|(lp, (needs, is_new))| {
+                                    json!({
+                                        "file_id": lp["file_id"],
+                                        "file_name": lp["file_name"],
+                                        "watchface_id": lp["watchface_id"],
+                                        "version": lp["version"],
+                                        "needs_update": needs,
+                                        "new": is_new,
+                                    })
+                                })
+                                .collect();
+                            var["packages"] = json!(pkgs);
+                            var["update_file_ids"] = json!(latest_pkgs
+                                .iter()
+                                .zip(flags.iter())
+                                .filter(|(_, (needs, _))| *needs)
+                                .map(|(lp, _)| lp["file_id"].clone())
+                                .collect::<Vec<_>>());
+                            has
+                        } else if !latest_pkgs.is_empty() {
+                            // 连一个包都没还原出来：退回整行指纹（老行为），所有包都算要更新
+                            let up = fallback_up();
+                            let pkgs: Vec<Value> = latest_pkgs
+                                .iter()
+                                .map(|lp| {
+                                    json!({
+                                        "file_id": lp["file_id"],
+                                        "file_name": lp["file_name"],
+                                        "watchface_id": lp["watchface_id"],
+                                        "version": lp["version"],
+                                        "needs_update": up,
+                                        "new": false,
+                                    })
+                                })
+                                .collect();
+                            var["packages"] = json!(pkgs);
+                            var["update_file_ids"] = json!(latest_pkgs
+                                .iter()
+                                .map(|lp| lp["file_id"].clone())
+                                .collect::<Vec<_>>());
+                            up
                         } else {
-                            !latest_ver.is_empty() && latest_ver != r.version
+                            // 服务端还是老版本（没有逐包信息）：维持整行比较
+                            fallback_up()
                         };
                         (true, json!(r.version), up)
                     }
@@ -786,6 +977,10 @@ pub async fn paid_list(state: tauri::State<'_, AppState>) -> Result<Value, Strin
                 var["has_update"] = json!(has_update);
             }
         }
+    }
+    // 老记录还原出的逐包快照写回一次（失败不影响本次判断）
+    for r in upgraded {
+        save_install(&paid_dir, r);
     }
     Ok(v)
 }
@@ -840,7 +1035,8 @@ pub async fn paid_latest_file(
 /// 表盘 id 是设备往返解析出来的，个别情况下解析不出来 —— 那种情况**安装本身已经成功**，
 /// 返回 `None` 让界面照常走成功页（不能反过来报「安装失败」骗用户重装）。
 /// `file_ids` = 只装选中的这些包（多包体「勾选安装」）；None = 全装。
-/// 记账的版本指纹始终按**全量包体**算（与服务端 latest_sha 同口径），勾选装一部分不影响「可更新」判断。
+/// 记账：整行 `sha` 仍按全量包体算（老逻辑兼容）；逐包快照只更新这次**真正装了的**包，
+/// 这次没勾的包保留上次指纹（下次仍会提示它有更新）。
 #[tauri::command]
 pub async fn paid_install(
     app: tauri::AppHandle,
@@ -983,12 +1179,63 @@ pub async fn paid_install(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // 上一次的逐包快照：这次没勾选的包要保留它原来的指纹（否则会被误记成「已最新」）
+    let prev = with_ctx(&state, |c| Ok(load_installs(&c.dir)))
+        .ok()
+        .and_then(|all| {
+            all.into_iter()
+                .find(|r| r.product_id == product_id && r.variant_id == variant_id)
+        });
+    let installed_ids: Vec<&str> = install_files
+        .iter()
+        .filter_map(|f| f["file_id"].as_str())
+        .collect();
+    let mut packages: Vec<InstalledPackage> = Vec::with_capacity(files.len());
+    for f in files.iter() {
+        let wid = f["watchface_id"].as_str().unwrap_or("");
+        let fname = f["file_name"].as_str().unwrap_or("");
+        let latest_sha = f["sha256_plain"].as_str().unwrap_or("");
+        let was_installed = installed_ids.contains(&f["file_id"].as_str().unwrap_or(""));
+        if was_installed {
+            packages.push(InstalledPackage {
+                watchface_id: wid.to_string(),
+                file_name: fname.to_string(),
+                sha: latest_sha.to_string(),
+            });
+            continue;
+        }
+        // 这次没装它：有上次记录就沿用上次指纹（仍会提示更新）；
+        // 上次也没有（新包）且这次没勾 → 不写进快照，下次仍当「新增」提示。
+        // 只有「首次安装 / 老记录还没还原」时退回老口径（记最新，不反复提示）。
+        match &prev {
+            Some(prev) if !prev.packages.is_empty() => {
+                let key = package_key(Some(wid), fname);
+                if let Some(old) = prev
+                    .packages
+                    .iter()
+                    .find(|p| installed_package_key(p) == key)
+                {
+                    packages.push(InstalledPackage {
+                        watchface_id: wid.to_string(),
+                        file_name: fname.to_string(),
+                        sha: old.sha.clone(),
+                    });
+                }
+            }
+            _ => packages.push(InstalledPackage {
+                watchface_id: wid.to_string(),
+                file_name: fname.to_string(),
+                sha: latest_sha.to_string(),
+            }),
+        }
+    }
     let rec = InstallRecord {
         product_id: product_id.clone(),
         variant_id: variant_id.clone(),
         version: version.clone(),
         sha: manifest_sha(&files),
         dials: dial_ids,
+        packages,
         at,
     };
     let _ = with_ctx(&state, |c| {
@@ -1031,5 +1278,47 @@ mod tests {
     fn url_encode_basic() {
         // RFC3986：'.' 属非保留字符，不转义；'@' 要转义
         assert_eq!(urlencode("a@b.c"), "a%40b.c");
+    }
+
+    #[test]
+    fn package_key_falls_back_to_name() {
+        assert_eq!(package_key(Some("123"), "x.bin"), "id:123");
+        assert_eq!(package_key(Some("000000000000"), "x.bin"), "name:x.bin");
+        assert_eq!(package_key(Some("  "), "x.bin"), "name:x.bin");
+    }
+
+    /// 只更新第二个包时，只有它标「需要更新」；没变的不标，新包标 new
+    #[test]
+    fn package_flags_is_per_package() {
+        let latest = vec![
+            json!({"watchface_id":"111","file_name":"a.bin","sha256_plain":"sha-a"}),
+            json!({"watchface_id":"222","file_name":"b.bin","sha256_plain":"sha-b2"}),
+            json!({"watchface_id":"333","file_name":"c.bin","sha256_plain":"sha-c"}),
+        ];
+        let installed = vec![
+            InstalledPackage {
+                watchface_id: "111".into(),
+                file_name: "a.bin".into(),
+                sha: "sha-a".into(),
+            },
+            InstalledPackage {
+                watchface_id: "222".into(),
+                file_name: "b.bin".into(),
+                sha: "sha-b1".into(),
+            },
+        ];
+        assert_eq!(
+            package_flags(&latest, &installed),
+            vec![(false, false), (true, false), (true, true)]
+        );
+    }
+
+    /// 老版本写的 installs.json 没有 packages 字段，必须还能读出来
+    #[test]
+    fn old_install_record_deserializes() {
+        let old = r#"{"product_id":"p","variant_id":"v","version":"1.0.0","sha":"abc","dials":["111"],"at":1}"#;
+        let rec: InstallRecord = serde_json::from_str(old).unwrap();
+        assert!(rec.packages.is_empty());
+        assert_eq!(rec.dials, vec!["111".to_string()]);
     }
 }

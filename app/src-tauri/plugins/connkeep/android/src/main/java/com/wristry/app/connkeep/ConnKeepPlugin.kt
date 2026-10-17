@@ -18,6 +18,7 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+import app.tauri.plugin.PluginManager
 
 @InvokeArg
 class StartArg {
@@ -84,6 +85,50 @@ class ConnKeepPlugin(private val activity: Activity) : Plugin(activity) {
         val ret = JSObject()
         ret.put("running", ConnKeepService.running)
         invoke.resolve(ret)
+    }
+
+    /**
+     * 连接前把「附近的设备」两个权限一起要齐（Android 12+）。
+     *
+     * 为什么不能只申请 BLUETOOTH_CONNECT：SPP 建链本身只要 CONNECT，但实测 vivo ROM
+     * 在 BLUETOOTH_SCAN 被拒时 SDP / RFCOMM 通道探测会直接失败 —— 上层只能看到
+     * 「未发现设备」，表现就是「哪个手环都连不上」。用户清数据 / 重装后权限被重置，
+     * 而插件里只有 connect 那条路会申请权限（只含 CONNECT），SCAN 永远不会被问到。
+     * 所以连接入口先调这个方法；已经齐了则不发弹窗。
+     */
+    @Command
+    fun ensureBtPermissions(invoke: Invoke) {
+        val missing = missingBtPermissions()
+        if (missing.isEmpty()) {
+            val ret = JSObject()
+            ret.put("granted", true)
+            invoke.resolve(ret)
+            return
+        }
+        val request = {
+            try {
+                PluginManager.requestPermissions(missing) { _ ->
+                    // 不看回调里的 map（不同 ROM 回报字段不一致），以系统当前的真实授权状态为准
+                    val ret = JSObject()
+                    ret.put("granted", missingBtPermissions().isEmpty())
+                    invoke.resolve(ret)
+                }
+            } catch (e: Exception) {
+                invoke.reject("BT_PERMISSION_FAILED", e.message ?: "无法申请蓝牙权限")
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) request() else activity.runOnUiThread(request)
+    }
+
+    /** Android 12 以下没有 BLUETOOTH_SCAN/CONNECT；那套系统上 SPP 连接不需要运行时权限。 */
+    private fun missingBtPermissions(): Array<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptyArray()
+        return listOf(
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT
+        ).filter {
+            ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
+        }.toTypedArray()
     }
 
     @Command

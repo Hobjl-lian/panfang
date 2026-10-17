@@ -136,7 +136,17 @@ const LEGAL_BASE = "https://api.hobjl-shop.top";
 const APP_BEIAN_NO = "粤ICP备2026135374号-2A";
 const BEIAN_URL = "https://beian.miit.gov.cn/";
 
-type FlowStep = "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "paid_account" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "crop_image" | "photo_generator";
+type FlowStep = "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "paid_account" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "crop_image" | "photo_generator" | "settings_account" | "settings_device";
+
+/** 逐包更新状态（服务端 packages + App 安装快照逐包比较后补上 needs_update/new） */
+interface PaidPackageStatus {
+  file_id: string;
+  file_name?: string;
+  watchface_id?: string | null;
+  version?: string | null;
+  needs_update?: boolean;
+  new?: boolean;
+}
 
 /** 付费资源（服务端 /v1/me 的返回，只含有包体的设备行） */
 interface PaidVariant {
@@ -145,8 +155,12 @@ interface PaidVariant {
   device_models: string[];
   screen: [number | null, number | null];
   latest_version: string | null;
-  /** 最新版本的**内容指纹**（服务端算的）；本机装过的话用它判有没有新版本 */
+  /** 最新版本的**整行内容指纹**（老口径；新逻辑优先用 packages 逐包比较） */
   latest_sha?: string | null;
+  /** 最新版每个包的指纹与逐包更新状态 */
+  packages?: PaidPackageStatus[];
+  /** 真正需要下载/安装的包（变化或新增）；更新时默认只勾这些 */
+  update_file_ids?: string[];
   /** 下面三个由 App 侧（paid_list 命令）按本机安装记录补上 */
   installed?: boolean;
   installed_version?: string | null;
@@ -158,10 +172,13 @@ interface PaidProduct {
   variants: PaidVariant[];
 }
 
-/** 一个版本里的包体（`paid_latest_file` 的 files 项；勾选安装只用到 file_id） */
+/** 一个版本里的包体（`paid_latest_file` 的 files 项；勾选安装用 file_id） */
 interface PaidFile {
   file_id: string;
+  file_name?: string;
   size?: number;
+  watchface_id?: string | null;
+  version?: string | null;
 }
 
 /** 本机安装记录（`paid_installs_get`）：某个设备行上次装的是哪个版本 + 装出来的表盘 id */
@@ -368,6 +385,9 @@ function parseRoute(route: string): { step: FlowStep; tab: TabKey } {
   if (route === "paid/dials") return { step: "paid_dials", tab: "home" };
   // 爱发电账号管理：二级页面，从设置进来（账号的日常管理只在这里，不在绑定流程里）
   if (route === "paid/account") return { step: "paid_account", tab: "settings" };
+  // 设置下的两个二级页（账号 / 设备与连接），都从设置页进来、返回设置页
+  if (route === "settings/account") return { step: "settings_account", tab: "settings" };
+  if (route === "settings/device") return { step: "settings_device", tab: "settings" };
   // 连接失败帮助页：三级页面（从设备抽屉进来），返回按层级回抽屉
   if (route === "connect-help") return { step: "connect_help", tab: "home" };
   // 4 步上手：新手引导页（首页卡片与设置里的「使用指引」都进这里）
@@ -395,6 +415,8 @@ const KNOWN_ROUTES = [
   "paid",
   "paid/dials",
   "paid/account",
+  "settings/account",
+  "settings/device",
   "connect-help",
   "guide",
   "dial-edit",
@@ -655,6 +677,8 @@ export default function App() {
   const LINK_HELP_FLAG = "panfang.linkHelpShown";
   /** 首页「第一次用？4 步上手」卡片：点开看过一次就不再出现（设置里仍可随时打开） */
   const ONBOARDING_FLAG = "panfang.onboardingSeen";
+  /** 编辑页「预览可能有差异」提示：点过「不再显示」就永久收起 */
+  const EDIT_PREVIEW_HINT_FLAG = "panfang.editPreviewHintHidden";
 
   // 连接竞态控制：每次点设备生成递增令牌，只有最新一次尝试能改界面（旧请求的成功/失败/超时一律忽略）
   const connectToken = useRef(0);
@@ -887,6 +911,10 @@ export default function App() {
     variant: PaidVariant;
     files: PaidFile[];
     picked: boolean[];
+    /** true = 更新（默认只勾变化的包，未变的标「已是最新」）；false = 全新安装 */
+    updateMode: boolean;
+    /** 与 files 一一对应：normal / update / new / latest */
+    status: ("normal" | "update" | "new" | "latest")[];
   } | null>(null);
   /** 点了安装、正在读包体列表的资源（按钮转「准备中…」；与 installBusyRef 一起挡连点） */
   const [installPreparing, setInstallPreparing] = useState<string | null>(null);
@@ -1066,10 +1094,16 @@ export default function App() {
   if (!navStack.current.length) navStack.current = boot.stack;
   /** 已压入浏览器历史的条目数（= 栈深 - 1） */
   const navDepth = useRef(0);
-  /** 应用内返回按钮自己同步历史时，要忽略的那几次 popstate */
-  const ignorePop = useRef(0);
+  /**
+   * 应用内返回 / 关浮窗自己同步历史时，要忽略的那几次 popstate（记登记时间 + 落点路由）。
+   * 用时间戳是因为 history.back() 在「历史已到底」时是同步空操作、**不会**产生 popstate：
+   * 只记次数的话那次永远等不到消费，会泄漏下去吞掉用户的下一次真返回（真机上的「必须重启才好」）。
+   */
+  const ignorePop = useRef<Array<{ at: number; route: string }>>([]);
   /** 重置页面栈时挂起的根路由：popstate 到达后把落点条目改写成它 */
   const pendingReset = useRef<string | null>(null);
+  /** 重置落点处理完之后还要再压在根页面上的那一层（例：装完直接进编辑页） */
+  const pendingPush = useRef<string | null>(null);
   /** 启动时把页面栈镜像进浏览器历史只做一次 */
   const bootNavDone = useRef(false);
 
@@ -1093,6 +1127,15 @@ export default function App() {
     } else {
       setIsDeviceDrawerOpen(false);
     }
+  };
+
+  /** 登记一次「应用自己触发的 popstate」，并记下它应该落到的页面（popstate 里凭这两条认领） */
+  const expectSelfPop = (route: string) => {
+    ignorePop.current = [...ignorePop.current, { at: Date.now(), route }];
+  };
+  /** 撤销登记（history.back() 同步抛错、根本不会有 popstate 时） */
+  const cancelSelfPop = () => {
+    ignorePop.current = ignorePop.current.slice(0, -1);
   };
 
   /**
@@ -1158,11 +1201,11 @@ export default function App() {
     setIsDeviceDrawerOpen(false);
     if (navDepth.current > 0) {
       navDepth.current -= 1;
-      ignorePop.current += 1;
+      expectSelfPop(currentRoute());
       try {
         window.history.back();
       } catch {
-        ignorePop.current -= 1;
+        cancelSelfPop();
       }
     }
     topIsOverlay.current = false;
@@ -1188,11 +1231,11 @@ export default function App() {
     if (navDepth.current > 0) {
       // 历史里确实还有一层：同步退回一格，并忽略它带来的这次 popstate
       navDepth.current -= 1;
-      ignorePop.current += 1;
+      expectSelfPop(currentRoute());
       try {
         window.history.back();
       } catch {
-        ignorePop.current -= 1;
+        cancelSelfPop();
       }
     }
   };
@@ -1200,27 +1243,50 @@ export default function App() {
   /**
    * 重置页面栈（登录成功 → 首页 / 退出登录 → 登录页）：目标页面成为新的根页面。
    * 栈底以上的浏览器历史条目一次性回退掉，再把落点条目改写成新根（popstate 里收尾）。
+   *
+   * `thenRoute` = 重置完成后再压在根页面上的那一层（例：安装成功页「去做壁纸」=
+   * 根换成管理页 + 上面一层编辑页）。**必须和重置一起做**：history.go() 是异步的，
+   * 外面如果紧跟一次 pushRoute 的 pushState，那条新条目会插进还没走完的回退里，
+   * 最终落在历史第一条 → canGoBack=false → 侧滑直接退出 App（真机 bug）。
    */
-  const resetStackTo = (route: string) => {
-    navStack.current = [route];
+  const resetStackTo = (route: string, thenRoute?: string) => {
+    navStack.current = thenRoute ? [route, thenRoute] : [route];
     const depth = navDepth.current;
     pendingReset.current = route;
+    pendingPush.current = thenRoute ?? null;
     navDepth.current = 0;
+    topIsOverlay.current = false; // 落点是真页面，不是浮窗层
     if (depth > 0) {
       try {
         window.history.go(-depth);
       } catch {
+        // 没有 history 环境：退不了就当场改写成新根（宁可多一层历史，也别丢页面）
         pendingReset.current = null;
+        pendingPush.current = null;
+        try {
+          window.history.replaceState({ panfang: true, route }, "", `#${route}`);
+          if (thenRoute) {
+            window.history.pushState({ panfang: true, route: thenRoute }, "", `#${thenRoute}`);
+            navDepth.current = 1;
+          }
+        } catch {
+          /* 忽略 */
+        }
       }
     } else {
       pendingReset.current = null;
+      pendingPush.current = null;
       try {
         window.history.replaceState({ panfang: true, route }, "", `#${route}`);
+        if (thenRoute) {
+          window.history.pushState({ panfang: true, route: thenRoute }, "", `#${thenRoute}`);
+          navDepth.current = 1;
+        }
       } catch {
         /* 忽略 */
       }
     }
-    applyRoute(route);
+    applyRoute(thenRoute ?? route);
   };
 
   // —— 真实链路（Tauri）会话态：浏览器里没有 window.__TAURI__ 时全程退回演示数据 ——
@@ -1289,6 +1355,12 @@ export default function App() {
    * （2026-10-07 真机上出现过一次「假表盘」：重启恢复页面栈时跳过了留档载入）。
    */
   const [dialSessionState, setDialSessionState] = useState<"idle" | "loading" | "ready" | "failed">("idle");
+
+  /** 编辑页预览差异提示：「不再显示」永久收起（本地记住）；单次关闭只关这一次进入 */
+  const [editPreviewHintHidden, setEditPreviewHintHidden] = useState(() =>
+    readStoredFlag(EDIT_PREVIEW_HINT_FLAG, false)
+  );
+  const [editPreviewHintClosed, setEditPreviewHintClosed] = useState(false);
 
   const [openSection, setOpenSection] = useState<AccordionSection>(null);
 
@@ -1363,16 +1435,12 @@ export default function App() {
   const canvasFrame = frameSizeFor(canvasScreen, 134, 174);
   /** 裁剪视图/蒙版：同一套比例（设计稿的裁剪框 208×248 作为尺寸上限） */
   const cropFrame = frameSizeFor(canvasScreen, 208, 248);
-  /** 表盘与当前设备规格不一致时给出告警（画布标识行变黄） */
+  /** 表盘与当前设备规格不一致时给出告警 */
   const canvasSpecMismatch =
     dialScreens.dial && dialScreens.device &&
     (dialScreens.dial.width !== dialScreens.device.width || dialScreens.dial.height !== dialScreens.device.height)
       ? { dial: dialScreens.dial, device: dialScreens.device }
       : null;
-  /** 设备标识行：`{设备名} · {宽}×{高}`（设备名未知时只留尺寸） */
-  const canvasLabel = [connected.current.name, `${canvasScreen.width}×${canvasScreen.height}`]
-    .filter(Boolean)
-    .join(" · ");
   /** 演示/无渲染图时，设计稿那层 mock 内容按 208×248 基准等比缩放进设备框 */
   const mockScale = Math.min(canvasFrame.w / 208, canvasFrame.h / 248);
   // 裁剪预览的绘制参数（异步回调里读它，始终是最新值）
@@ -2115,7 +2183,7 @@ export default function App() {
     }
   }, [currentStep, activeTab, isDeviceConnected]);
   useEffect(() => {
-    const onPop = () => {
+    const onPop = (event: PopStateEvent) => {
       // 安装中锁死返回键：把历史退回本页（一步也走不了），并告诉用户原因
       if (installLockRef.current) {
         showToast("安装中，请勿退出", "error");
@@ -2137,9 +2205,17 @@ export default function App() {
         navDepth.current += 1;
         return;
       }
-      if (ignorePop.current > 0) {
-        ignorePop.current -= 1; // 应用内返回按钮自己同步历史的那一次
-        return;
+      if (ignorePop.current.length) {
+        const expected = ignorePop.current[ignorePop.current.length - 1];
+        const target = (event.state as { route?: string } | null)?.route ?? null;
+        // 只有「刚登记过、且落点就是应用内返回要去的那一页」才认作自己触发的那一次；
+        // 落点对不上 / 登记太旧（history.back() 在历史到底时是空操作，不会有 popstate）
+        // 说明这是一次真实的系统返回，不能吞。
+        if (Date.now() - expected.at < 1000 && (target == null || target === expected.route)) {
+          ignorePop.current = ignorePop.current.slice(0, -1);
+          return;
+        }
+        ignorePop.current = [];
       }
       // 设备浮窗那一层：**只关浮窗，页面保持不变**（停在本页）
       if (topIsOverlay.current) {
@@ -2150,10 +2226,19 @@ export default function App() {
       }
       if (pendingReset.current) {
         const r = pendingReset.current;
+        const next = pendingPush.current;
         pendingReset.current = null;
-        // 重置页面栈的落点条目 = 新的根页面
+        pendingPush.current = null;
+        // 重置页面栈的落点条目 = 新的根页面；有 pendingPush 就在它上面再压一层
+        // （两步都在这里收尾，避免和异步回退抢历史条目）
         try {
           window.history.replaceState({ panfang: true, route: r }, "", `#${r}`);
+          if (next) {
+            window.history.pushState({ panfang: true, route: next }, "", `#${next}`);
+            navDepth.current = 1;
+          } else {
+            navDepth.current = 0;
+          }
         } catch {
           /* 忽略 */
         }
@@ -2732,37 +2817,60 @@ export default function App() {
 
     // 15 秒没回音 → **先给引导**（不放弃尝试）：手环慢的时候 20 秒也能连上，
     // 所以后台继续试到宽限期（CONNECT_GRACE_MS）才真正判失败。
-    connectTimer.current = window.setTimeout(() => {
-      if (!isLive()) return;
-      hideSpinner();
-      console.warn("[device_connect] 15 秒未返回：先给引导，后台继续尝试");
-      diagReport("connect", "timeout15s", "连接 15 秒未返回（后台继续试到 45 秒）");
-      setConnectError(CONNECT_HINT);
-      setFailedDevice(device);
-      showToast("连接未完成，请在手环上进入「连接新手机」后重试", "error");
-      connectFailStreak.current += 1;
-      if (connectFailStreak.current >= 3) {
-        connectFailStreak.current = 0;
-        setShowConnectHelpPrompt(true);
-      }
+    // 注意：真实连接要等系统权限弹窗，弹窗期间不能计时（用户慢慢点会被误判超时），
+    // 所以计时器由下面各自的分支在「真正开始建链」时启动。
+    const beginConnectTimers = () => {
       connectTimer.current = window.setTimeout(() => {
-        if (!settle()) return;
-        console.warn("[device_connect] 宽限期结束，判定失败");
-        void releaseStaleConnection(addr);
-        setIsDeviceConnected(false);
-        setLinkRetrying(false); // 这次连接已经判失败：别留着「重连中…」（那个是掉线自动重连的态）
-        reportedLoss.current = false;
-        // 同上：该地址的会话在尝试开头就被清掉了，失败 = 真没了 → 心跳别再去探它
-        if (connected.current.addr === addr) {
-          connected.current = { addr: null, model: null, name: null };
+        if (!isLive()) return;
+        hideSpinner();
+        console.warn("[device_connect] 15 秒未返回：先给引导，后台继续尝试");
+        diagReport("connect", "timeout15s", "连接 15 秒未返回（后台继续试到 45 秒）");
+        setConnectError(CONNECT_HINT);
+        setFailedDevice(device);
+        showToast("连接未完成，请在手环上进入「连接新手机」后重试", "error");
+        connectFailStreak.current += 1;
+        if (connectFailStreak.current >= 3) {
+          connectFailStreak.current = 0;
+          setShowConnectHelpPrompt(true);
         }
-      }, CONNECT_GRACE_MS - CONNECT_TIMEOUT_MS);
-    }, CONNECT_TIMEOUT_MS);
+        connectTimer.current = window.setTimeout(() => {
+          if (!settle()) return;
+          console.warn("[device_connect] 宽限期结束，判定失败");
+          void releaseStaleConnection(addr);
+          setIsDeviceConnected(false);
+          setLinkRetrying(false); // 这次连接已经判失败：别留着「重连中…」（那个是掉线自动重连的态）
+          reportedLoss.current = false;
+          // 同上：该地址的会话在尝试开头就被清掉了，失败 = 真没了 → 心跳别再去探它
+          if (connected.current.addr === addr) {
+            connected.current = { addr: null, model: null, name: null };
+          }
+        }, CONNECT_GRACE_MS - CONNECT_TIMEOUT_MS);
+      }, CONNECT_TIMEOUT_MS);
+    };
 
     // —— 真实连接（App 内）：device_connect（云端设备自带 mac / authkey）——
     if (invoke) {
       void (async () => {
         try {
+          // 先把「附近的设备」权限（SCAN + CONNECT）要齐再建链：Android 12+ 只授权
+          // CONNECT 时，部分 ROM（实测 vivo）SDP/RFCOMM 通道探测会直接失败，
+          // 上层只能看到「未发现设备」——表现就是清数据/重装后哪个手环都连不上。
+          let btAllowed = true;
+          try {
+            btAllowed = (await invoke("device_ensure_bt_permissions")) as boolean;
+          } catch (permErr) {
+            console.warn("[device_connect] 蓝牙权限申请失败，继续尝试连接", permErr);
+          }
+          if (!isLive()) return; // 等弹窗期间又点了别的设备 / 已断开
+          if (!btAllowed) {
+            if (!settle()) return;
+            hideSpinner();
+            setConnectError("请在系统设置中允许「附近的设备」权限后重试");
+            setFailedDevice(device);
+            showToast("需要「附近的设备」权限才能连接手环", "error");
+            return;
+          }
+          beginConnectTimers();
           const info = (await invoke("device_connect", {
             name: cloud?.name || device.name,
             addr,
@@ -2815,12 +2923,18 @@ export default function App() {
     }
 
     // —— 浏览器演示：延时后视为连接成功（同样受令牌保护：连点两台以最后一次为准）——
+    beginConnectTimers();
     setTimeout(() => {
       finishSwitch();
     }, 700);
   };
 
-  const handleOpenDialEdit = (dial: InstalledDial) => {
+  /**
+   * 打开编辑页。`fromRoot` = 从别处重置过来时的根页面（安装成功页「去做壁纸」用）：
+   * 这时整段栈要换成「根页面 → 编辑页」，必须由 resetStackTo 一次做完，
+   * 不能 resetStackTo 之后再 pushRoute（异步回退和同步 pushState 会打架）。
+   */
+  const handleOpenDialEdit = (dial: InstalledDial, fromRoot?: string) => {
     // F：只支持编辑本 APP 装过的表盘（设备上的表盘无法回读，没有留档就没有可编辑的图层模型）
     if (invoke && !archivedIds.current[dial.id]) {
       showToast("仅支持编辑通过本 APP 安装的表盘", "error");
@@ -2835,6 +2949,8 @@ export default function App() {
     setSelectedColorName(LARGE_COLORS[0].name);
     setContainers(DEMO_CONTAINERS);
     setOpenSection(null);
+    // 每次进入编辑页都重新给一次预览差异提示（永久收起过的除外）
+    setEditPreviewHintClosed(false);
     setCurrentWallpaperIndex(0);
     setIsApplying(false);
     setAppliedSuccess(false);
@@ -2847,7 +2963,8 @@ export default function App() {
       setWallpapers([]);
       wallpaperMeta.current = [];
     }
-    pushRoute("dial-edit"); // 进编辑页 = 压一层页面栈
+    if (fromRoot) resetStackTo(fromRoot, "dial-edit");
+    else pushRoute("dial-edit"); // 进编辑页 = 压一层页面栈
     void loadDialSession(dial);
   };
 
@@ -3308,17 +3425,27 @@ export default function App() {
 
   /**
    * 「设备上的表盘」里属于**有新版本的已购资源**的那些：表盘 id → 该资源与设备行。
-   * 数据来源 = 本机安装记录（表盘 id）+ 已购列表的 has_update（服务端指纹与本机记录比出来的）。
-   * 点这个标记会直接更新（复用安装通道，连接/型号的防呆都在 runPaidInstall 里）。
+   * 数据来源 = 本机安装记录（表盘 id）+ 已购列表的**逐包** has_update。
+   * 只标真正变化的那个表盘（以前是整行可更新 → 一条链接的两个包都会被标）。
    */
   const paidUpdateDials = (() => {
     const map = new Map<string, { product: PaidProduct; variant: PaidVariant }>();
     for (const p of paidProducts) {
       for (const v of p.variants) {
         if (!v.has_update) continue;
+        // 需要更新的包的表盘 id；老服务端没有逐包信息时只能整行标
+        const needIds = new Set(
+          (v.packages ?? [])
+            .filter(pkg => pkg.needs_update)
+            .map(pkg => (pkg.watchface_id ?? "").trim())
+            .filter(Boolean)
+        );
+        const precise = needIds.size > 0;
         for (const r of paidInstalls) {
           if (r.product_id !== p.product_id || r.variant_id !== v.variant_id) continue;
-          for (const id of r.dials) map.set(id, { product: p, variant: v });
+          for (const id of r.dials) {
+            if (!precise || needIds.has(id)) map.set(id, { product: p, variant: v });
+          }
         }
       }
     }
@@ -3336,7 +3463,11 @@ export default function App() {
     return { variant: p.variants[0] ?? null, screenKnown: false };
   };
 
-  /** 点安装：先读该版本的包体列表 —— 多包体先弹「选择要安装的表盘」勾选（表盘1..N，默认全选），单包体直接装 */
+  /**
+   * 点安装/更新：先读该版本的包体列表。
+   * 更新时按逐包指纹只默认勾选真正变化的包（单包变化直接装、不弹框）；
+   * 全新安装仍是多包体弹「选择要安装的表盘」（默认全选）。
+   */
   const runPaidInstall = (product: PaidProduct, variant: PaidVariant) => {
     const inv = invoke;
     if (!inv) return;
@@ -3363,12 +3494,58 @@ export default function App() {
         })) as { files?: PaidFile[] } | null;
         const files = (info?.files ?? []).filter((f): f is PaidFile => !!f && !!f.file_id);
         if (files.length === 0) throw new Error("该设备暂无可用包体");
-        if (files.length === 1) {
-          startPaidInstall(product, variant, null);
+
+        const updateIds = new Set(variant.update_file_ids ?? []);
+        const updateMode = !!variant.has_update && updateIds.size > 0;
+        if (!updateMode) {
+          if (files.length === 1) {
+            startPaidInstall(product, variant, null);
+            return;
+          }
+          // 全新安装：多包体弹勾选列表（默认全选）
+          setInstallPicker({
+            product,
+            variant,
+            files,
+            picked: files.map(() => true),
+            updateMode: false,
+            status: files.map(() => "normal")
+          });
           return;
         }
-        // 多包体：弹勾选列表（默认全选），确认后才进安装页（installBusyRef 到确认/取消才放开）
-        setInstallPicker({ product, variant, files, picked: files.map(() => true) });
+
+        // 更新：只勾真正变化的包；没变的默认不勾（仍可手动勾选重装）
+        const picked = files.map(f => updateIds.has(f.file_id));
+        const needCount = picked.filter(Boolean).length;
+        if (needCount === 0) {
+          // 列表里的 file_id 与最新清单对不上（刚刷新过）→ 让后台重新核对
+          installBusyRef.current = false;
+          showToast("已是最新版本");
+          void refreshPaidProductsBg();
+          return;
+        }
+        // 只更新一个包：直接装，不弹选择框（不碰没变的那个包）
+        if (needCount === 1) {
+          const only = files.find((_, i) => picked[i]);
+          if (only) {
+            startPaidInstall(product, variant, [only.file_id]);
+            return;
+          }
+        }
+        const pkgByFile = new Map((variant.packages ?? []).map(p => [p.file_id, p]));
+        setInstallPicker({
+          product,
+          variant,
+          files,
+          picked,
+          updateMode: true,
+          status: files.map(f => {
+            const p = pkgByFile.get(f.file_id);
+            if (!p) return "normal";
+            if (p.new) return "new";
+            return p.needs_update ? "update" : "latest";
+          })
+        });
       } catch (err) {
         installBusyRef.current = false;
         showToast(humanize(err, "install_paid"), "error");
@@ -3378,14 +3555,15 @@ export default function App() {
     })();
   };
 
-  /** 勾选浮层：点一行切换勾选；「全选」= 全勾↔全不勾（部分勾选时显示横杠） */
+  /** 勾选浮层：点一行切换勾选；「全选」在更新模式下只全选可更新的包（没变的不动） */
   const toggleInstallPick = (idx: number) =>
     setInstallPicker(p => (p ? { ...p, picked: p.picked.map((on, i) => (i === idx ? !on : on)) } : p));
   const toggleInstallPickAll = () =>
     setInstallPicker(p => {
       if (!p) return p;
-      const allOn = p.picked.every(Boolean);
-      return { ...p, picked: p.picked.map(() => !allOn) };
+      const selectable = p.files.map((_, i) => !p.updateMode || p.status[i] !== "latest");
+      const allOn = p.files.every((_, i) => !selectable[i] || p.picked[i]);
+      return { ...p, picked: p.picked.map((on, i) => (selectable[i] ? !allOn : on)) };
     });
   const cancelInstallPicker = () => {
     setInstallPicker(null);
@@ -3445,15 +3623,18 @@ export default function App() {
           }
         }
         await refreshDials(addr);
-        // 刚才装的就是这个设备行的最新版 → 就地清掉「可更新」标记（角标立刻消失），
-        // 再后台向服务端核对一次（App 侧记的指纹与服务端 latest_sha 必须一致）
+        // 装完后：只有把「需要更新/新增」的包都装了才清掉可更新标记；
+        // 用户手动取消某个包时保留角标，后台再按逐包指纹核对一次
+        const stillPending = (variant.update_file_ids ?? []).filter(
+          id => !!fileIds && !fileIds.includes(id)
+        );
         setPaidProducts(prev => prev.map(pp => pp.product_id !== product.product_id ? pp : {
           ...pp,
           variants: pp.variants.map(vv => vv.variant_id !== variant.variant_id ? vv : {
             ...vv,
             installed: true,
             installed_version: variant.latest_version ?? vv.installed_version ?? null,
-            has_update: false
+            has_update: stillPending.length > 0
           })
         }));
         void refreshPaidProductsBg();
@@ -3698,8 +3879,7 @@ export default function App() {
       showToast("点开刚装的表盘，就能做壁纸");
       return;
     }
-    resetStackTo("main/manage");
-    handleOpenDialEdit(dial);
+    handleOpenDialEdit(dial, "main/manage");
     showToast("在这儿做壁纸：选好照片直接套好相框");
   };
 
@@ -4495,7 +4675,7 @@ export default function App() {
                   盘坊
                 </h1>
                 <p className="text-[17px] font-medium text-black/45 mt-2">
-                  为你的手环装上喜欢的表盘
+                  登录小米账号以连接手环
                 </p>
               </div>
 
@@ -4586,7 +4766,11 @@ export default function App() {
                 )}
               </form>
 
-              <div className="text-center space-y-1.5">
+              <div className="text-center space-y-2">
+                {/* 首次登录的疑虑打消：备案 + 账号用途/数据去向，就放在登录按钮正下方 */}
+                <p className="text-[12px] font-medium text-black/40 leading-relaxed px-1">
+                  本应用已通过工信部 App 备案。小米账号仅用于获取手环连接信息，这些信息只保存在本机。
+                </p>
                 {/* 取得同意的落点：登录前必须能看到协议与政策（也放进「关于应用」页） */}
                 <p className="text-[12px] font-medium text-black/35 leading-relaxed">
                   登录即表示同意
@@ -4606,9 +4790,21 @@ export default function App() {
                     《隐私政策》
                   </button>
                 </p>
-                <span className="text-[13px] font-medium text-black/40">
-                  小米账号安全登录
-                </span>
+                <div className="flex flex-col items-center gap-1.5">
+                  <a
+                    href={BEIAN_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => {
+                      openLink(e, BEIAN_URL);
+                      showToast("正在打开工信部备案系统…");
+                    }}
+                    className="inline-flex items-center gap-1 text-[12px] font-medium text-black/35 hover:text-[#4361EE] transition-colors cursor-pointer"
+                  >
+                    <span>{APP_BEIAN_NO}</span>
+                    <ArrowSquareOut className="w-3 h-3 stroke-[2]" />
+                  </a>
+                </div>
               </div>
             </div>
           )}
@@ -5167,6 +5363,30 @@ export default function App() {
                       </h1>
                     </div>
 
+                    {/* 使用指引（4 步上手）：置顶，买家第一眼就能看到（用户 2026-10-17 要求） */}
+                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
+                      <button
+                        type="button"
+                        onClick={openOnboardingGuide}
+                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                      >
+                        <div className="flex items-center gap-3.5 min-w-0">
+                          <div className="w-10 h-10 rounded-xl bg-[#4361EE] text-white flex items-center justify-center shrink-0">
+                            <Scroll className="w-5 h-5 stroke-[2]" />
+                          </div>
+                          <div className="min-w-0">
+                            <h4 className="text-[16px] font-bold text-black leading-tight">
+                              使用指引
+                            </h4>
+                            <p className="text-[13px] font-medium text-black/40 mt-0.5">
+                              4 步把已购表盘装上手环
+                            </p>
+                          </div>
+                        </div>
+                        <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/45 transition-colors" />
+                      </button>
+                    </div>
+
                     {/* 功能设置组 */}
                     <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-black/5">
                       {/* 1. 本地表盘安装开关：52×30 · 开 #34C759 · 关 black/10 */}
@@ -5232,138 +5452,28 @@ export default function App() {
                       )}
                     </div>
 
-                    {/* 账号与设备组 */}
-                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-black/5">
-                      {/* 重新登录小米账号 */}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          resetStackTo("login"); // 重新登录：登录页成为根页面
-                          showToast("请登录您的小米账号", "error");
-                        }}
-                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
-                      >
-                        <div>
-                          <h4 className="text-[16px] font-bold text-black leading-tight">
-                            重新登录小米账号
-                          </h4>
-                          <p className="text-[13px] font-medium text-black/40 mt-1">
-                            已登录：{userProfile.nickname}
-                          </p>
-                        </div>
-                        <CaretRight className="w-5 h-5 text-black/25 stroke-[2]" />
-                      </button>
-
-                      {/* 重新导入设备 */}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          // 与设备抽屉里的「重新导入设备列表」同一口径：清掉「已移除」名单 + 重新拉全
-                          clearHiddenDevices();
-                          if (invoke) {
-                            void (async () => {
-                              try {
-                                const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
-                                applyCloudDevices(devices);
-                              } catch (err) {
-                                console.error("[xiaomi_restore] 重新导入失败：", err);
-                                showToast("重新导入失败，请稍后重试", "error");
-                              }
-                            })();
-                          } else {
-                            setMockDevicesList(MOCK_DEVICES);
-                          }
-                          pushRoute("devices");
-                          showToast("已刷新手环列表");
-                        }}
-                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
-                      >
-                        <div>
-                          <h4 className="text-[16px] font-bold text-black leading-tight">
-                            重新导入手环设备
-                          </h4>
-                          <p className="text-[13px] font-medium text-black/40 mt-1">
-                            当前连接：{selectedDevice.name}
-                          </p>
-                        </div>
-                        <CaretRight className="w-5 h-5 text-black/25 stroke-[2]" />
-                      </button>
-                    </div>
-
-                    {/* 后台保活：连接期间有前台服务（常驻一条静默通知）；被 ROM 省电策略冻死会断连 */}
+                    {/* 账号：二级页（爱发电账号 / 小米账号 / 退出登录） */}
                     <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
                       <button
                         type="button"
-                        onClick={() => {
-                          if (!invoke) {
-                            showToast("浏览器预览里没有系统设置", "error");
-                            return;
-                          }
-                          // 后端按「最能帮到用户的一步」走并回报做了什么（already/dialog/settings/failed）——
-                          // 每次点都必须有可见反馈，否则「点了没反应」会被当成坏了（2026-10-10 用户反馈）
-                          void invoke("device_open_battery_settings")
-                            .then((r: { result?: string } | null) => {
-                              switch (r?.result) {
-                                case "already":
-                                  showToast("盘坊已被系统允许后台运行");
-                                  break;
-                                case "dialog":
-                                  showToast("请在系统弹窗里选择「允许」");
-                                  break;
-                                case "settings":
-                                  showToast("请在「电池」里把盘坊设为不受限制");
-                                  break;
-                                default:
-                                  showToast("请到 系统设置 → 应用 → 盘坊 → 电池 里允许后台运行", "error");
-                              }
-                            })
-                            .catch(() => {
-                              showToast("请在系统设置里允许盘坊后台运行", "error");
-                            });
-                        }}
-                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
-                      >
-                        <div className="pr-3">
-                          <h4 className="text-[16px] font-bold text-black leading-tight">
-                            后台保持连接
-                          </h4>
-                          <p className="text-[13px] font-medium text-black/40 mt-1">
-                            打开系统的电池设置，允许盘坊在后台运行
-                          </p>
-                        </div>
-                        <CaretRight className="w-5 h-5 text-black/25 stroke-[2]" />
-                      </button>
-                    </div>
-
-                    {/* 爱发电账号（已购资源）：账号管理只在这里，不在绑定流程里 */}
-                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (paidBound) {
-                            pushRoute("paid/account");
-                            return;
-                          }
-                          goPaidBindPage();
-                        }}
+                        onClick={() => pushRoute("settings/account")}
                         className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
                       >
                         <div className="flex items-center gap-3.5 min-w-0">
-                          {/* 爱发电 brand 图标（用户在 Figma 里画的：紫底 + 白色 logo）；
-                              圆角裁在资源里（clipPath rx=300/1000 = 30%，与 rounded-xl 在 40px 上的比例一致） */}
-                          <img
-                            src={afdianIcon}
-                            alt=""
-                            className="w-10 h-10 shrink-0 rounded-xl"
-                          />
+                          <div className="w-10 h-10 rounded-xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center shrink-0">
+                            <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <circle cx="12" cy="8" r="4" />
+                              <path d="M4 21a8 8 0 0 1 16 0" />
+                            </svg>
+                          </div>
                           <div className="min-w-0">
                             <h4 className="text-[16px] font-bold text-black leading-tight">
-                              爱发电账号
+                              账号
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5 truncate">
                               {paidBound
-                                ? `已绑定${paidDisplay ? ` · 尾号 ${paidDisplay}` : ""}`
-                                : "未绑定 · 绑定后同步已购表盘"}
+                                ? `${userProfile.nickname} · 爱发电已绑定`
+                                : "爱发电未绑定 · 点此绑定"}
                             </p>
                           </div>
                         </div>
@@ -5371,23 +5481,27 @@ export default function App() {
                       </button>
                     </div>
 
-                    {/* 使用指引（4 步上手） */}
+                    {/* 设备与连接：二级页（当前设备 / 重新导入 / 后台保持连接） */}
                     <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
                       <button
                         type="button"
-                        onClick={openOnboardingGuide}
+                        onClick={() => pushRoute("settings/device")}
                         className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
                       >
                         <div className="flex items-center gap-3.5 min-w-0">
                           <div className="w-10 h-10 rounded-xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center shrink-0">
-                            <Scroll className="w-5 h-5 stroke-[2]" />
+                            <Watch className="w-5 h-5 stroke-[2]" />
                           </div>
                           <div className="min-w-0">
                             <h4 className="text-[16px] font-bold text-black leading-tight">
-                              使用指引
+                              设备与连接
                             </h4>
-                            <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              4 步把已购表盘装上手环
+                            <p className="text-[13px] font-medium text-black/40 mt-0.5 truncate">
+                              {isDeviceConnected
+                                ? `已连接：${selectedDevice.name}`
+                                : linkRetrying
+                                  ? `重连中：${selectedDevice.name}`
+                                  : "未连接 · 点此查看设备"}
                             </p>
                           </div>
                         </div>
@@ -5411,7 +5525,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.26"} · 开源许可与开发者
+                              盘坊 v{appVersion ?? "0.3.32"} · 开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -5419,27 +5533,12 @@ export default function App() {
                       </button>
                     </div>
 
-                    {/* 危险操作组 */}
-                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setShowLogoutConfirm(true);
-                        }}
-                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
-                      >
-                        <span className="text-[16px] font-bold text-[#FF3B30]">
-                          退出登录
-                        </span>
-                        <SignOut className="w-5 h-5 text-[#FF3B30] stroke-[2]" />
-                      </button>
-                    </div>
                   </div>
 
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 · 版本 {appVersion ?? "0.3.26"}
+                      盘坊 · 版本 {appVersion ?? "0.3.32"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -5457,6 +5556,221 @@ export default function App() {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {/* 3.4 设置 › 账号（二级页）：爱发电账号 / 小米账号 / 退出登录 */}
+          {currentStep === "settings_account" && (
+            <div className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
+              <div>
+                <button
+                  type="button"
+                  onClick={() => goBackOr("main/settings")}
+                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
+                >
+                  <CaretLeft className="w-6 h-6 stroke-[2]" />
+                </button>
+
+                <div className="px-1 pt-6 pb-7">
+                  <h1 className="text-[32px] font-bold text-black tracking-tight leading-none">
+                    账号
+                  </h1>
+                </div>
+
+                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-black/5">
+                  {/* 爱发电账号（已购资源）：账号管理只在这里，不在绑定流程里 */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (paidBound) {
+                        pushRoute("paid/account");
+                        return;
+                      }
+                      goPaidBindPage();
+                    }}
+                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-3.5 min-w-0">
+                      {/* 爱发电 brand 图标（Figma 里画的真商标：紫底 + 白色 logo） */}
+                      <img
+                        src={afdianIcon}
+                        alt=""
+                        className="w-10 h-10 shrink-0 rounded-xl"
+                      />
+                      <div className="min-w-0">
+                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                          爱发电账号
+                        </h4>
+                        <p className="text-[13px] font-medium text-black/40 mt-0.5 truncate">
+                          {paidBound
+                            ? `已绑定${paidDisplay ? ` · 尾号 ${paidDisplay}` : ""}`
+                            : "未绑定 · 绑定后同步已购表盘"}
+                        </p>
+                      </div>
+                    </div>
+                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/45 transition-colors" />
+                  </button>
+
+                  {/* 重新登录小米账号 */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      resetStackTo("login"); // 重新登录：登录页成为根页面
+                      showToast("请登录您的小米账号", "error");
+                    }}
+                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                  >
+                    <div className="min-w-0">
+                      <h4 className="text-[16px] font-bold text-black leading-tight">
+                        重新登录小米账号
+                      </h4>
+                      <p className="text-[13px] font-medium text-black/40 mt-1 truncate">
+                        已登录：{userProfile.nickname}
+                      </p>
+                    </div>
+                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                  </button>
+                </div>
+
+                {/* 退出登录：只保留在设置体系内（抽屉里不放），并保留二次确认 */}
+                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowLogoutConfirm(true);
+                    }}
+                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                  >
+                    <span className="text-[16px] font-bold text-[#FF3B30]">
+                      退出登录
+                    </span>
+                    <SignOut className="w-5 h-5 text-[#FF3B30] stroke-[2]" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 3.45 设置 › 设备与连接（二级页）：当前设备 / 重新导入 / 后台保持连接 */}
+          {currentStep === "settings_device" && (
+            <div className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
+              <div>
+                <button
+                  type="button"
+                  onClick={() => goBackOr("main/settings")}
+                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
+                >
+                  <CaretLeft className="w-6 h-6 stroke-[2]" />
+                </button>
+
+                <div className="px-1 pt-6 pb-7">
+                  <h1 className="text-[32px] font-bold text-black tracking-tight leading-none">
+                    设备与连接
+                  </h1>
+                </div>
+
+                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-black/5">
+                  {/* 当前设备：点按打开设备浮窗（全局覆盖层，返回只关浮窗） */}
+                  <button
+                    type="button"
+                    onClick={openDeviceDrawer}
+                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                  >
+                    <div className="min-w-0">
+                      <h4 className="text-[16px] font-bold text-black leading-tight">
+                        当前设备
+                      </h4>
+                      <p className="text-[13px] font-medium text-black/40 mt-1 truncate">
+                        {isDeviceConnected
+                          ? `已连接：${selectedDevice.name}`
+                          : linkRetrying
+                            ? `重连中：${selectedDevice.name}`
+                            : "未连接 · 点此打开设备列表"}
+                      </p>
+                    </div>
+                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                  </button>
+
+                  {/* 重新导入设备：与设备抽屉里的「重新导入设备列表」同一口径 */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      clearHiddenDevices();
+                      if (invoke) {
+                        void (async () => {
+                          try {
+                            const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
+                            applyCloudDevices(devices);
+                            openDeviceDrawer();
+                            showToast("已重新导入手环设备");
+                          } catch (err) {
+                            console.error("[xiaomi_restore] 重新导入失败：", err);
+                            showToast("重新导入失败，请稍后重试", "error");
+                          }
+                        })();
+                        return;
+                      }
+                      setMockDevicesList(MOCK_DEVICES);
+                      openDeviceDrawer();
+                      showToast("已重新导入手环设备");
+                    }}
+                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                  >
+                    <div className="pr-3">
+                      <h4 className="text-[16px] font-bold text-black leading-tight">
+                        重新导入手环设备
+                      </h4>
+                      <p className="text-[13px] font-medium text-black/40 mt-1">
+                        从小米账号重新拉取设备列表
+                      </p>
+                    </div>
+                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                  </button>
+
+                  {/* 后台保活：连接期间有前台服务（常驻一条静默通知）；被 ROM 省电策略冻死会断连 */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!invoke) {
+                        showToast("浏览器预览里没有系统设置", "error");
+                        return;
+                      }
+                      // 后端按「最能帮到用户的一步」走并回报做了什么（already/dialog/settings/failed）——
+                      // 每次点都必须有可见反馈，否则「点了没反应」会被当成坏了（2026-10-10 用户反馈）
+                      void invoke("device_open_battery_settings")
+                        .then((r: { result?: string } | null) => {
+                          switch (r?.result) {
+                            case "already":
+                              showToast("盘坊已被系统允许后台运行");
+                              break;
+                            case "dialog":
+                              showToast("请在系统弹窗里选择「允许」");
+                              break;
+                            case "settings":
+                              showToast("请在「电池」里把盘坊设为不受限制");
+                              break;
+                            default:
+                              showToast("请到 系统设置 → 应用 → 盘坊 → 电池 里允许后台运行", "error");
+                          }
+                        })
+                        .catch(() => {
+                          showToast("请在系统设置里允许盘坊后台运行", "error");
+                        });
+                    }}
+                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                  >
+                    <div className="pr-3">
+                      <h4 className="text-[16px] font-bold text-black leading-tight">
+                        后台保持连接
+                      </h4>
+                      <p className="text-[13px] font-medium text-black/40 mt-1">
+                        打开系统的电池设置，允许盘坊在后台运行
+                      </p>
+                    </div>
+                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
@@ -6217,7 +6531,7 @@ export default function App() {
             <div className="flex-1 flex flex-col bg-[#F5F6F9] overflow-hidden page-enter-anim relative">
               
               {/* 顶栏返回 */}
-              <div className="px-6 safe-top pb-2 flex items-center justify-between shrink-0 z-20">
+              <div className="px-6 safe-top pb-2 flex items-center justify-between shrink-0 z-20 relative">
                 <button
                   type="button"
                   onClick={() => goBackOr("main/manage")}
@@ -6231,6 +6545,43 @@ export default function App() {
                 </span>
 
                 <div className="w-11 h-11" />
+
+                {/* 预览差异提示：悬浮在标题下方（解包渲染的元素位置可能和手环实际显示不同）。
+                    × = 本次关掉；「不再显示」= 永久收起（本地记住）。 */}
+                {!editPreviewHintHidden && !editPreviewHintClosed && (
+                  <div className="absolute left-6 right-6 top-full mt-1.5 z-30 rounded-2xl bg-white border border-black/5 shadow-[0_6px_20px_rgba(0,0,0,0.08)] px-4 py-3">
+                    <div className="flex items-start gap-2.5 pr-6">
+                      <Info className="w-4 h-4 shrink-0 text-[#4361EE] mt-[2px]" />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[13px] font-bold text-black leading-[18px]">
+                          手机预览可能有差异
+                        </div>
+                        <div className="text-[12px] font-medium text-black/40 leading-[18px] mt-0.5">
+                          个别元素可能错位，装到手环上就正常了。
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditPreviewHintHidden(true);
+                            setEditPreviewHintClosed(true);
+                            storeFlag(EDIT_PREVIEW_HINT_FLAG, true);
+                          }}
+                          className="-ml-1 mt-0.5 h-6 px-1 text-[12px] font-semibold text-[#4361EE] cursor-pointer active:opacity-60 transition-opacity"
+                        >
+                          不再显示
+                        </button>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      aria-label="关闭提示"
+                      onClick={() => setEditPreviewHintClosed(true)}
+                      className="absolute right-2 top-2 w-7 h-7 rounded-full flex items-center justify-center text-black/25 hover:bg-black/5 active:scale-90 transition-all cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5 stroke-[2]" />
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* 顶部固定：画布 + 设备行 —— 在滚动容器外面，卡片怎么滚都不会叠到画布上 */}
@@ -6352,16 +6703,7 @@ export default function App() {
 
                   </div>
 
-                  {/* 设备标识行（设计稿没有，按 §5.2 补）：{设备名} · {宽}×{高} */}
-                  <div
-                    className={`pt-1.5 text-center text-[12px] font-medium ${
-                      canvasSpecMismatch ? "text-[#D4973B]" : "text-black/40"
-                    }`}
-                  >
-                    {canvasLabel}
-                  </div>
-
-                  {/* 表盘与当前设备规格不一致：该行变黄并给告警文案 */}
+                  {/* 表盘与当前设备规格不一致时才给告警（正常情况不占位置） */}
                   {canvasSpecMismatch && (
                     <div className="text-center text-[12px] font-medium text-[#D4973B] mt-1">
                       {`该表盘为 ${canvasSpecMismatch.dial.width}×${canvasSpecMismatch.dial.height}，与当前设备 ${canvasSpecMismatch.device.width}×${canvasSpecMismatch.device.height} 不一致`}
@@ -6378,20 +6720,9 @@ export default function App() {
                   {editingDial.isPhotoDial && (
                     <div className="bg-white rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex flex-col gap-2.5">
                       <div className="flex items-center justify-between">
-                        <div>
-                          <span className="text-[16px] font-bold text-black tracking-tight">
-                            {genPlan?.config ? "制作壁纸" : "上传壁纸"}
-                          </span>
-                          {genPlan?.config && (
-                            <div className="text-[11px] font-medium text-black/40 mt-0.5">
-                              {genPlan.config.photos.length > 1
-                                ? "选两张照片，自动套好相框"
-                                : (genPlan.config.frame?.colors?.length
-                                    ? "选一张照片，自动套好相框"
-                                    : "选一张照片，直接铺满表盘")}
-                            </div>
-                          )}
-                        </div>
+                        <span className="text-[16px] font-bold text-black tracking-tight">
+                          {genPlan?.config ? "制作壁纸" : "上传壁纸"}
+                        </span>
 
                         {/* 上传新增入口 */}
                         <button
@@ -7070,7 +7401,8 @@ export default function App() {
                   {colors.length > 1 && (
                     <div className="flex items-center gap-2">
                       <span className="text-[12px] font-medium text-black/45 w-[62px] shrink-0">相框</span>
-                      <div className="flex items-center gap-2 overflow-x-auto no-scrollbar py-0.5">
+                      {/* 留出环与选中放大的空间：滚动容器会裁剪超出内边距的部分，之前 py-0.5 把球顶/球底切掉了 */}
+                      <div className="flex items-center gap-2 overflow-x-auto no-scrollbar px-1 py-1">
                         {colors.map(col => {
                           const on = (genColor ?? colors[0].i) === col.i;
                           return (
@@ -7227,7 +7559,7 @@ export default function App() {
                     盘坊
                   </h2>
                   <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.26"}
+                    v{appVersion ?? "0.3.32"}
                   </span>
                 </div>
 
@@ -7271,7 +7603,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.26"}`}
+                            : `当前版本 v${appVersion ?? "0.3.32"}`}
                         </p>
                       </div>
                     </div>
@@ -7342,7 +7674,7 @@ export default function App() {
                           隐私政策
                         </h4>
                         <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                          收集什么、存在哪里、保留多久
+                          数据怎么处理
                         </p>
                       </div>
                     </div>
@@ -7367,7 +7699,7 @@ export default function App() {
                           用户协议
                         </h4>
                         <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                          授权范围、付费与内容使用说明
+                          付费与使用规则
                         </p>
                       </div>
                     </div>
@@ -8169,8 +8501,16 @@ export default function App() {
         {/* 多包体安装：勾选要装哪些（表盘1..N = 安装顺序；默认全选，支持全选） */}
         {installPicker && (() => {
           const pickedCount = installPicker.picked.filter(Boolean).length;
-          const allOn = pickedCount === installPicker.files.length;
-          const someOn = pickedCount > 0 && !allOn;
+          // 更新模式：没变的包不参与「全选」，默认也不勾（仍可手动勾选重装）
+          const selectable = installPicker.files.map(
+            (_, i) => !installPicker.updateMode || installPicker.status[i] !== "latest"
+          );
+          const selectableCount = selectable.filter(Boolean).length;
+          const checkedSelectable = installPicker.picked.filter(
+            (on, i) => selectable[i] && on
+          ).length;
+          const allOn = selectableCount > 0 && checkedSelectable === selectableCount;
+          const someOn = checkedSelectable > 0 && !allOn;
           return (
             <div
               className="absolute inset-0 z-[80] bg-black/40 flex items-center justify-center p-6 animate-in fade-in duration-200"
@@ -8182,10 +8522,12 @@ export default function App() {
               >
                 <div className="pt-6 px-6 pb-3 text-center">
                   <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
-                    选择要安装的表盘
+                    {installPicker.updateMode ? "选择要更新的表盘" : "选择要安装的表盘"}
                   </h3>
                   <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
-                    默认全部安装，可以只勾选需要的
+                    {installPicker.updateMode
+                      ? "默认只选有更新的包；没变的包可以不装"
+                      : "默认全部安装，可以只勾选需要的"}
                   </p>
                 </div>
 
@@ -8206,28 +8548,59 @@ export default function App() {
                         <span className="w-2.5 h-[2px] bg-white rounded-full" />
                       ) : null}
                     </span>
-                    <span className="text-[15px] font-bold text-black">全选</span>
+                    <span className="text-[15px] font-bold text-black">
+                      {installPicker.updateMode ? "全选可更新" : "全选"}
+                    </span>
                   </button>
                   <div className="h-px bg-black/5 mx-4" />
-                  {installPicker.files.map((f, i) => (
-                    <button
-                      key={f.file_id}
-                      type="button"
-                      onClick={() => toggleInstallPick(i)}
-                      className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl active:bg-black/5 transition-colors cursor-pointer"
-                    >
-                      <span
-                        className={`w-[22px] h-[22px] rounded-[7px] flex items-center justify-center shrink-0 border-2 ${
-                          installPicker.picked[i] ? "bg-[#4361EE] border-[#4361EE]" : "bg-white border-black/20"
-                        }`}
+                  {installPicker.files.map((f, i) => {
+                    const st = installPicker.status[i] ?? "normal";
+                    return (
+                      <button
+                        key={f.file_id}
+                        type="button"
+                        onClick={() => toggleInstallPick(i)}
+                        className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl active:bg-black/5 transition-colors cursor-pointer"
                       >
-                        {installPicker.picked[i] && (
-                          <Check className="w-3.5 h-3.5 text-white stroke-[3]" />
-                        )}
-                      </span>
-                      <span className="text-[15px] font-medium text-black">表盘{i + 1}</span>
-                    </button>
-                  ))}
+                        <span
+                          className={`w-[22px] h-[22px] rounded-[7px] flex items-center justify-center shrink-0 border-2 ${
+                            installPicker.picked[i] ? "bg-[#4361EE] border-[#4361EE]" : "bg-white border-black/20"
+                          }`}
+                        >
+                          {installPicker.picked[i] && (
+                            <Check className="w-3.5 h-3.5 text-white stroke-[3]" />
+                          )}
+                        </span>
+                        <span className="flex-1 min-w-0 text-left">
+                          <span
+                            className={`block text-[15px] font-medium ${
+                              st === "latest" ? "text-black/45" : "text-black"
+                            }`}
+                          >
+                            表盘{i + 1}
+                            {f.version && (
+                              <span className="ml-1.5 text-[12px] font-medium text-black/35">
+                                v{f.version}
+                              </span>
+                            )}
+                          </span>
+                          {installPicker.updateMode && st !== "normal" && (
+                            <span
+                              className={`block text-[12px] font-medium mt-0.5 ${
+                                st === "latest"
+                                  ? "text-black/35"
+                                  : st === "new"
+                                    ? "text-[#4361EE]"
+                                    : "text-[#D4973B]"
+                              }`}
+                            >
+                              {st === "latest" ? "已是最新" : st === "new" ? "新增包体" : "有更新"}
+                            </span>
+                          )}
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
 
                 <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
@@ -8248,7 +8621,11 @@ export default function App() {
                         : "text-[#4361EE] active:bg-[#4361EE]/10 cursor-pointer"
                     }`}
                   >
-                    开始安装
+                    {installPicker.updateMode
+                      ? pickedCount > 1
+                        ? `更新 ${pickedCount} 个包`
+                        : "更新这个包"
+                      : "开始安装"}
                   </button>
                 </div>
               </div>

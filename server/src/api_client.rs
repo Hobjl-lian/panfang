@@ -102,21 +102,48 @@ fn subject_products(state: &AppState, subject_id: &str) -> ApiResult<Vec<Value>>
 
         let mut variants: Vec<Value> = Vec::new();
         for (vid, vname, models, sw, sh, latest_ver) in rows {
-            // 最新版本的**内容指纹**：按文件顺序（sort_order, id）把各包 sha256_plain 连起来再 sha256。
-            // App 用它判「可更新」——版本号是人工填的字符串，管理页「强制替换」可以在不改版本号的情况下换内容。
-            let shas: Vec<String> = {
+            // 最新版本的每个包：App 据此精确判断「哪个包有更新」。
+            // `latest_sha` 仍保留（老 App 按整行指纹判断），新 App 按 packages 逐包比较。
+            let pkgs: Vec<(String, String, Option<String>, Option<String>, String, i64)> = {
                 let mut sstmt = conn.prepare(
-                    "SELECT f.sha256_plain FROM files f JOIN versions x ON f.version_id=x.id
-                      WHERE x.variant_id=?1 AND x.is_latest=1 ORDER BY f.sort_order, f.id",
+                    "SELECT f.id, f.file_name, f.watchface_id, f.bin_version,
+                            f.sha256_plain, f.size
+                     FROM files f JOIN versions x ON f.version_id=x.id
+                     WHERE x.variant_id=?1 AND x.is_latest=1
+                     ORDER BY f.sort_order, f.id",
                 )?;
-                let it = sstmt.query_map([&vid], |r| r.get::<_, String>(0))?;
+                let it = sstmt.query_map([&vid], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?;
                 it.filter_map(|r| r.ok()).collect()
             };
+            // 整行内容指纹 = 按文件顺序把各包 sha256_plain 连起来再 sha256（老 App 用）
+            let shas: Vec<&str> = pkgs.iter().map(|p| p.4.as_str()).collect();
             let latest_sha = if shas.is_empty() {
                 Value::Null
             } else {
                 json!(crate::crypto::sha256_hex(shas.join("|").as_bytes()))
             };
+            let packages: Vec<Value> = pkgs
+                .iter()
+                .map(|(file_id, file_name, wfid, bin_ver, sha, size)| {
+                    json!({
+                        "file_id": file_id,
+                        "file_name": file_name,
+                        "watchface_id": wfid,
+                        "version": bin_ver.clone().or_else(|| latest_ver.clone()),
+                        "sha256_plain": sha,
+                        "size": size,
+                    })
+                })
+                .collect();
             variants.push(json!({
                 "variant_id": vid,
                 "name": vname,
@@ -124,6 +151,8 @@ fn subject_products(state: &AppState, subject_id: &str) -> ApiResult<Vec<Value>>
                 "screen": [sw, sh],
                 "latest_version": latest_ver,
                 "latest_sha": latest_sha,
+                // 逐包指纹：App 用「已装快照」按表盘 id 对每个包分别判断有没有更新
+                "packages": packages,
             }));
         }
         out.push(json!({
@@ -434,6 +463,28 @@ pub struct OauthPoll {
     pub state: String,
 }
 
+/// 登录令牌在 `tokens` 表里的真实过期时间。
+///
+/// `afdian_oauth.expires_at` 是授权会话（15 分钟）的过期时间，**不能**当令牌有效期；
+/// 查不到令牌时退回 `fallback`（正常不会发生，只做兜底）。
+fn license_token_expires_at(
+    conn: &rusqlite::Connection,
+    token: &str,
+    fallback: i64,
+) -> ApiResult<i64> {
+    if token.is_empty() {
+        return Ok(fallback);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT expires_at FROM tokens WHERE token_hash=?1",
+            [crate::crypto::token_hash(token)],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(fallback))
+}
+
 /// GET /v1/afdian/oauth/poll?state=… —— App 轮询：pending / ok（带登录态）/ error
 pub async fn afdian_oauth_poll(
     State(state): State<AppState>,
@@ -459,14 +510,25 @@ pub async fn afdian_oauth_poll(
     match status.as_str() {
         "ok" => {
             let uid = afdian_uid.unwrap_or_default();
+            let license_token = token.unwrap_or_default();
+            // ⚠️ afdian_oauth.expires_at 是「这次授权会话」的 15 分钟有效期，
+            // 不是登录令牌的有效期。App 会把这里返回的 expires_at 原样存进
+            // session.enc 当作令牌过期时间 —— 返回授权会话时间会让用户在 15 分钟后
+            // 被判成「未绑定」（2026-10-17 真机报障）。这里必须返回 tokens 表的真实值。
+            let license_expires_at = {
+                let conn = state.conn();
+                license_token_expires_at(&conn, &license_token, expires_at)?
+            };
             Ok(Json(json!({
                 "status": "ok",
                 "bound": true,
                 "afdian_user_id": uid,
                 "display": display_of(&uid),
                 "mi_user_id": mi_uid,
-                "license_token": token.unwrap_or_default(),
-                "expires_at": expires_at,
+                "license_token": license_token,
+                "expires_at": license_expires_at,
+                // 授权会话本身的过期时间（排障用；App 不读）
+                "oauth_expires_at": expires_at,
             })))
         }
         "error" => Ok(Json(json!({
@@ -698,8 +760,8 @@ pub async fn manifest(
         let vid = v["id"].as_i64().unwrap_or(0);
         let mut fstmt = conn.prepare(
             // 一个版本可以有多个包（同一设备因内存限制拆成两个独立表盘）：按 sort_order 定序，App 依次安装
-            "SELECT id, file_name, size, sha256_plain, sha256_cipher FROM files
-             WHERE version_id=?1 ORDER BY sort_order, id",
+            "SELECT id, file_name, size, sha256_plain, sha256_cipher, watchface_id, bin_version
+             FROM files WHERE version_id=?1 ORDER BY sort_order, id",
         )?;
         let files: Vec<Value> = fstmt
             .query_map([vid], |r| {
@@ -709,6 +771,9 @@ pub async fn manifest(
                     "size": r.get::<_, i64>(2)?,
                     "sha256_plain": r.get::<_, String>(3)?,
                     "sha256_cipher": r.get::<_, String>(4)?,
+                    // 逐包更新判断用：App 拿它跟本机安装快照按表盘 id 对齐
+                    "watchface_id": r.get::<_, Option<String>>(5)?,
+                    "version": r.get::<_, Option<String>>(6)?,
                 }))
             })?
             .filter_map(|r| r.ok())
@@ -1406,5 +1471,30 @@ mod tests {
             "订单 202610070148365297524823631 还没绑定账号"
         );
         assert_eq!(scrub_secretish("蓝牙未开启，请先打开蓝牙"), "蓝牙未开启，请先打开蓝牙");
+    }
+
+    #[test]
+    fn oauth_poll_returns_token_expiry_not_oauth_window() {
+        // 回归（2026-10-17）：App 把 poll 返回的 expires_at 当作令牌过期时间存盘。
+        // 曾经这里返回 afdian_oauth 的 15 分钟授权窗口，导致绑定 15 分钟后被判成「未绑定」。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE tokens(token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);")
+            .unwrap();
+        let tok = "SB2o_1ZhbiGnqaBpeTg2uxmhLHt-cwc2RNxVl1Q_lUU";
+        let token_expiry = 1_792_210_026i64; // 令牌自己的有效期
+        conn.execute(
+            "INSERT INTO tokens(token_hash, expires_at) VALUES(?1, ?2)",
+            rusqlite::params![crate::crypto::token_hash(tok), token_expiry],
+        )
+        .unwrap();
+
+        // 查得到 → 必须返回令牌有效期，而不是传入的 15 分钟授权窗口
+        assert_eq!(
+            license_token_expires_at(&conn, tok, 111).unwrap(),
+            token_expiry
+        );
+        // 查不到 / 空令牌 → 兜底（正常不会走到）
+        assert_eq!(license_token_expires_at(&conn, "unknown", 111).unwrap(), 111);
+        assert_eq!(license_token_expires_at(&conn, "", 111).unwrap(), 111);
     }
 }
