@@ -1,0 +1,380 @@
+diff --git a/android/build.gradle.kts b/android/build.gradle.kts
+index 78863af..118e87f 100644
+--- a/android/build.gradle.kts
++++ b/android/build.gradle.kts
+@@ -35,6 +35,8 @@ android {
+ 
+ dependencies {
+     implementation(project(":tauri-android"))
++    // OnBackPressedCallback / AppCompatActivity：Tauri 侧是 implementation 依赖，不透传，自己声明
++    implementation("androidx.appcompat:appcompat:1.6.0")
+     implementation("androidx.core:core-ktx:1.17.0")
+     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+ }
+diff --git a/android/src/main/java/moe/astralsight/astrobox/plugin/inappbrowser/InappbrowserPlugin.kt b/android/src/main/java/moe/astralsight/astrobox/plugin/inappbrowser/InappbrowserPlugin.kt
+index 5218713..74144b4 100644
+--- a/android/src/main/java/moe/astralsight/astrobox/plugin/inappbrowser/InappbrowserPlugin.kt
++++ b/android/src/main/java/moe/astralsight/astrobox/plugin/inappbrowser/InappbrowserPlugin.kt
+@@ -1,6 +1,10 @@
+ package moe.astralsight.astrobox.plugin.inappbrowser
+ 
+ import android.app.Activity
++import android.webkit.WebView
++import androidx.activity.OnBackPressedCallback
++import androidx.appcompat.app.AppCompatActivity
++import androidx.core.view.WindowCompat
+ import app.tauri.annotation.Command
+ import app.tauri.annotation.InvokeArg
+ import app.tauri.annotation.TauriPlugin
+@@ -22,6 +26,45 @@ class OpenControlledArgs {
+     lateinit var onEvent: Channel
+ }
+ 
++@InvokeArg
++class SetSystemBarsArgs {
++    /// true = 深色图标（浅色背景页）；false = 白色图标（深色背景页，如裁剪页）
++    var light: Boolean = true
++}
++
++@InvokeArg
++class SetBackLockArgs {
++    /// true = 安装进行中：系统返回与侧滑手势都被吞掉（App 退不出去）
++    var locked: Boolean = false
++}
++
++/// 返回键锁开关（宿主 App 装表盘期间置 true）。
++/// 插件里的 OnBackPressedCallback 是第一道闸；宿主的 MainActivity 也读这个开关做兜底
++/// （Tauri 的返回处理在「WebView 无历史可退」时会回到 Activity.onBackPressed，那条路
++/// 不经过本回调，只看得到 Activity 层）。
++object InstallBackLock {
++    @Volatile
++    var locked: Boolean = false
++
++    /// 主 WebView（插件 load 时记住），用来在拦下返回时通知前端
++    @Volatile
++    internal var webView: WebView? = null
++
++    /// 拦下一次返回后通知前端弹提示（宿主暴露的 `window.__pfBackBlocked()`）。
++    /// 用 evaluateJavascript 而不是插件 Event/Channel：宿主只需要一个「返回被拦了」的信号，
++    /// 走全局函数不必为此多加一条命令通道；失败也不影响拦返回本身。
++    fun notifyBackBlocked() {
++        val view = webView ?: return
++        view.post {
++            try {
++                view.evaluateJavascript("window.__pfBackBlocked && window.__pfBackBlocked()", null)
++            } catch (_: Exception) {
++                // 通知失败无所谓：返回已经被吞掉了
++            }
++        }
++    }
++}
++
+ @InvokeArg
+ class BrowserIdArgs {
+     var id: Int = 0
+@@ -55,6 +98,27 @@ class CookiesArgs {
+ class InappbrowserPlugin(private val activity: Activity) : Plugin(activity) {
+     private val sessions = ConcurrentHashMap<Int, ControlledBrowserSession>()
+ 
++    /// 安装期间吞掉返回键：默认关闭（完全不影响系统返回的正常行为），
++    /// 由宿主 App 在装表盘时打开、装完/出错关掉。开着时什么都不做 = 不退页面也不退 App，
++    /// 但每次都让人知道原因（前端弹一条「安装中，请勿退出」）。
++    private val backLock = object : OnBackPressedCallback(false) {
++        override fun handleOnBackPressed() {
++            InstallBackLock.notifyBackBlocked()
++        }
++    }
++
++    init {
++        // 宿主 AppCompatActivity 才有 onBackPressedDispatcher；拿不到的宿主直接跳过（不拦返回）
++        (activity as? AppCompatActivity)?.let { host ->
++            host.onBackPressedDispatcher.addCallback(host, backLock)
++        }
++    }
++
++    override fun load(webView: WebView) {
++        // 记下主 WebView：拦下返回时要通知前端弹提示
++        InstallBackLock.webView = webView
++    }
++
+     @Command
+     fun openControlled(invoke: Invoke) {
+         val args = invoke.parseArgs(OpenControlledArgs::class.java)
+@@ -126,4 +190,29 @@ class InappbrowserPlugin(private val activity: Activity) : Plugin(activity) {
+         sessions.remove(args.id)?.close()
+         invoke.resolve()
+     }
++
++    @Command
++    fun setSystemBars(invoke: Invoke) {
++        val args = invoke.parseArgs(SetSystemBarsArgs::class.java)
++        activity.runOnUiThread {
++            try {
++                val controller = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
++                controller.isAppearanceLightStatusBars = args.light
++                controller.isAppearanceLightNavigationBars = args.light
++                invoke.resolve()
++            } catch (err: Exception) {
++                invoke.reject(err.message ?: "failed to set system bars appearance")
++            }
++        }
++    }
++
++    @Command
++    fun setBackLock(invoke: Invoke) {
++        val args = invoke.parseArgs(SetBackLockArgs::class.java)
++        InstallBackLock.locked = args.locked
++        activity.runOnUiThread {
++            backLock.isEnabled = args.locked
++            invoke.resolve()
++        }
++    }
+ }
+diff --git a/src/mobile.rs b/src/mobile.rs
+index 2950187..3c73bd5 100644
+--- a/src/mobile.rs
++++ b/src/mobile.rs
+@@ -91,6 +91,16 @@ struct CookiesArgs {
+     url: String,
+ }
+ 
++#[derive(Serialize)]
++struct SetSystemBarsArgs {
++    light: bool,
++}
++
++#[derive(Serialize)]
++struct SetBackLockArgs {
++    locked: bool,
++}
++
+ #[derive(Deserialize)]
+ struct EvalResult {
+     #[serde(default)]
+@@ -122,6 +132,22 @@ impl<R: Runtime> Inappbrowser<R> {
+         self.handle.run_mobile_plugin("close", ()).map_err(Into::into)
+     }
+ 
++    /// 系统栏图标明暗：light=true 深色图标（浅色页），false 白色图标（深色页）。
++    /// 供宿主 App 按页面底色切换状态栏/导航栏前景色。
++    pub fn set_system_bars(&self, light: bool) -> crate::Result<()> {
++        self.handle
++            .run_mobile_plugin("setSystemBars", SetSystemBarsArgs { light })
++            .map_err(Into::into)
++    }
++
++    /// 返回键锁：locked=true 时系统返回与侧滑手势都被原生吞掉（宿主 App 安装表盘期间用，
++    /// 防止安装被打断）。只吞返回，不拦 Home。
++    pub fn set_back_lock(&self, locked: bool) -> crate::Result<()> {
++        self.handle
++            .run_mobile_plugin("setBackLock", SetBackLockArgs { locked })
++            .map_err(Into::into)
++    }
++
+     pub async fn open_controlled(&self, request: OpenControlledRequest) -> crate::Result<u32> {
+         let id = self.browsers.allocate(&request);
+         let app = self.app.clone();
+@@ -214,11 +240,29 @@ impl<R: Runtime> Inappbrowser<R> {
+     }
+ 
+     pub async fn get_cookies(&self, id: u32, url: String) -> crate::Result<Vec<BrowserCookie>> {
+-        let result: CookiesResult = self
++        // 原生端可能把 cookies 数组变成了 JSON 字符串（平台 bridge 的序列化差异），
++        // 数组/字符串两种形状都兼容解析。
++        let raw: serde_json::Value = self
+             .handle
+             .run_mobile_plugin_async("getCookies", CookiesArgs { id, url })
+             .await?;
+-        Ok(result.cookies)
++        let payload = raw
++            .get("cookies")
++            .cloned()
++            .unwrap_or(serde_json::Value::Null);
++        let cookies = match payload {
++            serde_json::Value::Array(_) => payload,
++            serde_json::Value::String(text) => serde_json::from_str(&text)
++                .map_err(|err| Error::Browser(format!("invalid cookies payload: {err}")))?,
++            serde_json::Value::Null => serde_json::Value::Array(Vec::new()),
++            other => {
++                return Err(Error::Browser(format!(
++                    "unexpected cookies payload type: {other}"
++                )))
++            }
++        };
++        serde_json::from_value(cookies)
++            .map_err(|err| Error::Browser(format!("invalid cookies: {err}")))
+     }
+ 
+     pub async fn close_controlled(&self, id: u32) -> crate::Result<()> {
+diff --git a/src/stub.rs b/src/stub.rs
+index cc12e6e..3e2262b 100644
+--- a/src/stub.rs
++++ b/src/stub.rs
+@@ -38,6 +38,16 @@ impl<R: Runtime> Inappbrowser<R> {
+         Err(Error::UnsupportedPlatform)
+     }
+ 
++    /// 桌面端无系统栏概念，no-op。
++    pub fn set_system_bars(&self, _light: bool) -> crate::Result<()> {
++        Ok(())
++    }
++
++    /// 桌面端无系统返回键，no-op。
++    pub fn set_back_lock(&self, _locked: bool) -> crate::Result<()> {
++        Ok(())
++    }
++
+     pub async fn open_controlled(&self, request: OpenControlledRequest) -> crate::Result<u32> {
+         desktop_browser::open(&self.app, &self.browsers, request)
+     }
+
+# ================================================================
+# 追加（2026-10-08）：安装期间屏幕常亮 + 打开系统 WebView 设置
+#   宿主 App 用：① setKeepScreenOn —— 装表盘时不让屏幕熄灭（息屏会让进程被系统
+#   冻结，SPP 传输停在半路）；② openWebViewSettings —— WebView 版本门禁页的
+#   「去更新」按钮打开系统 WebView 的应用详情页。
+#   注意：这一段是在**上面那些改动已经应用之后**的现场上生成的，
+#   重放顺序 = 先应用上面全部，再应用这一段。
+# ================================================================
+
+diff --git a/android/src/main/java/moe/astralsight/astrobox/plugin/inappbrowser/InappbrowserPlugin.kt b/android/src/main/java/moe/astralsight/astrobox/plugin/inappbrowser/InappbrowserPlugin.kt
+--- a/android/src/main/java/moe/astralsight/astrobox/plugin/inappbrowser/InappbrowserPlugin.kt
++++ b/android/src/main/java/moe/astralsight/astrobox/plugin/inappbrowser/InappbrowserPlugin.kt
+@@ -1,6 +1,11 @@
+ package moe.astralsight.astrobox.plugin.inappbrowser
+ 
+ import android.app.Activity
++import android.content.Intent
++import android.net.Uri
++import android.os.Build
++import android.provider.Settings
++import android.view.WindowManager
+ import android.webkit.WebView
+ import androidx.activity.OnBackPressedCallback
+ import androidx.appcompat.app.AppCompatActivity
+@@ -36,6 +41,12 @@
+ class SetBackLockArgs {
+     /// true = 安装进行中：系统返回与侧滑手势都被吞掉（App 退不出去）
+     var locked: Boolean = false
++}
++
++@InvokeArg
++class SetKeepScreenOnArgs {
++    /// true = 安装进行中：屏幕保持常亮（息屏会让系统把 App 冻住，传输就停半路）
++    var on: Boolean = false
+ }
+ 
+ /// 返回键锁开关（宿主 App 装表盘期间置 true）。
+@@ -215,4 +226,50 @@
+             invoke.resolve()
+         }
+     }
+-}
++
++    /** 屏幕常亮（宿主 App 安装表盘期间用）：只加在窗口标志上，窗口销毁即失效，
++        不会出现「App 关了屏幕还亮着」。 */
++    @Command
++    fun setKeepScreenOn(invoke: Invoke) {
++        val args = invoke.parseArgs(SetKeepScreenOnArgs::class.java)
++        activity.runOnUiThread {
++            try {
++                if (args.on) {
++                    activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++                } else {
++                    activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++                }
++                invoke.resolve()
++            } catch (err: Exception) {
++                invoke.reject(err.message ?: "failed to set keep screen on")
++            }
++        }
++    }
++
++    /** 打开系统 WebView 的应用详情页（宿主 App 的版本门禁「去更新」按钮）：
++        用户在这里能找到「更新」入口，比让他自己去应用商店搜省事。
++        问不出当前 WebView 包名（API 26 以下或个别 ROM）就退回本 App 的详情页。 */
++    @Command
++    fun openWebViewSettings(invoke: Invoke) {
++        activity.runOnUiThread {
++            val pkg = runCatching {
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                    WebView.getCurrentWebViewPackage()?.packageName
++                } else {
++                    null
++                }
++            }.getOrNull() ?: activity.packageName
++            try {
++                activity.startActivity(
++                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
++                        data = Uri.parse("package:$pkg")
++                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                    }
++                )
++                invoke.resolve()
++            } catch (err: Exception) {
++                invoke.reject(err.message ?: "failed to open application details")
++            }
++        }
++    }
++}
+
+diff --git a/src/mobile.rs b/src/mobile.rs
+--- a/src/mobile.rs
++++ b/src/mobile.rs
+@@ -101,6 +101,11 @@
+     locked: bool,
+ }
+ 
++#[derive(Serialize)]
++struct SetKeepScreenOnArgs {
++    on: bool,
++}
++
+ #[derive(Deserialize)]
+ struct EvalResult {
+     #[serde(default)]
+@@ -145,6 +150,23 @@
+     pub fn set_back_lock(&self, locked: bool) -> crate::Result<()> {
+         self.handle
+             .run_mobile_plugin("setBackLock", SetBackLockArgs { locked })
++            .map_err(Into::into)
++    }
++
++    /// 屏幕常亮：on=true 时宿主安装表盘期间不让屏幕熄灭（宿主 App 用）。
++    /// 息屏会让 App 进入 cached 状态、进程可能被系统冻结，传输就停在半路；
++    /// 只作用于本 Activity 的窗口，窗口销毁即失效（不会残留耗电）。
++    pub fn set_keep_screen_on(&self, on: bool) -> crate::Result<()> {
++        self.handle
++            .run_mobile_plugin("setKeepScreenOn", SetKeepScreenOnArgs { on })
++            .map_err(Into::into)
++    }
++
++    /// 打开系统 WebView 应用详情页（宿主 App 的版本门禁用）：系统 WebView 过旧时，
++    /// 用户在这里能看到「更新」入口，比让他自己去应用商店搜好找。
++    pub fn open_webview_settings(&self) -> crate::Result<()> {
++        self.handle
++            .run_mobile_plugin("openWebViewSettings", ())
+             .map_err(Into::into)
+     }
+ 
+
+diff --git a/src/stub.rs b/src/stub.rs
+--- a/src/stub.rs
++++ b/src/stub.rs
+@@ -48,6 +48,16 @@
+         Ok(())
+     }
+ 
++    /// 桌面端不存在「息屏冻结进程」，no-op。
++    pub fn set_keep_screen_on(&self, _on: bool) -> crate::Result<()> {
++        Ok(())
++    }
++
++    /// 桌面端没有「系统 WebView」这个概念，no-op（宿主前端另有桌面分支）。
++    pub fn open_webview_settings(&self) -> crate::Result<()> {
++        Ok(())
++    }
++
+     pub async fn open_controlled(&self, request: OpenControlledRequest) -> crate::Result<u32> {
+         desktop_browser::open(&self.app, &self.browsers, request)
+     }

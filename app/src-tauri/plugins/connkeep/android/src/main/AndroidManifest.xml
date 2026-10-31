@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 前台服务（保活）：连接期间钉住进程，阻止 cached 冻结与回收 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+ 起，前台服务必须声明类型并对上「连接设备」这个用途的权限 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- 常驻通知要显示就得有这个权限（Android 13+ 运行时申请；拒绝则服务照跑、通知不显示） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 「不限制电池优化」系统对话框（部分 ROM 才有；没有就退回应用详情页） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application>
+        <!-- stopWithTask=true：用户从最近任务划掉 App = 一切结束（预期行为，不做复活） -->
+        <service
+            android:name="com.wristry.app.connkeep.ConnKeepService"
+            android:exported="false"
+            android:stopWithTask="true"
+            android:foregroundServiceType="connectedDevice" />
+    </application>
+</manifest>

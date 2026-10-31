@@ -1,0 +1,16 @@
+[package]
+name = "connkeep"
+version = "0.1.0"
+description = "连接保活：与手环保持连接期间拉起前台服务（常驻通知），阻止 Android 把进程冻结/回收"
+edition = "2021"
+rust-version = "1.77.2"
+exclude = ["/android"]
+links = "connkeep"
+
+[dependencies]
+tauri = { version = "2.11.3", features = ["rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }

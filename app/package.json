@@ -1,0 +1,9 @@
+{
+  "name": "panfang-app",
+  "version": "0.3.12",
+  "private": true,
+  "description": "盘坊（Panfang）— 小米 Vela 穿戴设备表盘安装与编辑工具（Tauri 工程根）",
+  "scripts": {
+    "tauri": "tauri"
+  }
+}

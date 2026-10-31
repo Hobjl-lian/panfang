@@ -1,0 +1,8 @@
+# 统一换行；不使用 Git LFS（本仓库图片/字体都很小，直接以二进制入库）
+* text=auto eol=lf
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.icns  binary
+*.jar   binary

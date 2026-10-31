@@ -1,0 +1,234 @@
+//! connkeep：连接保活（安卓）。
+//!
+//! 为什么要有这个插件：经典蓝牙 SPP 的 socket 由 App 进程内的 Kotlin 插件持有，
+//! 进程一旦进入 cached 状态就可能被系统（Android 12+ 的 app freezer，及各 ROM 的省电策略）
+//! 冻结 —— 冻结期间读线程停摆、传输停在半路，甚至 socket 被系统回收。
+//! 唯一可靠的解法是**前台服务**：带一条低优先级静默通知，让系统别把进程当 cached 处理。
+//! 服务与本插件同进程，只是「钉住」进程，不接管 socket。
+//!
+//! 命令（都只从 Rust 侧调用，不暴露给网页层）：
+//!  - start：拉起/刷新前台服务（通知里带设备名）
+//!  - stop：停掉前台服务（断开连接时调）
+//!  - isRunning：服务在不在（查询用）
+//!  - openAppSettings：打开本应用的应用详情页（国产 ROM 的后台/电池设置入口）
+//!  - requestIgnoreBattery：尝试弹「不限制电池优化」系统对话框；弹不出来返回 false
+//!  - ensureBtPermissions：连接前把「附近的设备」权限（SCAN + CONNECT）要齐
+//!
+//! 桌面端：整套只在安卓上有意义 —— 插件在桌面构建里编译通过但不注册句柄。
+
+use serde::{Deserialize, Serialize};
+use tauri::{
+    plugin::{Builder, PluginHandle, TauriPlugin},
+    Runtime,
+};
+#[cfg(target_os = "android")]
+use tauri::Manager;
+
+#[cfg(target_os = "android")]
+mod mobile;
+
+/// 前台服务状态（给 Rust 侧核对用）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeepStatus {
+    pub running: bool,
+    pub notification_allowed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StartArg<'a> {
+    name: &'a str,
+    addr: &'a str,
+}
+
+/// 手机型号/系统（诊断打点用；不含账号信息）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PhoneInfo {
+    pub model: String,
+    pub os: String,
+}
+
+/// 一个小米运动健康/Zepp Life 的检测结果。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FitnessApp {
+    pub package: String,
+    pub installed: bool,
+    pub version: String,
+    pub label: String,
+    /// true = 被用户「强行停止」；false 只代表没被强停，不代表正在运行
+    pub stopped: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MiFitnessStatus {
+    pub apps: Vec<FitnessApp>,
+}
+
+/// 插件句柄（主 crate 通过 `app.conn_keep()` 拿到它）。
+pub struct ConnKeep<R: Runtime> {
+    handle: PluginHandle<R>,
+}
+
+/// 安卓：真正调到 Kotlin 侧。
+///
+/// ⚠️ `run_mobile_plugin` 只在 mobile 目标上存在 —— 桌面构建必须走下面那套空实现，
+/// 否则 `cargo test`/`cargo build`（Windows 主机）直接编译不过，而 binface 回归
+/// 与单元测试都要在主机上编这个 crate。
+#[cfg(target_os = "android")]
+impl<R: Runtime> ConnKeep<R> {
+    /// 拉起/刷新前台服务（同一进程，服务在 = 进程不会被当成 cached 冻结）。
+    pub fn start(&self, device_name: &str, addr: &str) -> Result<KeepStatus, String> {
+        self.handle
+            .run_mobile_plugin::<KeepStatus>(
+                "start",
+                StartArg {
+                    name: device_name,
+                    addr,
+                },
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// 停掉前台服务（用户主动断开 / 切换设备时调）。
+    pub fn stop(&self) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin::<()>("stop", ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 前台服务当前在不在。
+    pub fn is_running(&self) -> Result<bool, String> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            running: bool,
+        }
+        self.handle
+            .run_mobile_plugin::<P>("isRunning", ())
+            .map(|p| p.running)
+            .map_err(|e| e.to_string())
+    }
+
+    /// 连接前确保「附近的设备」权限齐全（Android 12+）。
+    ///
+    /// 会一直等到用户对系统弹窗作出选择才返回 —— 调用方必须放在阻塞线程里（见 bridge）。
+    /// 返回 false = 用户拒绝或系统没给（上层据此给一句操作指引，不要继续建链）。
+    pub fn ensure_bt_permissions(&self) -> Result<bool, String> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            granted: bool,
+        }
+        self.handle
+            .run_mobile_plugin::<P>("ensureBtPermissions", ())
+            .map(|p| p.granted)
+            .map_err(|e| e.to_string())
+    }
+
+    /// 手机厂商/型号与系统版本（只给失败打点区分设备用）。
+    pub fn device_info(&self) -> Result<PhoneInfo, String> {
+        self.handle
+            .run_mobile_plugin::<PhoneInfo>("deviceInfo", ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 打开本应用的「应用信息」系统页（电池 / 后台运行设置都在里面）。
+    pub fn open_app_settings(&self) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin::<()>("openAppSettings", ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 「后台保持连接」一键入口：插件按最有用的一步走（弹系统对话框 / 开应用信息页 / 本来就已经允许），
+    /// 返回实际做了什么：`"already" | "dialog" | "settings" | "failed"`（前端据此给一句提示）。
+    /// 详见 Kotlin 侧 `batteryHelp` 的判定顺序注释。
+    pub fn battery_help(&self) -> Result<String, String> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            result: String,
+        }
+        self.handle
+            .run_mobile_plugin::<P>("batteryHelp", ())
+            .map(|p| p.result)
+            .map_err(|e| e.to_string())
+    }
+
+    /// 小米运动健康/Zepp Life 的安装/强制停止状态（Android 允许读到的全部信息）。
+    pub fn mi_fitness_status(&self) -> Result<MiFitnessStatus, String> {
+        self.handle
+            .run_mobile_plugin::<MiFitnessStatus>("miFitnessStatus", ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 打开指定健身类 App 的应用信息页（用户去点「强行停止」）。
+    pub fn open_package_settings(&self, package_name: &str) -> Result<(), String> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Arg<'a> {
+            package_name: &'a str,
+        }
+        self.handle
+            .run_mobile_plugin::<()>("openPackageSettings", Arg { package_name })
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// 取插件句柄：`app.conn_keep()`（仅安卓）。
+/// 桌面：编译通过、调用即报错（插件只在安卓上有意义，本就不注册句柄）。
+#[cfg(not(target_os = "android"))]
+impl<R: Runtime> ConnKeep<R> {
+    pub fn start(&self, _device_name: &str, _addr: &str) -> Result<KeepStatus, String> {
+        Err("连接保活仅安卓可用".into())
+    }
+    pub fn stop(&self) -> Result<(), String> {
+        Err("连接保活仅安卓可用".into())
+    }
+    pub fn is_running(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+    pub fn ensure_bt_permissions(&self) -> Result<bool, String> {
+        Ok(true)
+    }
+    pub fn device_info(&self) -> Result<PhoneInfo, String> {
+        Ok(PhoneInfo::default())
+    }
+    pub fn open_app_settings(&self) -> Result<(), String> {
+        Err("连接保活仅安卓可用".into())
+    }
+    pub fn battery_help(&self) -> Result<String, String> {
+        Ok("failed".into())
+    }
+    pub fn mi_fitness_status(&self) -> Result<MiFitnessStatus, String> {
+        Ok(MiFitnessStatus::default())
+    }
+    pub fn open_package_settings(&self, _package_name: &str) -> Result<(), String> {
+        Err("连接保活仅安卓可用".into())
+    }
+}
+
+#[cfg(target_os = "android")]
+pub trait ConnKeepExt<R: Runtime> {
+    fn conn_keep(&self) -> &ConnKeep<R>;
+}
+
+#[cfg(target_os = "android")]
+impl<R: Runtime, T: tauri::Manager<R>> ConnKeepExt<R> for T {
+    fn conn_keep(&self) -> &ConnKeep<R> {
+        self.state::<ConnKeep<R>>().inner()
+    }
+}
+
+/// 初始化插件（安卓注册 Kotlin 插件；其他平台只是编译通过）。
+pub fn init<R: Runtime>() -> TauriPlugin<R> {
+    Builder::new("connkeep")
+        .setup(|app, api| {
+            #[cfg(target_os = "android")]
+            {
+                let keep = mobile::init(app, api)?;
+                app.manage(keep);
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let _ = (app, api);
+            }
+            Ok(())
+        })
+        .build()
+}
