@@ -53,7 +53,6 @@ app/                         应用（Tauri 2 + React；安卓为目标平台）
 server/                      授权服务（Rust + axum + SQLite；独立程序，不随本仓库公开）
 vendor/netcfg/               上游私有模块的等价占位实现（必须，account 依赖）
 scripts/init-upstream.sh     拉取上游开源核心并放置占位模块
-docs/patches/                对上游模块的本地补丁（构建必需）
 ```
 
 ---
