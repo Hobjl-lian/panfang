@@ -1,0 +1,146 @@
+diff --git a/src/btinterface.rs b/src/btinterface.rs
+index 602756d..372da74 100644
+--- a/src/btinterface.rs
++++ b/src/btinterface.rs
+@@ -85,13 +85,24 @@ impl_error!(
+ pub enum ConnectError {
+     DeviceNotFound,
+     TargetRejected,
++    /// 插件/系统返回的具体原因（连接超时、权限、无可用 SPP 通道……）。
++    ///
++    /// 本地补丁（盘坊）：以前插件返回的任何错误都被映射成 DeviceNotFound，上层只能报
++    /// 「未发现设备」——超时和「手环没进连接新手机模式」看起来一模一样，排障时完全分不清。
++    Failed(String),
+ }
+ 
+-impl_error!(
+-    ConnectError,
+-    DeviceNotFound => "device not found",
+-    TargetRejected => "target rejected",
+-);
++impl std::fmt::Display for ConnectError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::DeviceNotFound => write!(f, "device not found"),
++            Self::TargetRejected => write!(f, "target rejected"),
++            Self::Failed(msg) => write!(f, "{msg}"),
++        }
++    }
++}
++
++impl std::error::Error for ConnectError {}
+ 
+ #[derive(Debug)]
+ pub enum SendError {
+diff --git a/src/stdimp.rs b/src/stdimp.rs
+index 1a30bbb..c59b92e 100644
+--- a/src/stdimp.rs
++++ b/src/stdimp.rs
+@@ -550,7 +550,13 @@ impl StdImp {
+             while let Ok(Some(item)) = tokio::time::timeout_at(deadline, scan.next()).await {
+                 let raw_id = item.device.id().to_string();
+                 let vivo_mac = Self::parse_vivo_advertisement(&item.adv_data).map(|info| info.mac);
++                // 本地补丁：Windows 后端的设备 id 是 WinRT 容器串
++                // （BluetoothLE#BluetoothLE<mac>-<mac>），直接与 MAC 字符串比较永远不相等；
++                // 两侧先过 normalize_addr_for_dedup 归一化再匹配。
++                let normalized_id = normalize_addr_for_dedup(&raw_id);
++                let normalized_target = normalize_addr_for_dedup(&addr);
+                 if raw_id.eq_ignore_ascii_case(&addr)
++                    || normalized_id.eq_ignore_ascii_case(&normalized_target)
+                     || vivo_mac.as_ref().is_some_and(|mac| mac.eq_ignore_ascii_case(&addr))
+                 {
+                     let device = item.device.clone();
+@@ -567,20 +573,34 @@ impl StdImp {
+         }
+ 
+         let device = device_opt.ok_or(ConnectError::DeviceNotFound)?;
+-        let setup = tokio::time::timeout(Duration::from_secs(20), async {
++        // 本地补丁：20s 不够覆盖「手环端确认 + Windows 配对弹窗 + 服务发现」的交互耗时，
++        // 用户操作稍慢就会误报 target rejected；放宽到 75s。
++        let setup = tokio::time::timeout(Duration::from_secs(75), async {
+             // A system-connected peripheral still needs a connection owned by this central.
+             adapter.connect_device(&device).await
+                 .map_err(|err| {
+                     log::warn!("BLE connect failed for {addr}: {err}");
+                     ConnectError::TargetRejected
+                 })?;
+-            if let Err(err) = device.pair().await {
+-                log::warn!("BLE pair failed for {addr}: {err}");
+-            }
+-            let services = device.discover_services().await.map_err(|err| {
+-                log::warn!("BLE service discovery failed for {addr}: {err}");
+-                ConnectError::TargetRejected
+-            })?;
++            // 本地补丁：跳过 Windows 系统级配对。小米手环的认证在应用层（authkey）完成，
++            // Chrome/AstroBox-WASM 均不做系统配对；主动配对会创建 bonding，
++            // 之后 Windows 后台抢连 + 加密要求反而导致服务发现时设备掉线（unreachable）。
++            log::info!("[local-patch] skipping Windows pairing for {addr}");
++            let services = match device.discover_services().await {
++                Ok(services) => services,
++                Err(err) => {
++                    // 掉线抖动：重连一次再发现
++                    log::warn!("BLE service discovery failed for {addr}: {err}; retrying once");
++                    adapter.connect_device(&device).await.map_err(|err| {
++                        log::warn!("BLE reconnect failed for {addr}: {err}");
++                        ConnectError::TargetRejected
++                    })?;
++                    device.discover_services().await.map_err(|err| {
++                        log::warn!("BLE service discovery retry failed for {addr}: {err}");
++                        ConnectError::TargetRejected
++                    })?
++                }
++            };
+             Self::build_addressed_ble_session(device.clone(), services).await
+         }).await;
+         let session = match setup {
+@@ -1352,7 +1372,9 @@ impl BluetoothInterface for StdImp {
+                 let remove_bond = unpair_before_connect.unwrap_or(true);
+                 app.btclassic_spp()
+                     .connect(&addr, remove_bond, &fallback_channels)
+-                    .map_err(|_| ConnectError::DeviceNotFound)
++                    // 本地补丁（盘坊）：把插件给的具体原因带上去（超时/权限/无通道），
++                    // 不再一律折叠成「未发现设备」——见 btinterface.rs 的 ConnectError::Failed。
++                    .map_err(|e| ConnectError::Failed(e.to_string()))
+                     .and_then(|result| {
+                         if result.ret {
+                             Ok(())
+@@ -1445,10 +1467,12 @@ impl BluetoothInterface for StdImp {
+         data: Vec<u8>,
+         characteristic: Option<Uuid>,
+     ) -> Result<(), SendError> {
+-        match self
+-            .addressed_connect_type(addr)
+-            .ok_or(SendError::Disconnected)?
+-        {
++        let resolved = self.addressed_connect_type(addr);
++        log::info!(
++            "[stdimp.send] addr={addr} resolved={resolved:?} len={}",
++            data.len()
++        );
++        match resolved.ok_or(SendError::Disconnected)? {
+             ConnectType::SPP => Self::app()
+                 .ok_or(SendError::Disconnected)?
+                 .btclassic_spp()
+@@ -1461,11 +1485,17 @@ impl BluetoothInterface for StdImp {
+                 characteristic,
+             )),
+             #[cfg(target_os = "android")]
+-            ConnectType::BLE => Self::app()
+-                .ok_or(SendError::Disconnected)?
+-                .btclassic_spp()
+-                .send(addr, &data)
+-                .map_err(|_| SendError::Disconnected),
++            ConnectType::BLE => {
++                log::info!("[stdimp.send] android BLE branch -> send_ble");
++                let result = Self::app()
++                    .ok_or(SendError::Disconnected)?
++                    .btclassic_spp()
++                    // 本地修复：原代码误用 SPP 的 send（对未连接的 SPP 通道发送必然失败，
++                    // 表现为 "Transport send failed: Disconnected"，认证握手无法启动）。
++                    .send_ble(addr, &data);
++                log::info!("[stdimp.send] send_ble result={result:?}");
++                result.map_err(|_| SendError::Disconnected)
++            }
+         }
+     }
+ 

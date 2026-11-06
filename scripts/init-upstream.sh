@@ -70,26 +70,30 @@ mkdir -p "$DEST/src-tauri/modules/netcfg/src"
 cp "$ROOT/vendor/netcfg/Cargo.toml" "$DEST/src-tauri/modules/netcfg/Cargo.toml"
 cp "$ROOT/vendor/netcfg/src/lib.rs"  "$DEST/src-tauri/modules/netcfg/src/lib.rs"
 
-echo "==> 5/5 应用 inappbrowser 本地改动"
-# App 侧直接调用的几个方法（set_system_bars / set_back_lock / set_keep_screen_on /
-# open_webview_settings）以及 ConnectError::Failed 只存在于本地插件里，上游没有。
-# 补丁路径相对插件根，所以必须在该目录里 apply；已经打过的再跑一次会失败，按幂等处理。
-PATCH="$ROOT/docs/patches/inappbrowser-local-changes.patch"
-PLUGIN="$DEST/src-tauri/plugins/inappbrowser"
-if [ -f "$PATCH" ]; then
-  if git -C "$PLUGIN" apply --check "$PATCH" 2>/dev/null; then
-    git -C "$PLUGIN" apply "$PATCH"
-    echo "    已应用 inappbrowser-local-changes.patch"
-  elif git -C "$PLUGIN" apply --reverse --check "$PATCH" 2>/dev/null; then
-    echo "    补丁已应用过，跳过"
-  else
-    echo "!! 补丁与当前插件提交对不上（先核对 PINNED_MODULES 里的 inappbrowser 提交）" >&2
+echo "==> 5/5 应用各上游仓库的本地改动"
+# App 侧直接依赖的上游改动（`ConnectError::Failed`、inappbrowser 的 set_back_lock 等）
+# 只存在于本地工作树，上游仓库里没有。补丁路径相对各自仓库根，所以在仓库目录里 apply；
+# 已经打过的再跑一次会失败，按幂等处理（reverse --check 命中就跳过）。
+apply_patch() {
+  local repo="$DEST/src-tauri/$1" patch="$ROOT/docs/patches/$2"
+  if [ ! -f "$patch" ]; then
+    echo "!! 找不到 $patch" >&2
     exit 1
   fi
-else
-  echo "!! 找不到 $PATCH" >&2
-  exit 1
-fi
+  if git -C "$repo" apply --check "$patch" 2>/dev/null; then
+    git -C "$repo" apply "$patch"
+    echo "    $1 ← $2"
+  elif git -C "$repo" apply --reverse --check "$patch" 2>/dev/null; then
+    echo "    $1 ← $2（已应用，跳过）"
+  else
+    echo "!! $1 的补丁与钉住的提交对不上（先核对 PINNED_MODULES）" >&2
+    exit 1
+  fi
+}
+apply_patch modules/bluetooth bluetooth-local-changes.patch
+apply_patch modules/core core-local-changes.patch
+apply_patch plugins/btclassic-spp btclassic-spp-local-changes.patch
+apply_patch plugins/inappbrowser inappbrowser-local-changes.patch
 
 echo
 echo "完成。接下来："

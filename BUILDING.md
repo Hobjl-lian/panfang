@@ -14,8 +14,9 @@ bash scripts/init-upstream.sh      # 克隆 AstroBox-NG、钉住各模块提交�
 ```
 
 钉住的提交已包含本项目需要的上游改动；`init-upstream.sh` 还会把
-`docs/patches/inappbrowser-local-changes.patch` 应用到 `inappbrowser` 插件
-（本项目依赖的少量行为改动，脚本自动完成，无需手工操作）。
+`docs/patches/*-local-changes.patch` 打到对应的上游仓库
+（bluetooth / core / btclassic-spp / inappbrowser 各一份，本项目依赖的少量行为改动，
+脚本自动完成，无需手工操作）。
 
 （与上游的关系见 README「开源许可与署名」一节。）
 

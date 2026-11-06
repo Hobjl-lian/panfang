@@ -1,0 +1,173 @@
+# 盘坊本地补丁（2026-10-17）：断链时让图传立刻失败
+#
+# 背景：repos/AstroBox-NG 的 modules/* 与 plugins/* 被上游 .gitignore，改动进不了 git。
+# 应用方式：在 AstroBox-NG 源码上按本 patch 修改（只动 core 三个文件）。
+# 行尾按 LF 记录；源码是 CRLF 时用 `patch --binary` 应用即可。
+#
+# 1) sar/mod.rs：SarController 加 `aborted` 标记（abort_all_pending 置位、收到任何回包清掉），
+#    暴露 is_aborted() —— 让等 ACK 的上层（MASS 图传）知道链路已经中止。
+# 2) components/mass.rs：
+#    · MassComponent.prepare_wait 改成 Sender<Result<PrepareResponse>>，新增 MassSystem::fail_waiters，
+#      链路死掉时立刻唤醒等 Prepare 的调用方（以前只能干等）；
+#    · 等 PrepareResponse 加 20 秒兜底（以前完全没有超时）；
+#    · wait_for_seq_ack 每轮检查 is_aborted() → 立刻失败（以前要等满 30 秒 ack_wait_timeout）。
+# 3) device/xiaomi.rs：fail_all_device_slots 补上 MassSystem（以前漏了它，断链后图传不被唤醒，
+#    表现就是「卡 25 秒 → 设备长时间无响应（安装停滞）」）。
+#
+# 现象来源：2026-10-17 小米手环 9 Pro 买家编辑表盘时链路断开，诊断里 5 条
+# `edit_apply disconnected Transport send failed: Disconnected` + 1 条 `edit_apply stalled`。
+#
+--- a/src-tauri/modules/core/src/device/xiaomi/sar/mod.rs
++++ b/src-tauri/modules/core/src/device/xiaomi/sar/mod.rs
+@@ -69,6 +69,9 @@
+     acked: HashSet<u8>,
+     ack_notify: Arc<Notify>,
+     profiler: TransportProfilerHandle,
++    /// 链路已中止（发送失败 / 重传超限）：等 ACK 的上层（MASS 图传）据此立刻失败，
++    /// 而不是干等到自己的超时。收到任何回包即视为链路又活了，自动清掉。
++    aborted: bool,
+ }
+ 
+ impl SarController {
+@@ -105,6 +108,7 @@
+             acked: HashSet::new(),
+             ack_notify: Arc::new(Notify::new()),
+             profiler,
++            aborted: false,
+         };
+ 
+         // 启动定时检查超时任务
+@@ -204,6 +208,11 @@
+         self.acked.contains(&seq)
+     }
+ 
++    /// 链路是否已被中止（发送失败 / 重传超限）。上层等 ACK 的循环据此立刻失败。
++    pub fn is_aborted(&self) -> bool {
++        self.aborted
++    }
++
+     /// 判断一组 seq 是否全部确认。
+     pub fn is_all_acked(&self, seqs: &[u8]) -> bool {
+         seqs.iter().all(|s| self.acked.contains(s))
+@@ -386,6 +395,7 @@
+         );
+         self.tx_queue.clear();
+         self.command_pool = CommandPool::new();
++        self.aborted = true;
+         self.ack_notify.notify_waiters();
+ 
+         let device_id = self.device_id.clone();
+@@ -418,6 +428,8 @@
+     }
+ 
+     pub fn on_l1_packet(&mut self, l1: &L1Packet) -> bool {
++        // 收到任何回包 = 链路是活的：清掉中止标记（重连后重建的控制器本来就是干净的）
++        self.aborted = false;
+         match l1.pkt_type {
+             L1DataType::Ack => {
+                 self.handle_ack(l1.seq);
+--- a/src-tauri/modules/core/src/device/xiaomi/components/mass.rs
++++ b/src-tauri/modules/core/src/device/xiaomi/components/mass.rs
+@@ -197,7 +197,18 @@
+         let owner = self.owner_id.clone();
+         let _ = with_device_component_mut::<MassComponent, _, _>(owner, move |comp| {
+             if let Some(tx) = comp.prepare_wait.lock().take() {
+-                let _ = tx.send(resp);
++                let _ = tx.send(Ok(resp));
++            }
++        });
++    }
++
++    /// 链路死掉时把还在等 PrepareResponse 的调用方立刻唤醒（否则它只能干等，直到自己的超时）。
++    pub fn fail_waiters(&mut self, err: &anyhow::Error) {
++        let owner = self.owner_id.clone();
++        let msg = format!("{err:#}");
++        let _ = with_device_component_mut::<MassComponent, _, _>(owner, move |comp| {
++            if let Some(tx) = comp.prepare_wait.lock().take() {
++                let _ = tx.send(Err(anyhow::anyhow!(msg)));
+             }
+         });
+     }
+@@ -312,7 +323,8 @@
+ #[derive(Component, serde::Serialize)]
+ pub struct MassComponent {
+     #[serde(skip_serializing)]
+-    prepare_wait: Mutex<Option<oneshot::Sender<protocol::PrepareResponse>>>, // 等 Prepare 回包的单次通道
++    // 等 Prepare 回包的单次通道；`Err` = 链路已中止（由 MassSystem::fail_waiters 唤醒）
++    prepare_wait: Mutex<Option<oneshot::Sender<Result<protocol::PrepareResponse>>>>,
+ }
+ 
+ impl MassComponent {
+@@ -416,7 +428,14 @@
+     log::info!("Waiting for prepare response...");
+ 
+     // 3) 等设备回能力参数
+-    let prepare_resp = rx.await.context("Mass prepare response not received")?;
++    //    链路死掉时 MassSystem::fail_waiters 会立刻回 Err；这里再加 20 秒兜底，
++    //    避免「设备不回包、链路又没报错」时永远挂着（以前没有超时）。
++    let prepare_resp = match timeout(Duration::from_secs(20), rx).await {
++        Ok(Ok(Ok(resp))) => resp,
++        Ok(Ok(Err(e))) => return Err(e),
++        Ok(Err(e)) => return Err(anyhow::anyhow!("Mass prepare response channel closed: {e}")),
++        Err(_) => bail_site!("Mass prepare response not received (20s timeout)"),
++    };
+     if prepare_resp.prepare_status != protocol::PrepareStatus::Ready as i32 {
+         bail_site!("Mass data prepare was not READY");
+     }
+@@ -942,20 +961,27 @@
+         loop {
+             let notified = ack_notifier.notified();
+             let owner_clone = owner.clone();
+-            let acked = crate::ecs::with_rt_mut(move |rt| {
++            let (acked, aborted) = crate::ecs::with_rt_mut(move |rt| {
+                 rt.with_device_mut(&owner_clone, |world, entity| {
+                     if let Some(dev) = world.get_mut::<XiaomiDevice>(entity) {
+-                        return dev.sar.lock().is_acked(seq);
++                        let sar = dev.sar.lock();
++                        return (sar.is_acked(seq), sar.is_aborted());
+                     }
+-                    false
++                    (false, false)
+                 })
+-                .unwrap_or(false)
++                .unwrap_or((false, false))
+             })
+             .await;
+             if acked {
+-                break;
++                break Ok(());
++            }
++            if aborted {
++                // 链路已中止（发送失败 / 重传超限）：别干等满 30 秒，立刻把失败交给上层
++                break Err(anyhow::anyhow!("连接已断开，传输中止"));
+             }
+-            notified.await;
++            // 用短超时兜住「notify_waiters 与注册之间的竞态」：漏了通知最多多等 50ms，
++            // 不会把整次传输拖到 30 秒超时。
++            let _ = timeout(Duration::from_millis(50), notified).await;
+         }
+     };
+ 
+@@ -964,7 +990,7 @@
+         ack_future,
+     )
+     .await
+-    .context("Timeout waiting for mass packet ACK")?;
++    .context("Timeout waiting for mass packet ACK")??;
+     Ok(())
+ }
+ 
+--- a/src-tauri/modules/core/src/device/xiaomi.rs
++++ b/src-tauri/modules/core/src/device/xiaomi.rs
+@@ -215,6 +215,11 @@
+             if let Some(mut sys) = world.get_mut::<components::media::MediaSystem>(entity) {
+                 sys.fail_waiters(&err);
+             }
++            // MASS（表盘图传 / 文件安装）也要立刻唤醒：漏了它，链路死了图传还在等 PrepareResponse，
++            // 表现就是「卡 25 秒 → 设备长时间无响应（安装停滞）」。
++            if let Some(mut sys) = world.get_mut::<components::mass::MassSystem>(entity) {
++                sys.fail_waiters(&err);
++            }
+             if let Some(mut sys) = world.get_mut::<components::report::ReportSystem>(entity) {
+                 sys.fail_waiters(&err);
+             }

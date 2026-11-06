@@ -1,0 +1,372 @@
+diff --git a/android/src/main/java/BTSpp.kt b/android/src/main/java/BTSpp.kt
+index 225f97e..bc5a368 100755
+--- a/android/src/main/java/BTSpp.kt
++++ b/android/src/main/java/BTSpp.kt
+@@ -28,6 +28,7 @@ import android.net.Uri
+ import android.os.Build
+ import android.os.Handler
+ import android.os.Looper
++import android.os.SystemClock
+ import android.provider.Settings
+ import android.webkit.WebView
+ import androidx.core.app.ActivityCompat
+@@ -44,6 +45,8 @@ import java.io.OutputStream
+ import java.util.Locale
+ import java.util.UUID
+ import java.util.concurrent.ConcurrentLinkedQueue
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
+ import kotlin.coroutines.resume
+ import kotlin.coroutines.resumeWithException
+ 
+@@ -54,6 +57,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+     private val BLE_UUID_KEYWORD_XIAOMI_SERVICE = "0050"
+     private val BLE_UUID_KEYWORD_XIAOMI_SENT = "005f"
+     private val BLE_UUID_KEYWORD_XIAOMI_RECV = "005e"
++    // 本地补丁：VSCP 标准写特征为 005d（005e 为通知）；优先用它，005f 作兜底。
++    private val BLE_UUID_KEYWORD_XIAOMI_SENT_PRIMARY = "005d"
+     private val BLE_UUID_VIVO_SERVICE = "0000276008c211e190730e8ac72e1011"
+     private val BLE_UUID_VIVO_SENT = "0000276008c211e190730e8ac72e0011"
+     private val BLE_UUID_VIVO_RECV = "0000276008c211e190730e8ac72e0012"
+@@ -64,6 +69,21 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+     private val CLIENT_CHARACTERISTIC_CONFIG_UUID =
+         UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+     private val STREAM_WRITE_HINT = 60 * 1024
++    /**
++     * 单次 SPP 建链的总预算（本地补丁）。
++     *
++     * 为什么必须有：`BluetoothSocket.connect()` 是阻塞调用，协程的 withTimeout **打断不了它**；
++     * 手环不在「连接新手机」或被别的手机占用时，它会一直卡在系统栈里 —— 上层只能看到
++     * 「15 秒未返回」，然后用户重试、再卡住，永远拿不到一条真实错误。
++     * 到点由看门狗 close socket 把阻塞调用打断，返回一句明确的超时原因。
++     * Rust 侧每次尝试还有 20 秒保险；两次尝试（保留配对 / 解配对）合计仍小于前端 45 秒宽限。
++     */
++    private val CONNECT_BUDGET_MS = 12_000L
++    private val SOCKET_CONNECT_TIMEOUT_MS = 6_000L
++    /** 建链看门狗：到点 close socket（阻塞的 connect() 会抛 IOException 返回）。 */
++    private val connectTimer = Executors.newSingleThreadScheduledExecutor { r ->
++        Thread(r, "bt-spp-connect-timer").apply { isDaemon = true }
++    }
+     private val PERMISSION_REQUEST_CODE = 1001
+     private val PERMISSION_REQUEST_COOLDOWN_MS = 1500L
+     private val PRECISE_LOCATION_REQUIRED_MESSAGE =
+@@ -422,20 +442,34 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+     @SuppressLint("MissingPermission")
+     private suspend fun unpairDevice(device: BluetoothDevice): Boolean {
+         return withContext(Dispatchers.IO) {
+-            try {
++            if (device.bondState == BluetoothDevice.BOND_NONE) {
++                webViewLog("Kotlin: ${device.address} 本来就没有系统配对")
++                return@withContext true
++            }
++            val invoked = try {
+                 webViewLog("Kotlin: Attempting to unpair device ${device.address} via reflection.")
+                 val method = device.javaClass.getMethod("removeBond")
+-                val result = method.invoke(device) as? Boolean ?: false
+-                if (result) {
+-                    webViewLog("Kotlin: removeBond() invoked successfully.")
+-                } else {
+-                    webViewLog("Kotlin: removeBond() invocation failed.")
+-                }
+-                result
++                (method.invoke(device) as? Boolean) ?: false
+             } catch (e: Exception) {
+                 webViewLog("Kotlin: Reflection failed for removeBond: ${e.message}")
+                 false
+             }
++            if (!invoked) {
++                // 被别的 App 占着时 removeBond 可能直接返回 false；不阻断连接，继续试
++                webViewLog("Kotlin: removeBond() invocation failed.")
++            }
++            // removeBond() 是异步的：等系统真的把 bond 清掉再连，最多 2 秒。
++            // 不等的话紧接着的连接仍会踩旧 bond（表现为连上就被顶掉）。
++            val deadline = SystemClock.elapsedRealtime() + 2_000L
++            while (SystemClock.elapsedRealtime() < deadline) {
++                if (device.bondState == BluetoothDevice.BOND_NONE) {
++                    webViewLog("Kotlin: 系统配对已解除")
++                    return@withContext true
++                }
++                delay(100)
++            }
++            webViewLog("Kotlin: 等待解配对超时（bondState=${device.bondState}），继续尝试连接")
++            false
+         }
+     }
+ 
+@@ -473,18 +507,29 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+             if (adapter.isDiscovering) adapter.cancelDiscovery()
+ 
+             if (remove_bond) {
++                // unpairDevice 内部会等 bondState 真的变成 BOND_NONE（最多 2 秒）
+                 unpairDevice(dev)
+             }
+ 
+-            var sock = trySdpUuid(dev)
+-            if (sock == null) {
++            val deadline = SystemClock.elapsedRealtime() + CONNECT_BUDGET_MS
++            var sock = trySdpUuid(dev, deadline)
++            if (sock == null && SystemClock.elapsedRealtime() < deadline) {
+                 val channels = fallbackChannels.ifEmpty { listOf(5, 1) }.distinct()
+                 for (channel in channels) {
+-                    sock = tryChannel(dev, channel, if (channel == 5) 8_000 else 6_000)
++                    val left = deadline - SystemClock.elapsedRealtime()
++                    if (left <= 0) break
++                    sock = tryChannel(
++                        dev,
++                        channel,
++                        minOf(SOCKET_CONNECT_TIMEOUT_MS, left),
++                        deadline
++                    )
+                     if (sock != null) break
+                 }
+             }
+-            val connectedSock = sock ?: return@withContext false to "No SPP channel/UUID available"
++            val connectedSock = sock ?: return@withContext false to
++                "连接超时（${CONNECT_BUDGET_MS / 1000} 秒内手机没有和手环建立 SPP 通道）。" +
++                "请确认手环仍停在「连接新手机」界面，且没有别的手机或小米运动健康占着它。"
+ 
+             socket = connectedSock
+             inStream = connectedSock.inputStream
+@@ -529,12 +574,36 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+         }
+     }
+ 
+-    /** 通过 SDP UUID 尝试（secure + insecure） **/
++    /**
++     * 可中断的 socket 连接（本地补丁）。
++     *
++     * `withTimeout` 只能取消协程，**打断不了阻塞的 RFCOMM connect()**；这里改成
++     * 「到点由看门狗 close socket」——close 会让阻塞调用立刻抛 IOException 返回。
++     */
++    private suspend fun connectSocket(sock: BluetoothSocket, timeoutMs: Long): Boolean {
++        if (timeoutMs <= 0) return false
++        // 注意：webViewLog 是 suspend 函数，不能在看门狗线程里调；这里只做 close。
++        val closer = connectTimer.schedule({
++            runCatching { sock.close() }
++        }, timeoutMs, TimeUnit.MILLISECONDS)
++        return try {
++            sock.connect()
++            true
++        } catch (e: Exception) {
++            webViewLog("Kotlin: socket 连接失败：${e.message}")
++            false
++        } finally {
++            closer.cancel(false)
++        }
++    }
++
++    /** 通过 SDP UUID 尝试（secure + insecure），受整次建链的 deadline 约束 **/
+     @SuppressLint("MissingPermission")
+-    private suspend fun trySdpUuid(dev: BluetoothDevice): BluetoothSocket? {
++    private suspend fun trySdpUuid(dev: BluetoothDevice, deadline: Long): BluetoothSocket? {
+         if (!dev.fetchUuidsWithSdp()) return null
+ 
+         repeat(20) {
++            if (SystemClock.elapsedRealtime() >= deadline) return null
+             dev.uuids
+                 ?.firstOrNull { it.uuid.toString().startsWith(SPP_PREFIX, ignoreCase = true) }
+                 ?.let { parcel ->
+@@ -542,13 +611,12 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+                     val insecureResult = runCatching {
+                         webViewLog("Kotlin: trySdpUuid (insecure, uuid=${parcel.uuid})")
+                         val sock = dev.createInsecureRfcommSocketToServiceRecord(parcel.uuid)
+-                        try {
+-                            withTimeout(6_000) { sock.connect() }
+-                            sock
+-                        } catch (e: Exception) {
++                        val left = deadline - SystemClock.elapsedRealtime()
++                        if (!connectSocket(sock, minOf(SOCKET_CONNECT_TIMEOUT_MS, left))) {
+                             runCatching { sock.close() }
+-                            throw e
++                            throw IOException("insecure connect failed")
+                         }
++                        sock
+                     }
+                     if (insecureResult.isSuccess) {
+                         return insecureResult.getOrNull()
+@@ -557,13 +625,12 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+ 
+                     val secureResult = runCatching {
+                         val sock = dev.createRfcommSocketToServiceRecord(parcel.uuid) // secure
+-                        try {
+-                            withTimeout(6_000) { sock.connect() }
+-                            sock
+-                        } catch (e: Exception) {
++                        val left = deadline - SystemClock.elapsedRealtime()
++                        if (!connectSocket(sock, minOf(SOCKET_CONNECT_TIMEOUT_MS, left))) {
+                             runCatching { sock.close() }
+-                            throw e
++                            throw IOException("secure connect failed")
+                         }
++                        sock
+                     }
+                     if (secureResult.isSuccess) {
+                         return secureResult.getOrNull()
+@@ -574,26 +641,28 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+         return null
+     }
+ 
+-    /** 通过 channel 号反射尝试（secure + insecure） **/
++    /** 通过 channel 号反射尝试（secure + insecure），受整次建链的 deadline 约束 **/
+     private suspend fun tryChannel(
+         dev: BluetoothDevice,
+         ch: Int,
+-        timeoutMs: Long
++        timeoutMs: Long,
++        deadline: Long
+     ): BluetoothSocket? {
++        val left = deadline - SystemClock.elapsedRealtime()
++        if (left <= 0) return null
++        val budget = minOf(timeoutMs, left)
+         return runCatching {
+-            webViewLog("Kotlin: tryChannel(ch=$ch)")
++            webViewLog("Kotlin: tryChannel(ch=$ch, budget=${budget}ms)")
+             val method = runCatching {
+                 dev.javaClass.getMethod("createInsecureRfcommSocket", Int::class.javaPrimitiveType)
+             }.getOrNull() ?: dev.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+ 
+             val sock = method.invoke(dev, ch) as BluetoothSocket
+-            try {
+-                withTimeout(timeoutMs) { sock.connect() }
+-                sock
+-            } catch (e: Exception) {
++            if (!connectSocket(sock, budget)) {
+                 runCatching { sock.close() }
+-                throw e
++                throw IOException("channel $ch connect failed")
+             }
++            sock
+         }.getOrNull()
+     }
+ 
+@@ -714,8 +783,13 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+ 
+     private fun extractBleCharacteristics(services: List<BluetoothGattService>): Boolean {
+         var recv: BluetoothGattCharacteristic? = null
+-        var sent: BluetoothGattCharacteristic? = null
++        var sentPrimary: BluetoothGattCharacteristic? = null
++        var sentFallback: BluetoothGattCharacteristic? = null
+         var serviceProbe: BluetoothGattCharacteristic? = null
++        // 本地补丁：按属性兜底候选（关键词全不中时使用）
++        var notifyCandidate: BluetoothGattCharacteristic? = null
++        var writeWithResponse: BluetoothGattCharacteristic? = null
++        var writeAny: BluetoothGattCharacteristic? = null
+ 
+         for (service in services) {
+             val serviceUuid = service.uuid
+@@ -725,21 +799,46 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+ 
+             for (characteristic in service.characteristics) {
+                 val characteristicUuid = characteristic.uuid
++                val props = characteristic.properties
++                if (isXiaomi) {
++                    android.util.Log.i(
++                        "BTSpp",
++                        "xiaomi char ${characteristicUuid} props=0x${Integer.toHexString(props)}"
++                    )
++                }
++                val canNotify = (props and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE)) != 0
++                val canWrite = (props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
++                val canWriteNoRsp = (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+                 when {
+                     isXiaomi && uuidContains(characteristicUuid, BLE_UUID_KEYWORD_XIAOMI_RECV) ->
+                         recv = characteristic
++                    isXiaomi && uuidContains(characteristicUuid, BLE_UUID_KEYWORD_XIAOMI_SENT_PRIMARY) ->
++                        sentPrimary = characteristic
+                     isXiaomi && uuidContains(characteristicUuid, BLE_UUID_KEYWORD_XIAOMI_SENT) ->
+-                        sent = characteristic
++                        sentFallback = characteristic
+                     isXiaomi && uuidContains(characteristicUuid, BLE_UUID_KEYWORD_XIAOMI_SERVICE) ->
+                         serviceProbe = characteristic
+                     isVivo && uuidCompactEq(characteristicUuid, BLE_UUID_VIVO_RECV) ->
+                         recv = characteristic
+                     isVivo && uuidCompactEq(characteristicUuid, BLE_UUID_VIVO_SENT) ->
+-                        sent = characteristic
++                        sentFallback = characteristic
++                }
++                if (isXiaomi) {
++                    if (canNotify && notifyCandidate == null) notifyCandidate = characteristic
++                    if (canWrite && writeWithResponse == null) writeWithResponse = characteristic
++                    if (canWriteNoRsp && writeAny == null) writeAny = characteristic
+                 }
+             }
+         }
+ 
++        // 优先级：005d（标准写）> 005f（原有）> 属性兜底（有响应写优先）
++        val sent = sentPrimary ?: sentFallback ?: writeWithResponse ?: writeAny
++        if (recv == null) recv = notifyCandidate
++
++        android.util.Log.i(
++            "BTSpp",
++            "extractBleCharacteristics recv=${recv?.uuid} sent=${sent?.uuid}"
++        )
+         bleNotifyCharacteristic = recv
+         bleWriteCharacteristic = sent
+         bleServiceProbeCharacteristic = serviceProbe
+@@ -857,25 +956,49 @@ class BTSpp(private val context: Context, private val webView: WebView) {
+                 return@withLock false to "BLE packet too long: ${data.size} > $maxLen"
+             }
+ 
+-            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+-            val writeStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+-                gatt.writeCharacteristic(
+-                    characteristic,
+-                    data,
++            // 本地补丁：GATT 忙（前一操作的回调尚未回收）时 writeCharacteristic 会立即失败，
++            // 上游只试一次导致认证包发不出去。此处重试若干次，且前几次用无响应写、
++            // 之后降级为有响应写（兼容不支持无响应写的特征）。
++            var lastDetail = "unknown"
++            for (attempt in 0 until 6) {
++                val writeType = if (attempt < 3) {
+                     BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+-                ) == BluetoothStatusCodes.SUCCESS
+-            } else {
+-                @Suppress("DEPRECATION")
+-                characteristic.value = data
+-                @Suppress("DEPRECATION")
+-                gatt.writeCharacteristic(characteristic)
+-            }
+-            if (!writeStarted) {
+-                return@withLock false to "BLE write failed to start"
++                } else {
++                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
++                }
++                characteristic.writeType = writeType
++                val status = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++                    gatt.writeCharacteristic(characteristic, data, writeType)
++                } else {
++                    @Suppress("DEPRECATION")
++                    characteristic.value = data
++                    @Suppress("DEPRECATION")
++                    if (gatt.writeCharacteristic(characteristic)) BluetoothStatusCodes.SUCCESS
++                    else BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY
++                }
++                if (status == BluetoothStatusCodes.SUCCESS) {
++                    android.util.Log.i(
++                        "BTSpp",
++                        "sendBle ok attempt=$attempt type=$writeType len=${data.size}"
++                    )
++                    delay(BLE_WRITE_DELAY_MS)
++                    return@withLock true to null
++                }
++                lastDetail = when (status) {
++                    BluetoothStatusCodes.ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION -> "missing CONNECT permission"
++                    BluetoothStatusCodes.ERROR_DEVICE_NOT_BONDED -> "device not bonded"
++                    BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY -> "gatt write busy"
++                    BluetoothStatusCodes.ERROR_GATT_WRITE_NOT_ALLOWED -> "write not allowed"
++                    BluetoothStatusCodes.ERROR_PROFILE_SERVICE_NOT_BOUND -> "profile service not bound"
++                    else -> "status=$status"
++                }
++                android.util.Log.w(
++                    "BTSpp",
++                    "sendBle attempt=$attempt failed: $lastDetail (type=$writeType)"
++                )
++                delay(25)
+             }
+-
+-            delay(BLE_WRITE_DELAY_MS)
+-            true to null
++            false to "BLE write failed to start after retries: $lastDetail"
+         }
+     }
+ 

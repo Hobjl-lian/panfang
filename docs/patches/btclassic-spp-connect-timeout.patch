@@ -1,0 +1,241 @@
+# 盘坊本地补丁（2026-10-17）：SPP 建链硬超时 + 真实错误原因 + 解配对重试
+#
+# 背景：repos/AstroBox-NG 的 modules/* 与 plugins/* 被上游 .gitignore，改动进不了 git。
+# 应用方式：在 AstroBox-NG 源码上按本 patch 修改；或直接对照本文件手改三处。
+#
+# 1) btinterface.rs：ConnectError 增加 Failed(String)，不再把所有插件错误折叠成 DeviceNotFound
+# 2) stdimp.rs：把插件返回的具体错误原样带上去
+# 3) BTSpp.kt：给阻塞的 RFCOMM connect 加可中断的硬超时（12 秒预算 / 单次 socket 6 秒）
+
+--- a/src-tauri/modules/bluetooth/src/btinterface.rs
++++ b/src-tauri/modules/bluetooth/src/btinterface.rs
+@@ -85,13 +85,24 @@
+ pub enum ConnectError {
+     DeviceNotFound,
+     TargetRejected,
++    /// 插件/系统返回的具体原因（连接超时、权限、无可用 SPP 通道……）。
++    ///
++    /// 本地补丁（盘坊）：以前插件返回的任何错误都被映射成 DeviceNotFound，上层只能报
++    /// 「未发现设备」——超时和「手环没进连接新手机模式」看起来一模一样，排障时完全分不清。
++    Failed(String),
+ }
+ 
+-impl_error!(
+-    ConnectError,
+-    DeviceNotFound => "device not found",
+-    TargetRejected => "target rejected",
+-);
++impl std::fmt::Display for ConnectError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::DeviceNotFound => write!(f, "device not found"),
++            Self::TargetRejected => write!(f, "target rejected"),
++            Self::Failed(msg) => write!(f, "{msg}"),
++        }
++    }
++}
++
++impl std::error::Error for ConnectError {}
+ 
+ #[derive(Debug)]
+ pub enum SendError {
+--- a/src-tauri/modules/bluetooth/src/stdimp.rs
++++ b/src-tauri/modules/bluetooth/src/stdimp.rs
+@@ -1372,7 +1372,9 @@
+                 let remove_bond = unpair_before_connect.unwrap_or(true);
+                 app.btclassic_spp()
+                     .connect(&addr, remove_bond, &fallback_channels)
+-                    .map_err(|_| ConnectError::DeviceNotFound)
++                    // 本地补丁（盘坊）：把插件给的具体原因带上去（超时/权限/无通道），
++                    // 不再一律折叠成「未发现设备」——见 btinterface.rs 的 ConnectError::Failed。
++                    .map_err(|e| ConnectError::Failed(e.to_string()))
+                     .and_then(|result| {
+                         if result.ret {
+                             Ok(())
+--- a/src-tauri/plugins/btclassic-spp/android/src/main/java/BTSpp.kt
++++ b/src-tauri/plugins/btclassic-spp/android/src/main/java/BTSpp.kt
+@@ -28,6 +28,7 @@
+ import android.os.Build
+ import android.os.Handler
+ import android.os.Looper
++import android.os.SystemClock
+ import android.provider.Settings
+ import android.webkit.WebView
+ import androidx.core.app.ActivityCompat
+@@ -44,6 +45,8 @@
+ import java.util.Locale
+ import java.util.UUID
+ import java.util.concurrent.ConcurrentLinkedQueue
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
+ import kotlin.coroutines.resume
+ import kotlin.coroutines.resumeWithException
+ 
+@@ -66,6 +69,21 @@
+     private val CLIENT_CHARACTERISTIC_CONFIG_UUID =
+         UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+     private val STREAM_WRITE_HINT = 60 * 1024
++    /**
++     * 单次 SPP 建链的总预算（本地补丁）。
++     *
++     * 为什么必须有：`BluetoothSocket.connect()` 是阻塞调用，协程的 withTimeout **打断不了它**；
++     * 手环不在「连接新手机」或被别的手机占用时，它会一直卡在系统栈里 —— 上层只能看到
++     * 「15 秒未返回」，然后用户重试、再卡住，永远拿不到一条真实错误。
++     * 到点由看门狗 close socket 把阻塞调用打断，返回一句明确的超时原因。
++     * Rust 侧每次尝试还有 20 秒保险；两次尝试（保留配对 / 解配对）合计仍小于前端 45 秒宽限。
++     */
++    private val CONNECT_BUDGET_MS = 12_000L
++    private val SOCKET_CONNECT_TIMEOUT_MS = 6_000L
++    /** 建链看门狗：到点 close socket（阻塞的 connect() 会抛 IOException 返回）。 */
++    private val connectTimer = Executors.newSingleThreadScheduledExecutor { r ->
++        Thread(r, "bt-spp-connect-timer").apply { isDaemon = true }
++    }
+     private val PERMISSION_REQUEST_CODE = 1001
+     private val PERMISSION_REQUEST_COOLDOWN_MS = 1500L
+     private val PRECISE_LOCATION_REQUIRED_MESSAGE =
+@@ -476,17 +494,29 @@
+ 
+             if (remove_bond) {
+                 unpairDevice(dev)
++                // removeBond() 是异步的：给它一点时间真的从系统里消失，否则紧接着的连接仍会踩旧 bond
++                delay(300)
+             }
+ 
+-            var sock = trySdpUuid(dev)
+-            if (sock == null) {
++            val deadline = SystemClock.elapsedRealtime() + CONNECT_BUDGET_MS
++            var sock = trySdpUuid(dev, deadline)
++            if (sock == null && SystemClock.elapsedRealtime() < deadline) {
+                 val channels = fallbackChannels.ifEmpty { listOf(5, 1) }.distinct()
+                 for (channel in channels) {
+-                    sock = tryChannel(dev, channel, if (channel == 5) 8_000 else 6_000)
++                    val left = deadline - SystemClock.elapsedRealtime()
++                    if (left <= 0) break
++                    sock = tryChannel(
++                        dev,
++                        channel,
++                        minOf(SOCKET_CONNECT_TIMEOUT_MS, left),
++                        deadline
++                    )
+                     if (sock != null) break
+                 }
+             }
+-            val connectedSock = sock ?: return@withContext false to "No SPP channel/UUID available"
++            val connectedSock = sock ?: return@withContext false to
++                "连接超时（${CONNECT_BUDGET_MS / 1000} 秒内手机没有和手环建立 SPP 通道）。" +
++                "请确认手环仍停在「连接新手机」界面，且没有别的手机或小米运动健康占着它。"
+ 
+             socket = connectedSock
+             inStream = connectedSock.inputStream
+@@ -531,12 +561,36 @@
+         }
+     }
+ 
+-    /** 通过 SDP UUID 尝试（secure + insecure） **/
++    /**
++     * 可中断的 socket 连接（本地补丁）。
++     *
++     * `withTimeout` 只能取消协程，**打断不了阻塞的 RFCOMM connect()**；这里改成
++     * 「到点由看门狗 close socket」——close 会让阻塞调用立刻抛 IOException 返回。
++     */
++    private suspend fun connectSocket(sock: BluetoothSocket, timeoutMs: Long): Boolean {
++        if (timeoutMs <= 0) return false
++        // 注意：webViewLog 是 suspend 函数，不能在看门狗线程里调；这里只做 close。
++        val closer = connectTimer.schedule({
++            runCatching { sock.close() }
++        }, timeoutMs, TimeUnit.MILLISECONDS)
++        return try {
++            sock.connect()
++            true
++        } catch (e: Exception) {
++            webViewLog("Kotlin: socket 连接失败：${e.message}")
++            false
++        } finally {
++            closer.cancel(false)
++        }
++    }
++
++    /** 通过 SDP UUID 尝试（secure + insecure），受整次建链的 deadline 约束 **/
+     @SuppressLint("MissingPermission")
+-    private suspend fun trySdpUuid(dev: BluetoothDevice): BluetoothSocket? {
++    private suspend fun trySdpUuid(dev: BluetoothDevice, deadline: Long): BluetoothSocket? {
+         if (!dev.fetchUuidsWithSdp()) return null
+ 
+         repeat(20) {
++            if (SystemClock.elapsedRealtime() >= deadline) return null
+             dev.uuids
+                 ?.firstOrNull { it.uuid.toString().startsWith(SPP_PREFIX, ignoreCase = true) }
+                 ?.let { parcel ->
+@@ -544,13 +598,12 @@
+                     val insecureResult = runCatching {
+                         webViewLog("Kotlin: trySdpUuid (insecure, uuid=${parcel.uuid})")
+                         val sock = dev.createInsecureRfcommSocketToServiceRecord(parcel.uuid)
+-                        try {
+-                            withTimeout(6_000) { sock.connect() }
+-                            sock
+-                        } catch (e: Exception) {
++                        val left = deadline - SystemClock.elapsedRealtime()
++                        if (!connectSocket(sock, minOf(SOCKET_CONNECT_TIMEOUT_MS, left))) {
+                             runCatching { sock.close() }
+-                            throw e
++                            throw IOException("insecure connect failed")
+                         }
++                        sock
+                     }
+                     if (insecureResult.isSuccess) {
+                         return insecureResult.getOrNull()
+@@ -559,13 +612,12 @@
+ 
+                     val secureResult = runCatching {
+                         val sock = dev.createRfcommSocketToServiceRecord(parcel.uuid) // secure
+-                        try {
+-                            withTimeout(6_000) { sock.connect() }
+-                            sock
+-                        } catch (e: Exception) {
++                        val left = deadline - SystemClock.elapsedRealtime()
++                        if (!connectSocket(sock, minOf(SOCKET_CONNECT_TIMEOUT_MS, left))) {
+                             runCatching { sock.close() }
+-                            throw e
++                            throw IOException("secure connect failed")
+                         }
++                        sock
+                     }
+                     if (secureResult.isSuccess) {
+                         return secureResult.getOrNull()
+@@ -576,26 +628,28 @@
+         return null
+     }
+ 
+-    /** 通过 channel 号反射尝试（secure + insecure） **/
++    /** 通过 channel 号反射尝试（secure + insecure），受整次建链的 deadline 约束 **/
+     private suspend fun tryChannel(
+         dev: BluetoothDevice,
+         ch: Int,
+-        timeoutMs: Long
++        timeoutMs: Long,
++        deadline: Long
+     ): BluetoothSocket? {
++        val left = deadline - SystemClock.elapsedRealtime()
++        if (left <= 0) return null
++        val budget = minOf(timeoutMs, left)
+         return runCatching {
+-            webViewLog("Kotlin: tryChannel(ch=$ch)")
++            webViewLog("Kotlin: tryChannel(ch=$ch, budget=${budget}ms)")
+             val method = runCatching {
+                 dev.javaClass.getMethod("createInsecureRfcommSocket", Int::class.javaPrimitiveType)
+             }.getOrNull() ?: dev.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+ 
+             val sock = method.invoke(dev, ch) as BluetoothSocket
+-            try {
+-                withTimeout(timeoutMs) { sock.connect() }
+-                sock
+-            } catch (e: Exception) {
++            if (!connectSocket(sock, budget)) {
+                 runCatching { sock.close() }
+-                throw e
++                throw IOException("channel $ch connect failed")
+             }
++            sock
+         }.getOrNull()
+     }
+ 

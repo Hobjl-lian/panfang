@@ -1,0 +1,70 @@
+# 盘坊本地补丁（2026-10-18）：解配对后等 bondState 真的清掉再连
+#
+# 叠加在 btclassic-spp-connect-timeout.patch 之上；改动文件：
+#   repos/AstroBox-NG/src-tauri/plugins/btclassic-spp/android/src/main/java/BTSpp.kt
+#
+# 背景：短命掉线后的第一次重连要先解除系统配对（把占用手环的小米运动健康/另一台手机顶掉）。
+# 上游 removeBond() 是异步的，原来只固定 delay(300)，紧接着的连接经常还踩着旧 bond，
+# 表现为「刚连上就被顶掉」。改成轮询 bondState 直到 BOND_NONE（最多 2 秒）。
+#
+# 注意：removeBond() 被别的 App 占着时可能直接返回 false；这里不阻断连接，继续尝试，
+# 只把真实状态写进 console 日志（用户侧不显示技术细节）。
+
+--- a/src-tauri/plugins/btclassic-spp/android/src/main/java/BTSpp.kt
++++ b/src-tauri/plugins/btclassic-spp/android/src/main/java/BTSpp.kt
+@@
+     @SuppressLint("MissingPermission")
+     private suspend fun unpairDevice(device: BluetoothDevice): Boolean {
+         return withContext(Dispatchers.IO) {
+-            try {
+-                webViewLog("Kotlin: Attempting to unpair device ${device.address} via reflection.")
+-                val method = device.javaClass.getMethod("removeBond")
+-                val result = method.invoke(device) as? Boolean ?: false
+-                if (result) {
+-                    webViewLog("Kotlin: removeBond() invoked successfully.")
+-                } else {
+-                    webViewLog("Kotlin: removeBond() invocation failed.")
+-                }
+-                result
+-            } catch (e: Exception) {
+-                webViewLog("Kotlin: Reflection failed for removeBond: ${e.message}")
+-                false
+-            }
++            if (device.bondState == BluetoothDevice.BOND_NONE) {
++                webViewLog("Kotlin: ${device.address} 本来就没有系统配对")
++                return@withContext true
++            }
++            val invoked = try {
++                webViewLog("Kotlin: Attempting to unpair device ${device.address} via reflection.")
++                val method = device.javaClass.getMethod("removeBond")
++                (method.invoke(device) as? Boolean) ?: false
++            } catch (e: Exception) {
++                webViewLog("Kotlin: Reflection failed for removeBond: ${e.message}")
++                false
++            }
++            if (!invoked) {
++                // 被别的 App 占着时 removeBond 可能直接返回 false；不阻断连接，继续试
++                webViewLog("Kotlin: removeBond() invocation failed.")
++            }
++            // removeBond() 是异步的：等系统真的把 bond 清掉再连，最多 2 秒。
++            // 不等的话紧接着的连接仍会踩旧 bond（表现为连上就被顶掉）。
++            val deadline = SystemClock.elapsedRealtime() + 2_000L
++            while (SystemClock.elapsedRealtime() < deadline) {
++                if (device.bondState == BluetoothDevice.BOND_NONE) {
++                    webViewLog("Kotlin: 系统配对已解除")
++                    return@withContext true
++                }
++                delay(100)
++            }
++            webViewLog("Kotlin: 等待解配对超时（bondState=${device.bondState}），继续尝试连接")
++            false
+         }
+     }
+@@
+             if (remove_bond) {
+-                unpairDevice(dev)
+-                // removeBond() 是异步的：给它一点时间真的从系统里消失，否则紧接着的连接仍会踩旧 bond
+-                delay(300)
++                // unpairDevice 内部会等 bondState 真的变成 BOND_NONE（最多 2 秒）
++                unpairDevice(dev)
+             }
