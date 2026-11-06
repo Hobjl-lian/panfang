@@ -61,7 +61,7 @@ pub fn set_phone_info(model: &str, os: &str) {
 }
 
 /// 界面能正常显示所需的最低 WebView 主版本 —— 与前端 `App.tsx` 的 `WEBVIEW_MIN_MAJOR` 对齐。
-const WEBVIEW_MIN_MAJOR: u32 = 111;
+const WEBVIEW_MIN_MAJOR: u32 = 83;
 
 /// 读安卓侧启动时写的 WebView 探测结果（`MainActivity.writeWebViewProbe`），
 /// 版本够不着界面门槛就上报一次。

@@ -44,6 +44,46 @@ body {
   animation: pageEnter 0.28s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* —— 底部托盘：滑出 + 卡片依次跟上 ——
+   托盘本身「快速从底部滑上来」（ease-out 收尾，像被推上来停住）；
+   卡片跟在后面错开一点点。
+   ⚠️ 这里只动 transform/opacity，并提前 will-change 提层：
+   早期版本给每张卡加了 26px 位移 + scale + 最长 190ms 的延迟，安卓 WebView 上会出现
+   「一张一张顿着弹出来」的抽动（每张卡都要重新光栅化）。现在位移收到 18px、不缩放、
+   延迟 40ms 起、每张只错开 22ms，整段动画更像一坨被甩出来而不是一串。
+   fill-mode 用 backwards 而不是 forwards：动画结束后必须回到「无 transform」，
+   否则会盖掉后面拖动托盘时写在 style 上的 transform（拖不动）。 */
+@keyframes sheetUp {
+  0% {
+    transform: translateY(100%);
+  }
+  100% {
+    transform: translateY(0);
+  }
+}
+
+.sheet-up {
+  animation: sheetUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  will-change: transform;
+}
+
+@keyframes cardIn {
+  0% {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.card-in {
+  animation: cardIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  will-change: transform, opacity;
+  backface-visibility: hidden;
+}
+
 /* —— 系统安全区 ——
    App 在安卓上是全屏（MainActivity 调了 enableEdgeToEdge），顶部要让开系统状态栏、
    底部固定栏要让开手势条。env(safe-area-inset-*) 在多数安卓 WebView 上只反映刘海/挖孔

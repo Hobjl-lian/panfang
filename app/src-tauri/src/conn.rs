@@ -189,6 +189,37 @@ impl Supervisor {
         }
     }
 
+    /// 改保活通知的副标题（「<设备名> · <状态>」）：通知必须跟着真实链路走。
+    ///
+    /// 以前通知只在 start 时写死「已连接」，之后再也不改 —— 手环断了、正在重连、
+    /// 甚至已经放弃自动重连，通知栏还挂着「已连接」，买家据此以为链路好好的，
+    /// 装表盘失败时也想不到是连接没了（2026-11-05 买家反馈）。
+    fn set_keepalive_text(&self, state: &str) {
+        let text = self
+            .desired
+            .lock()
+            .as_ref()
+            .map(|d| format!("{} · {}", d.name, state));
+        let Some(text) = text else { return };
+        #[cfg(target_os = "android")]
+        {
+            use connkeep::ConnKeepExt;
+            let app = self.app.clone();
+            // ⚠️ 必须换一条线程去调：Tauri 的插件命令会投回主线程执行，而 note_lost
+            // 常常就在主线程（BLE 回调）里跑 —— 直接调就是自己等自己，整个连接总管卡死。
+            tauri::async_runtime::spawn_blocking(move || {
+                match app.conn_keep().set_status(&text) {
+                    Ok(()) => log::info!("[conn] 保活通知 → {text}"),
+                    Err(e) => log::warn!("[conn] 更新保活通知失败（不影响连接）: {e}"),
+                }
+            });
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = text;
+        }
+    }
+
     /// 连接成功：登记期望连接、开始保活（前端手动连接成功后调）
     pub fn arm(&self, addr: &str, name: &str, authkey: &str) {
         *self.desired.lock() = Some(DesiredConn {
@@ -286,6 +317,7 @@ impl Supervisor {
                     flap: true,
                 },
             );
+            self.set_keepalive_text("已断开");
             self.emit(
                 "wf-link-give-up",
                 LinkGiveUpPayload {
@@ -309,6 +341,8 @@ impl Supervisor {
                 },
             );
         }
+        // 通知如实翻成「断开中」：用户锁屏/切走时只能看到通知栏，那里不能再骗人
+        self.set_keepalive_text("已断开，正在重连…");
         self.start_retry(hard);
     }
 
@@ -363,6 +397,7 @@ impl Supervisor {
                     self.probe_failures.store(0, Ordering::SeqCst);
                     self.lost_notified.store(false, Ordering::SeqCst);
                     self.retrying.store(false, Ordering::SeqCst);
+                    self.set_keepalive_text("已连接");
                     self.emit("wf-link-restored", LinkRestoredPayload { addr: d.addr, name: d.name });
                     return;
                 }
@@ -464,6 +499,7 @@ impl Supervisor {
             return;
         }
         self.gave_up.store(true, Ordering::SeqCst);
+        self.set_keepalive_text("已断开");
         let addr = self.desired.lock().as_ref().map(|d| d.addr.clone()).unwrap_or_default();
         log::warn!("[conn] 自动重连放弃（{addr}）：{last_err}");
         self.emit(

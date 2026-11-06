@@ -29,6 +29,11 @@ class StartArg {
 }
 
 @InvokeArg
+class StatusArg {
+    lateinit var text: String
+}
+
+@InvokeArg
 class PackageArg {
     lateinit var packageName: String
 }
@@ -38,6 +43,7 @@ class PackageArg {
  *
  *  - start：拉起 / 刷新前台服务（保活）
  *  - stop：停掉前台服务（用户主动断开 / 切换设备时）
+ *  - updateStatus：改通知正文（已连接 / 正在重连 / 已断开）
  *  - isRunning：服务在不在
  *  - openAppSettings：打开本应用的应用详情页（国产 ROM 的电池 / 后台设置入口）
  *  - requestIgnoreBattery：尝试弹「不限制电池优化」系统对话框，弹不出来返回 shown=false
@@ -84,6 +90,21 @@ class ConnKeepPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve()
         } catch (e: Exception) {
             invoke.reject("FGS_STOP_FAILED", e.message ?: "无法停止保活服务")
+        }
+    }
+
+    /**
+     * 改通知正文（Rust 侧 conn.rs 在连接状态变化时调）。
+     * 只改文字、不起停服务 —— 保活本身不受影响。
+     */
+    @Command
+    fun updateStatus(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(StatusArg::class.java)
+            ConnKeepService.updateText(activity.applicationContext, args.text)
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject("FGS_STATUS_FAILED", e.message ?: "无法更新通知")
         }
     }
 

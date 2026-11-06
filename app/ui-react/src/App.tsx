@@ -66,10 +66,29 @@ import {
   Footprints, CaretDown, Plus, GearSix, ArrowsDownUp, ArrowSquareOut,
   Info, ShieldCheck, FileText, Scroll, Code, DotsThree, ArrowClockwise,
   ArrowCounterClockwise, MagnifyingGlassPlus, MagnifyingGlass, SunDim, Drop, IconContext,
-  User, Storefront
+  User, Storefront, Copy
 } from "@phosphor-icons/react";
 
-/** 画一条圆角矩形路径（预览画布用；Chromium 111+ 有 roundRect 也要兜底） */
+/**
+ * 集市封面圆角比例（相对预览宽度）。
+ *
+ * 封面是**作者导出时就把圆角烤进 PNG** 的：2026-11-05 量了线上 27 张，半径分三档 ——
+ * 18 张 = 宽度的 **13.5%**（230 宽取 r≈31px）、5 张 = 24.3%（432 宽的红米手表6 那批）、
+ * 4 张 = 47%（作者直接做成半宽胶囊）。四角 alpha=0，弧线上只有 1px 抗锯齿。
+ *
+ * 问题在于那 18 张源图只有 230px 宽，4 倍屏上要铺到 470 物理像素 → 放大约 2 倍，
+ * 1px 的弧线被插值成 4px 的软边，看着就是「圆角毛边、有点脏」。
+ *
+ * 解法：在容器上再裁一次圆角。**半径必须大于作者烤的那个（13.5%）才盖得住** ——
+ * 小了等于没裁（已实测：12% 时页面输出与不裁逐像素一致），取 17% 时弧线整体被换成
+ * 由设备分辨率重绘的圆角，边缘从 4px 软边变成 1px 硬边。
+ * 半径按宽度算而不是写死 px，详情页放大后同样成立。
+ * 24.3% 与胶囊那 9 张半径本就比我们大，裁不到，保持作者原样（不会变差）。
+ */
+const PREVIEW_CORNER_RATIO = 0.17;
+const previewCornerRadius = (width: number) => Math.round(width * PREVIEW_CORNER_RATIO);
+
+/** 画一条圆角矩形路径（预览画布用；`roundRect` 是 Chrome 99+，旧内核走这条兜底） */
 function roundRectPath(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -224,9 +243,10 @@ interface InstalledDial {
 }
 
 const MOCK_DEVICES: DeviceItem[] = [
-  { id: "mb10", name: "Xiaomi 手环 10", model: "主力设备", battery: 78 },
-  { id: "mb9p", name: "Xiaomi 手环 9 Pro", model: "备用", battery: 45 },
-  { id: "rw5", name: "Redmi Watch 5", model: "家庭", battery: 92 }
+  // id 就是蓝牙地址（真机也是这么用的）：演示态写成 MAC 形状，界面上的地址行才是真样式
+  { id: "74:FB:17:AD:FF:A6", name: "Xiaomi 手环 10", model: "主力设备", battery: 78 },
+  { id: "3C:AF:B7:F4:C6:75", name: "Xiaomi 手环 9 Pro", model: "备用", battery: 45 },
+  { id: "E8:E6:09:10:46:FD", name: "Redmi Watch 5", model: "家庭", battery: 92 }
 ];
 
 const LARGE_STYLES = [
@@ -631,21 +651,206 @@ function marketTagOptions(faces: MarketFace[]): string[] {
 }
 
 /**
- * 按标签 + 搜索词筛（null/空 = 全部）；筛选在本地做，集市条目只有几十个。
+ * 集市排序轮换：不让「最上面永远是那几个」。
+ *
+ * 做法是**时间窗口 + 本机标识的确定性洗牌**：
+ *  - 同一小时内、同一台手机上顺序固定，来回切标签、刷新列表都不跳；
+ *  - 过了这个窗口再进集市，整体换一批；
+ *  - 种子掺了本机安装标识，不同买家看到的排头也不一样，曝光更分散。
+ *
+ * 为什么不是「每次打开都随机」：用户看完第 3 行一刷新就换位置，会找不到东西；
+ * 也不放在服务端算：那边只能给全站同一个顺序，解决不了「所有人都看到同一批新品」。
+ */
+const MARKET_ROTATE_MS = 60 * 60 * 1000;
+let marketRotateState: { win: number; seed: number } | null = null;
+
+/** 本机安装标识（一次性随机后落盘）：让不同手机排出来的顺序不同 */
+function marketDeviceSeed(): number {
+  try {
+    const key = "market_rotate_seed";
+    let v = localStorage.getItem(key);
+    if (!v) {
+      v = String(Math.floor(Math.random() * 0xffffffff));
+      localStorage.setItem(key, v);
+    }
+    return Number(v) >>> 0;
+  } catch {
+    return 0x9e3779b9;
+  }
+}
+
+/** 读当前排序种子：渲染时只读，绝不在这里换批（否则用户盯着列表，跨过整点会自己跳一下） */
+function marketRotateSeed(): number {
+  return marketRotateState ? marketRotateState.seed : marketRotateRefresh();
+}
+
+/** 换批的唯一入口：只在「进集市 / 刷新列表」时调，且同一窗口内不变 */
+function marketRotateRefresh(): number {
+  const win = Math.floor(Date.now() / MARKET_ROTATE_MS);
+  if (marketRotateState && marketRotateState.win === win) return marketRotateState.seed;
+  const seed = (win ^ marketDeviceSeed()) >>> 0;
+  marketRotateState = { win, seed };
+  return seed;
+}
+
+/** mulberry32：极小、够用的确定性伪随机（同一 seed 得到同一串数） */
+function mulberry32(a: number): () => number {
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** 按种子洗一遍（Fisher-Yates；不改原数组） */
+function shuffleBySeed<T>(arr: T[], seed: number): T[] {
+  const rnd = mulberry32(seed);
+  const out = arr.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    const t = out[i];
+    out[i] = out[j];
+    out[j] = t;
+  }
+  return out;
+}
+
+/**
+ * 按标签 + 搜索词筛（null/空 = 全部），再按当前窗口的种子排序。
+ * 筛选在本地做，集市条目只有几十个。
  * 搜索匹配表盘名与标签（关键字），不分大小写。
  */
 function filterMarketFaces(faces: MarketFace[], tag: string | null, query = ""): MarketFace[] {
   const q = query.trim().toLowerCase();
-  return faces.filter(f => {
+  const hit = faces.filter(f => {
     if (tag && !(f.tags || []).includes(tag)) return false;
     if (!q) return true;
     const hay = [f.name || "", ...(f.tags || [])].join(" ").toLowerCase();
     return hay.includes(q);
   });
+  return shuffleBySeed(hit, marketRotateSeed());
 }
 
-/** 界面能正常显示所需的最低 WebView 主版本（Tailwind v4 产物的 color-mix / dvh 门槛） */
-const WEBVIEW_MIN_MAJOR = 111;
+/**
+ * 界面能正常显示所需的最低 WebView 主版本。
+ *
+ * 2026-11-05 起产物整体降到 Chrome 83 打包（vite.config.ts 的 `PF_LEGACY_WEBVIEW`，默认开启）：
+ * 逻辑赋值、`@layer`、逻辑属性简写、`100dvh` 都在构建期抹平了，所以门槛跟着从 111 降到 83。
+ * 低于 83（Android 7~10 里那些从没更新过 WebView 的机器）仍然拦，那档没验过。
+ */
+const WEBVIEW_MIN_MAJOR = 83;
+
+/**
+ * 切换设备的排序：**当前设备永远排第一条**，其余保持账号里的原顺序。
+ * 列表只有几台，稳定排序比按最近使用更好理解（用户要找的就是「现在这台」）。
+ */
+function orderDevicesForSwitch(devices: DeviceItem[], currentId: string | null): DeviceItem[] {
+  if (!currentId) return devices;
+  const current = devices.find(device => device.id === currentId);
+  if (!current) return devices;
+  return [current, ...devices.filter(device => device.id !== currentId)];
+}
+
+/** 蓝牙地址：真机是 MAC（大写冒号分隔）；浏览器演示态的假 id 不显示这一行 */
+function formatDeviceAddr(addr: string): string | null {
+  return /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(addr) ? addr.toUpperCase() : null;
+}
+
+/**
+ * 设备卡：一台一张，显示设备名 + 蓝牙地址，右侧「⋯」开操作菜单。
+ *
+ * 2026-11-05 按用户给的参考图重做：
+ * · 不要左侧图标 —— 每张卡图形都一样，等于没有信息量；
+ * · 名字下面显示蓝牙地址 —— 同名设备只能靠它区分（小米账号里 "(2)" 这种后缀不是唯一凭据）；
+ * · 当前设备排最上面（排序由调用方负责），用蓝字 + 描边 + 一行「当前设备，状态」标注；
+ * · 连接/断开/删除三个动作里，连接是点卡片（主操作），另两个收进「⋯」。
+ */
+function DeviceCard({
+  device,
+  isCurrent,
+  isConnecting,
+  isConnected,
+  surface = "sheet",
+  onSelect,
+  onMore
+}: {
+  device: DeviceItem;
+  /** 是不是「当前设备」（排在最上面、带标注的那台） */
+  isCurrent: boolean;
+  isConnecting: boolean;
+  isConnected: boolean;
+  /**
+   * 卡片站在什么底色上：托盘是白底 → 卡片用浅灰；首次「选择设备」整页是浅灰底 → 卡片用白。
+   * 不区分的话，整页那种情况下卡片会和页面底色糊成一片（浏览器里实测过）。
+   */
+  surface?: "sheet" | "page";
+  onSelect: (device: DeviceItem) => void;
+  /** 右侧「⋯」：带元素本身，用来把菜单贴着它弹出来 */
+  onMore: (device: DeviceItem, anchor: HTMLElement) => void;
+}) {
+  const addr = formatDeviceAddr(device.id);
+  const status = isConnecting ? "正在连接" : isConnected ? "已连接" : "未连接";
+  // 状态色按用户要求：未连接红、已连接绿（连接中给蓝，跟转圈同一个色）
+  const statusColor = isConnecting
+    ? "text-[#4361EE]"
+    : isConnected
+      ? "text-[#34C759]"
+      : "text-[#FF3B30]";
+  const surfaceClass =
+    surface === "page"
+      ? "bg-white shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+      : "bg-[#F5F6F9]";
+  return (
+    <div
+      className={`w-full rounded-2xl px-4 py-3.5 transition-colors ${
+        isCurrent ? "bg-[#EEF1FE] ring-1 ring-[#4361EE]/25" : surfaceClass
+      }`}
+    >
+      <div className="flex items-start gap-3">
+        <button
+          type="button"
+          onClick={() => onSelect(device)}
+          aria-label={`${device.name}：${isConnected ? "点击断开连接" : "点击连接"}`}
+          className="min-w-0 flex-1 text-left cursor-pointer active:opacity-60 transition-opacity"
+        >
+          {isCurrent && (
+            <span className="block text-[12px] font-bold mb-1">
+              <span className="text-black/45">当前设备 / </span>
+              <span className={statusColor}>{status}</span>
+            </span>
+          )}
+          <span
+            className={`block truncate text-[16px] font-bold tracking-tight ${
+              isConnected ? "text-[#4361EE]" : "text-black"
+            }`}
+          >
+            {device.name}
+          </span>
+          {addr && (
+            <span className="block mt-1 text-[12px] font-medium tracking-wide text-black/35">
+              {addr}
+            </span>
+          )}
+        </button>
+
+        {isConnecting ? (
+          <CircleNotch className="w-4 h-4 mt-1.5 shrink-0 animate-spin text-[#4361EE]" />
+        ) : (
+          <button
+            type="button"
+            onClick={event => onMore(device, event.currentTarget)}
+            aria-label={`${device.name}：更多操作`}
+            className="w-8 h-8 -mr-1.5 -mt-0.5 shrink-0 rounded-full flex items-center justify-center text-black/30 hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
+          >
+            <DotsThree className="w-5 h-5" strokeWidth={2.5} />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 /**
  * 系统 WebView 过旧时的说明页（安卓专有；桌面与浏览器预览走不到这里）。
@@ -1075,6 +1280,14 @@ export default function App() {
   /** 正在等浏览器里完成授权时的会话号（null = 没在等） */
   const paidOauthState = useRef<string | null>(null);
   const paidOauthTimer = useRef<number | null>(null);
+  /**
+   * 等待授权期间的授权页地址。
+   * 系统浏览器没被唤起（部分机型、纯净模式、没设默认浏览器）时，用户可以把这条链接
+   * 复制出来自己到浏览器里打开 —— 2026-11-05 买家反馈「卡在等待授权，跳不过去」。
+   */
+  const [paidOauthUrl, setPaidOauthUrl] = useState<string | null>(null);
+  /** 刚点过复制：图标换成对勾，两秒后回退 */
+  const [paidOauthCopied, setPaidOauthCopied] = useState(false);
   const [paidScreen, setPaidScreen] = useState<[number, number] | null>(null);
   /** 本机安装记录（纯本地读）：管理页把「设备上的表盘」对上资源、标「可更新」用 */
   const [paidInstalls, setPaidInstalls] = useState<PaidInstallRecord[]>([]);
@@ -1217,6 +1430,10 @@ export default function App() {
   const [paidAccountConfirm, setPaidAccountConfirm] = useState<null | "logout" | "switch">(null);
   /** 从设备列表移除的二次确认（只移除列表项，小米账号不动） */
   const [deviceRemoveConfirm, setDeviceRemoveConfirm] = useState<DeviceItem | null>(null);
+  /** 设备卡右侧「⋯」弹出的操作菜单（贴着按钮的位置：x/y 是视口坐标） */
+  const [deviceMenu, setDeviceMenu] = useState<
+    { device: DeviceItem; x: number; y: number } | null
+  >(null);
 
   // App 自更新（安卓）：检查结果 / 「发现新版本」对话框 / 下载进度浮层
   const [appUpdate, setAppUpdate] = useState<AppUpdateCheck | null>(null);
@@ -1501,6 +1718,32 @@ export default function App() {
     }
     topIsOverlay.current = false;
   };
+
+  // —— 托盘的下滑关闭动画 ——
+  // 三个用途：点 ×、点遮罩、系统返回/侧滑。三者的区别只在「要不要动 history」，
+  // 动画本身统一走 animateCloseDeviceDrawer，避免某条路径瞬间消失。
+  const [sheetDrag, setSheetDrag] = useState(0);
+  const [sheetDragging, setSheetDragging] = useState(false);
+  const [sheetClosing, setSheetClosing] = useState(false);
+  const sheetDragStart = useRef<number | null>(null);
+  /** 用 ref 而不是 state：popstate 回调拿到的闭包是旧的，读 state 会误判 */
+  const sheetClosingRef = useRef(false);
+
+  /** 播完下滑动画再执行 afterUnmount（历史条目动不动由调用方决定） */
+  const animateCloseDeviceDrawer = (afterUnmount: () => void) => {
+    if (sheetClosingRef.current) return;
+    sheetClosingRef.current = true;
+    setSheetClosing(true);
+    window.setTimeout(() => {
+      sheetClosingRef.current = false;
+      setSheetClosing(false);
+      setSheetDrag(0);
+      afterUnmount();
+    }, 260);
+  };
+
+  /** 用户主动关（× / 遮罩）：动画结束后顺手消费掉那条历史条目 */
+  const requestCloseDeviceDrawer = () => animateCloseDeviceDrawer(closeDeviceDrawer);
 
   /** 打开「4 步上手」：首页入口看过一次就不再出现（设置里可随时再看） */
   const openOnboardingGuide = () => {
@@ -2509,8 +2752,10 @@ export default function App() {
       // 设备浮窗那一层：**只关浮窗，页面保持不变**（停在本页）
       if (topIsOverlay.current) {
         topIsOverlay.current = false;
-        setIsDeviceDrawerOpen(false);
         navDepth.current = Math.max(0, navDepth.current - 1);
+        // 侧滑/返回键关托盘也要有下滑动画。这里历史条目已经被系统弹掉了，
+        // 所以只播动画、不再调 closeDeviceDrawer（那会再 back 一次，多弹一层）。
+        animateCloseDeviceDrawer(() => setIsDeviceDrawerOpen(false));
         return;
       }
       if (pendingReset.current) {
@@ -3055,6 +3300,82 @@ export default function App() {
     showToast(`已断开「${device.name}」`);
   };
 
+  /**
+   * 「⋯」菜单：**贴着按钮弹出**（不是居中弹窗），位置用按钮的视口坐标算，
+   * 再夹到窗口内，保证贴边或列表最后一条时不会跑出屏幕。
+   */
+  const openDeviceMenu = (device: DeviceItem, anchor: HTMLElement) => {
+    const rect = anchor.getBoundingClientRect();
+    const width = 176;
+    const height = 104;
+    const x = Math.min(Math.max(8, rect.right - width), window.innerWidth - width - 8);
+    const y = Math.min(rect.bottom + 6, window.innerHeight - height - 12);
+    setDeviceMenu({ device, x, y });
+  };
+
+  /**
+   * 设备列表的橡皮筋：**只回弹，不自由滚动**。
+   *
+   * 上版留了 32px 上下内边距，结果内容比托盘高一点点 → 进入原生滚动 → 能停在任意位置，
+   * 手感就成了「不跟手」。现在内边距和位移上限都收成 12px：正常情况下列表滚不动，
+   * 拖出来的是那条空，松手弹回原位，永远停在同一个位置。
+   * （设备多到装不下时仍会退回原生滚动 —— 见外层 overflow-y-auto，那时确实需要能滚。）
+   */
+  const deviceListRef = useRef<HTMLDivElement | null>(null);
+  const deviceListTouch = useRef<{ y: number; atTop: boolean; atBottom: boolean } | null>(null);
+  const [deviceListOffset, setDeviceListOffset] = useState(0);
+  const [deviceListDragging, setDeviceListDragging] = useState(false);
+  const BOUNCE_MAX = 20;
+
+  /**
+   * 托盘横杠的拖拽：按住可以把整个托盘跟手往下拉，松手超过 96px 就关，否则弹回。
+   * （关闭动画与历史处理在 closeDeviceDrawer 那一块，点 × / 遮罩 / 系统返回共用。）
+   */
+  const onHandlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    sheetDragStart.current = event.clientY;
+    setSheetDragging(true);
+  };
+
+  const onHandlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (sheetDragStart.current === null) return;
+    setSheetDrag(Math.max(0, event.clientY - sheetDragStart.current));
+  };
+
+  const onHandlePointerUp = () => {
+    if (sheetDragStart.current === null) return;
+    sheetDragStart.current = null;
+    setSheetDragging(false);
+    if (sheetDrag > 96) requestCloseDeviceDrawer();
+    else setSheetDrag(0);
+  };
+
+  const onDeviceListTouchStart = (event: React.TouchEvent) => {
+    const el = deviceListRef.current;
+    if (!el) return;
+    deviceListTouch.current = {
+      y: event.touches[0].clientY,
+      atTop: el.scrollTop <= 0,
+      atBottom: el.scrollTop + el.clientHeight >= el.scrollHeight - 1
+    };
+  };
+
+  const onDeviceListTouchMove = (event: React.TouchEvent) => {
+    const start = deviceListTouch.current;
+    if (!start) return;
+    const dy = event.touches[0].clientY - start.y;
+    if ((start.atTop && dy > 0) || (start.atBottom && dy < 0)) {
+      setDeviceListDragging(true);
+      setDeviceListOffset(Math.max(-BOUNCE_MAX, Math.min(BOUNCE_MAX, dy * 0.4)));
+    }
+  };
+
+  const onDeviceListTouchEnd = () => {
+    deviceListTouch.current = null;
+    setDeviceListDragging(false);
+    setDeviceListOffset(0);
+  };
+
   const handleSelectDevice = (device: DeviceItem) => {
     // —— 连接竞态：这次点击领一个递增令牌，只有令牌还是最新的一次尝试有权改界面 ——
     const token = ++connectToken.current;
@@ -3466,11 +3787,17 @@ export default function App() {
       window.clearInterval(paidOauthTimer.current);
       paidOauthTimer.current = null;
     }
+    // 链接只在「正在等」时有意义：停轮询后它已经过期，别留在界面上误导
+    setPaidOauthUrl(null);
+    setPaidOauthCopied(false);
   };
 
   /**
    * 正式绑定：打开爱发电授权页 → 用户授权 → 服务端收回调 → 这里轮询取结果。
-   * 用户整个过程中在本机浏览器里，App 只是等着，所以每 2 秒问一次，最长 3 分钟。
+   * 用户整个过程中在本机浏览器里，App 只是等着，所以每 2 秒问一次。
+   *
+   * 唤起浏览器可能失败（部分机型丢 ACTION_VIEW、纯净模式拦截、没设默认浏览器），
+   * 所以**不把「唤起成功」当成前提**：地址始终摆在页面上，用户可以自己复制去浏览器打开。
    */
   const handlePaidOauth = () => {
     const inv = invoke;
@@ -3485,18 +3812,39 @@ export default function App() {
         const st = r?.state ?? "";
         const url = r?.url ?? "";
         if (!st || !url) throw new Error("暂时无法发起爱发电授权，请稍后再试");
-        paidOauthState.current = st;
-        await inv("open_external", { url });
-        showToast("请在浏览器里完成授权");
         const startedAt = Date.now();
         stopPaidOauthPoll();
         paidOauthState.current = st;
+        setPaidOauthUrl(url);
         paidOauthTimer.current = window.setInterval(() => {
           void (async () => {
             const cur = paidOauthState.current;
             if (!cur) return;
-            if (Date.now() - startedAt > 3 * 60 * 1000) {
+            // 服务端会话 15 分钟有效：这里留 10 分钟给「复制链接 → 浏览器里登录」的慢路径
+            if (Date.now() - startedAt > 10 * 60 * 1000) {
               stopPaidOauthPoll();
+              // 用户可能已经授权完、只是最后一次轮询没赶上：落定前再问一次本机绑定态
+              try {
+                const s = (await inv("paid_status")) as {
+                  bound?: boolean;
+                  display?: string;
+                  afdian_user_id?: string;
+                  afdian_name?: string;
+                } | null;
+                if (s?.bound) {
+                  setPaidBound(true);
+                  paidBoundRef.current = true;
+                  setPaidDisplay(s?.display ?? null);
+                  setPaidAfdianId(s?.afdian_user_id ?? "");
+                  setPaidAfdianName(s?.afdian_name ?? "");
+                  setPaidBusy(false);
+                  showToast("已绑定");
+                  goToList();
+                  return;
+                }
+              } catch {
+                /* 读不到就按超时处理 */
+              }
               setPaidBusy(false);
               setPaidError("授权超时，请重新点一次");
               return;
@@ -3529,12 +3877,73 @@ export default function App() {
             }
           })();
         }, 2000);
+        // 轮询起来之后再唤起浏览器：唤起失败不影响等待，用户还能手动打开链接
+        try {
+          await inv("open_external", { url });
+          showToast("请在浏览器里完成授权");
+        } catch (err) {
+          // 唤起失败不打断等待（用户还能复制链接），但要留痕：
+          // 这类机型以后还会来，管理页「客户端诊断」里得看得见是哪一步断的
+          diagReport("bind", "open_external", String(err));
+        }
       } catch (err) {
         stopPaidOauthPoll();
         setPaidBusy(false);
         setPaidError(humanize(err, "bind"));
       }
     })();
+  };
+
+  /**
+   * 等待授权时：点一下复制图标就把授权页地址放进剪贴板。
+   * navigator.clipboard 在部分 WebView 上被拒（非安全上下文 / 没给用户手势），
+   * 所以再走一遍 textarea + execCommand 的老路，两条都失败才让用户长按复制。
+   */
+  const copyPaidOauthUrl = async () => {
+    const url = paidOauthUrl;
+    if (!url) return;
+    const legacyCopy = (): boolean => {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = url;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, url.length);
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(url);
+      ok = true;
+    } catch {
+      ok = legacyCopy();
+    }
+    if (ok) {
+      setPaidOauthCopied(true);
+      showToast("链接已复制，粘贴到浏览器打开");
+      window.setTimeout(() => setPaidOauthCopied(false), 2000);
+    } else {
+      // 两条复制路径都没成（极少数 WebView）：别让用户以为已经复制好了
+      showToast("复制没成功，请再点一次", "error");
+    }
+  };
+
+  /**
+   * 等待授权时：重新发起一次绑定。
+   * 不做「再打开一次同一个链接」——第一次没唤起浏览器，再点同一个 Intent 注定还是失败，
+   * 只会让用户以为还有救。重新发起会拿到新会话并再试一次唤起浏览器。
+   */
+  const restartPaidOauth = () => {
+    handlePaidOauth();
   };
 
   /** 绑定爱发电（联调模式：直接用已登录的小米账号，不跳浏览器） */
@@ -3627,6 +4036,7 @@ export default function App() {
       setPaidProducts([]);
       setPaidLoaded(false);
       setPaidError(null);
+      setPaidOauthUrl(null);
       if (mode === "switch") {
         goPaidBindPage(true);
         showToast("请用新的爱发电账号登录");
@@ -3804,6 +4214,8 @@ export default function App() {
         marketArgs.w = screen[0];
         marketArgs.h = screen[1];
       }
+      // 进集市 / 换设备都算一次「打开」：只有这里允许换一批排序（同一小时内还是原顺序）
+      marketRotateRefresh();
       const d = (await inv("market_list", marketArgs)) as MarketList | null;
       const faces = Array.isArray(d?.faces) ? d.faces : [];
       setMarketNinePro(!!d?.ninePro);
@@ -5262,58 +5674,18 @@ export default function App() {
                     </button>
                   </div>
                 ) : (
-                  mockDevicesList.map((device) => {
-                    const isConnecting = connectingId === device.id;
-                    const isConnected = connectedId === device.id;
-
-                    return (
-                      <div
-                        key={device.id}
-                        className="w-full bg-white rounded-3xl p-5 transition-all duration-200 flex items-center justify-between shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => handleSelectDevice(device)}
-                          className="flex-1 min-w-0 text-left flex items-center gap-4 cursor-pointer active:scale-[0.98] transition-transform group"
-                        >
-                          <div className="w-11 h-11 shrink-0 rounded-xl bg-[#F5F6F9] flex items-center justify-center text-black/80">
-                            <Watch className="w-5 h-5 stroke-[2]" />
-                          </div>
-                          <h3 className="text-[18px] font-bold text-black leading-snug tracking-tight min-w-0">
-                            {device.name}
-                          </h3>
-                        </button>
-
-                        <div className="flex items-center gap-1.5 pl-2 shrink-0">
-                          {isConnecting && (
-                            <div className="flex items-center gap-2 text-[#4361EE] font-bold text-[14px]">
-                              <CircleNotch className="w-5 h-5 animate-spin" />
-                            </div>
-                          )}
-
-                          {isConnected && (
-                            <div className="w-8 h-8 rounded-full bg-[#34C759]/15 text-[#34C759] flex items-center justify-center animate-in zoom-in-75 duration-200">
-                              <Check className="w-5 h-5 stroke-[2]" />
-                            </div>
-                          )}
-
-                          {!isConnecting && !isConnected && (
-                            <CaretRight className="w-5 h-5 text-black/25 stroke-[2] group-hover:text-black/45 group-hover:translate-x-0.5 transition-all" />
-                          )}
-
-                          {/* 移除：只从列表里去掉（小米账号里不动），「重新导入设备」可找回 */}
-                          <button
-                            type="button"
-                            aria-label={`移除 ${device.name}`}
-                            onClick={() => setDeviceRemoveConfirm(device)}
-                            className="w-8 h-8 rounded-full flex items-center justify-center text-black/25 hover:text-[#FF3B30] hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
-                          >
-                            <X className="w-4 h-4 stroke-[2.5]" />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })
+                  orderDevicesForSwitch(mockDevicesList, connectedId).map(device => (
+                    <DeviceCard
+                      key={device.id}
+                      device={device}
+                      isCurrent={!!connectedId && connectedId === device.id}
+                      isConnecting={connectingId === device.id}
+                      isConnected={!!connectedId && connectedId === device.id}
+                      surface="page"
+                      onSelect={handleSelectDevice}
+                      onMore={openDeviceMenu}
+                    />
+                  ))
                 )}
 
                 {connectGuideCard}
@@ -5734,8 +6106,12 @@ export default function App() {
                             className="min-w-0 text-center cursor-pointer active:scale-[0.97] transition-transform"
                           >
                             <div
-                              className="relative mx-auto"
-                              style={{ width: previewW, height: previewH }}
+                              className="relative mx-auto overflow-hidden"
+                              style={{
+                                width: previewW,
+                                height: previewH,
+                                borderRadius: previewCornerRadius(previewW)
+                              }}
                             >
                               <img
                                 src={face.coverUrl}
@@ -6170,7 +6546,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.61"}，开源许可与开发者
+                              盘坊 v{appVersion ?? "0.3.73"}，开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -6183,7 +6559,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.3.61"}
+                      盘坊 v{appVersion ?? "0.3.73"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -6778,8 +7154,12 @@ export default function App() {
                     <h2 className="text-[22px] font-bold text-black tracking-tight">
                       同步已购表盘
                     </h2>
+                    {/* 等待授权期间这段就是状态说明：别把解释塞到按钮下面，
+                        那里只留操作，底部才不至于两行灰字贴在一起。 */}
                     <p className="text-[14px] font-medium text-black/45 mt-1.5 max-w-[260px]">
-                      绑定你在爱发电买过的表盘，之后每次购买也会自动到账
+                      {paidOauthUrl
+                        ? "页面没反应或跳转失败，就复制授权链接，手动粘到浏览器里打开"
+                        : "绑定你在爱发电买过的表盘，之后每次购买也会自动到账"}
                     </p>
                   </>
                 )}
@@ -6790,28 +7170,57 @@ export default function App() {
               </div>
 
               <div>
+                {/* 等待授权期间主按钮是「重新发起绑定」：第一次没跳过去的话，
+                    再点同一条链接也没用，重新发起才有意义。想不重启流程的走下面的复制。 */}
                 <button
                   type="button"
-                  disabled={paidBusy || (!paidBound && paidMode === "none")}
-                  onClick={paidBound ? goToList : handlePaidPrimary}
+                  disabled={
+                    (paidBusy && !(paidMode === "oauth" && paidOauthUrl)) ||
+                    (!paidBound && paidMode === "none")
+                  }
+                  onClick={
+                    paidBound
+                      ? goToList
+                      : paidMode === "oauth" && paidOauthUrl
+                        ? restartPaidOauth
+                        : handlePaidPrimary
+                  }
                   className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/10 disabled:text-black/25 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
                 >
-                  {paidBusy
-                    ? paidMode === "oauth"
-                      ? "等待授权…"
-                      : "正在绑定…"
-                    : paidBound
-                      ? "查看我的表盘"
-                      : paidMode === "none"
-                        ? "暂不可用"
-                        : paidMode === "oauth"
-                          ? "用爱发电账号登录"
-                          : "去绑定爱发电"}
+                  {paidMode === "oauth" && paidOauthUrl && !paidBound
+                    ? "重新发起绑定"
+                    : paidBusy
+                      ? paidMode === "oauth"
+                        ? "等待授权…"
+                        : "正在绑定…"
+                      : paidBound
+                        ? "查看我的表盘"
+                        : paidMode === "none"
+                          ? "暂不可用"
+                          : paidMode === "oauth"
+                            ? "用爱发电账号登录"
+                            : "去绑定爱发电"}
                 </button>
-                {!paidBound && paidMode === "oauth" && (
+                {!paidBound && paidMode === "oauth" && !paidOauthUrl && (
                   <p className="text-[12px] font-medium text-black/35 text-center mt-3 leading-snug">
                     会打开爱发电的授权页，登录自己的账号即可
                   </p>
+                )}
+                {/* 等待授权：主按钮负责重新发起，这个按钮负责把链接交到用户手上。
+                    轮询照旧在跑，用户在浏览器里授权完这里照样能收到结果。 */}
+                {!paidBound && paidMode === "oauth" && paidOauthUrl && (
+                  <button
+                    type="button"
+                    onClick={() => void copyPaidOauthUrl()}
+                    className="mt-3 w-full h-[52px] rounded-full bg-black/5 text-black/70 font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 tracking-tight"
+                  >
+                    {paidOauthCopied ? (
+                      <Check className="w-[18px] h-[18px] text-[#34C759] stroke-[3]" />
+                    ) : (
+                      <Copy className="w-[18px] h-[18px]" />
+                    )}
+                    {paidOauthCopied ? "已复制" : "复制授权链接"}
+                  </button>
                 )}
                 {/* 取得同意的落点（付费页）：购买与使用即表示接受用户协议 */}
                 <p className="text-[12px] font-medium text-black/35 text-center mt-2 leading-snug">
@@ -7007,7 +7416,11 @@ export default function App() {
                     <img
                       src={face.coverUrl}
                       alt={face.name}
-                      style={{ width: previewW, height: previewH }}
+                      style={{
+                        width: previewW,
+                        height: previewH,
+                        borderRadius: previewCornerRadius(previewW)
+                      }}
                       className="block drop-shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
                     />
                   </div>
@@ -8340,7 +8753,7 @@ export default function App() {
                     盘坊
                   </h2>
                   <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.61"}
+                    v{appVersion ?? "0.3.73"}
                   </span>
                 </div>
 
@@ -8384,7 +8797,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.61"}`}
+                            : `当前版本 v${appVersion ?? "0.3.73"}`}
                         </p>
                       </div>
                     </div>
@@ -8774,126 +9187,117 @@ export default function App() {
           </div>
         )}
 
-        {/* 屏幕正中悬浮对话框：设备与账号（精雕 Apple 大气居中卡片） */}
+        {/* 设备切换托盘（底部弹出） */}
         {isDeviceDrawerOpen && (
           <div
-            className="absolute inset-0 z-50 bg-black/40 backdrop-blur-md flex items-center justify-center p-6 animate-in fade-in duration-200"
-            onClick={closeDeviceDrawer}
+            className="absolute inset-0 z-50 flex flex-col justify-end"
+            onClick={requestCloseDeviceDrawer}
           >
+            {/* 遮罩：跟着托盘下拽变淡，关闭时一起淡出。
+                这里**故意不用 backdrop-blur** —— 托盘滑出、卡片进场的整段时间里，
+                背景模糊每帧都要重算，安卓 WebView 上就是「一卡一顿」的抽动源头。 */}
             <div
-              className="bg-white w-full max-w-[340px] rounded-3xl p-6 flex flex-col max-h-[85%] animate-in zoom-in-95 duration-200 shadow-[0_8px_24px_rgba(0,0,0,0.10)] border border-black/5"
+              className="absolute inset-0 bg-black/40 transition-opacity duration-200"
+              style={{ opacity: sheetClosing ? 0 : Math.max(0, 1 - sheetDrag / 360) }}
+            />
+            {/* 底部托盘：宽度铺满屏幕，只有上方两个圆角（参考用户给的样式，颜色/圆角用我们自己的） */}
+            <div
+              className="relative bg-white rounded-t-[28px] max-h-[88%] flex flex-col overflow-hidden sheet-up"
+              style={{
+                transform: sheetClosing
+                  ? "translateY(100%)"
+                  : sheetDrag
+                    ? `translateY(${sheetDrag}px)`
+                    : undefined,
+                transition: sheetDragging ? "none" : "transform 300ms cubic-bezier(0.22, 1, 0.36, 1)"
+              }}
               onClick={(e) => e.stopPropagation()}
             >
-              {/* 顶部：账号信息与关闭按钮 */}
-              <div className="flex items-center justify-between pb-4 border-b border-black/5">
-                <div className="flex items-center gap-3.5">
-                  <div className="w-11 h-11 rounded-full bg-[#4361EE] text-white font-bold text-[18px] flex items-center justify-center shadow-[0_1px_3px_rgba(0,0,0,0.02)] shrink-0">
-                    {userProfile.avatarInitial}
-                  </div>
-                  <div>
-                    <h4 className="text-[17px] font-bold text-black leading-tight tracking-tight">
-                      {userProfile.nickname}
-                    </h4>
-                    <p className="text-[13px] font-medium text-black/40 mt-1">
-                      {userProfile.phoneTail ? `小米账号，尾号 ${userProfile.phoneTail}` : "小米账号"}
-                    </p>
-                  </div>
-                </div>
+              {/* 抓手：按住会变深变宽，并且可以把托盘跟手拉下来 */}
+              <div
+                className="flex justify-center pt-2.5 pb-1.5 shrink-0 touch-none cursor-grab active:cursor-grabbing"
+                onPointerDown={onHandlePointerDown}
+                onPointerMove={onHandlePointerMove}
+                onPointerUp={onHandlePointerUp}
+                onPointerCancel={onHandlePointerUp}
+              >
+                <span
+                  className={`h-1 rounded-full transition-all duration-150 ${
+                    sheetDragging ? "w-11 bg-black/45" : "w-9 bg-black/15"
+                  }`}
+                />
+              </div>
 
+              {/* 标题 */}
+              <div className="px-5 pt-1.5 pb-3 flex items-center justify-between shrink-0">
+                <h3 className="text-[20px] font-bold text-black tracking-tight">切换设备</h3>
                 <button
                   type="button"
-                  onClick={closeDeviceDrawer}
-                  className="w-11 h-11 -mr-2.5 rounded-full flex items-center justify-center text-black/40 cursor-pointer hover:bg-black/5 active:scale-95 transition-all shrink-0"
+                  onClick={requestCloseDeviceDrawer}
+                  aria-label="关闭"
+                  className="-mr-2 w-10 h-10 rounded-full flex items-center justify-center text-black/40 cursor-pointer active:bg-black/5 active:scale-95 transition-all shrink-0"
                 >
                   <X className="w-5 h-5 stroke-[2]" />
                 </button>
               </div>
 
-              {/* 中间：手环设备列表 */}
-              <div className="py-4 overflow-y-auto no-scrollbar">
-                <span className="text-[13px] font-bold text-black/40 px-1 mb-2.5 block">
-                  切换手环设备
-                </span>
+              {/* 设备列表：当前设备排第一。
+                  外层滚动器在顶/底被拖时由下面的 transform 把整块内容跟手移出去（橡皮筋），
+                  内层 py-3 与位移上限等值，恰好给这段位移留出不被裁切的空间。 */}
+              <div
+                ref={deviceListRef}
+                className="px-4 pb-4 overflow-y-auto no-scrollbar overscroll-contain min-h-0"
+                onTouchStart={onDeviceListTouchStart}
+                onTouchMove={onDeviceListTouchMove}
+                onTouchEnd={onDeviceListTouchEnd}
+                onTouchCancel={onDeviceListTouchEnd}
+              >
+                <div
+                  className="flex flex-col gap-2.5 py-5"
+                  style={{
+                    transform: `translateY(${deviceListOffset}px)`,
+                    transition: deviceListDragging
+                      ? "none"
+                      : "transform 300ms cubic-bezier(0.22, 1, 0.36, 1)"
+                  }}
+                >
+                  {/* 连不上时的引导卡：放在列表**上方**，保证一眼能看到（列表会把下方内容挤出屏幕） */}
+                  {connectGuideCard}
 
-                {/* 连不上时的引导卡：放在列表**上方**，保证一眼能看到（列表会把下方内容挤出屏幕） */}
-                {connectGuideCard}
-
-                <div className="flex flex-col gap-2.5">
                   {mockDevicesList.length === 0 && (
                     <p className="text-[13px] font-medium text-black/40 text-center py-3 leading-relaxed">
                       列表里没有设备了，点下方「重新导入设备列表」找回
                     </p>
                   )}
-                  {mockDevicesList.map((device) => {
-                    // 高亮只跟随「真实连接中」的设备：没连上时列表一律静默，
-                    // 不默认勾上次连过的设备（避免被误读成已经连上了）。
-                    // 用户点了哪个，哪个转圈（connectingId）；连上后这里才变蓝。
-                    const isSelected = isDeviceConnected && selectedDevice.id === device.id;
-                    const isConnecting = connectingId === device.id;
 
-                    return (
-                      <div
-                        key={device.id}
-                        className={`w-full p-4 rounded-3xl transition-all flex items-center justify-between shadow-[0_1px_3px_rgba(0,0,0,0.02)] ${
-                          isSelected
-                            ? "bg-[#4361EE]/10 border-2 border-[#4361EE]"
-                            : "bg-[#F5F6F9] hover:bg-[#ECEEF2] border-2 border-transparent"
-                        }`}
-                      >
-                        {/* 点「已连接」的那台 = 主动断开（不报错、不再自动重连）；其它设备 = 连接 */}
-                        <button
-                          type="button"
-                          onClick={() =>
-                            isSelected ? handleDisconnectDevice(device) : handleSelectDevice(device)
-                          }
-                          className="flex-1 min-w-0 text-left flex items-center gap-3.5 cursor-pointer active:scale-[0.98] transition-transform"
-                        >
-                          <div className={`w-11 h-11 shrink-0 rounded-xl flex items-center justify-center ${
-                            isSelected ? "bg-[#4361EE] text-white" : "bg-white text-black/80"
-                          }`}>
-                            <Watch className="w-5 h-5 stroke-[2]" />
-                          </div>
-                          <div className="min-w-0">
-                            <h5 className={`text-[16px] font-bold leading-tight tracking-tight ${
-                              isSelected ? "text-[#4361EE]" : "text-black"
-                            }`}>
-                              {device.name}
-                            </h5>
-                            {/* 断开引导：用户明确要求「一眼看得出怎么断开」（2026-10-10）；
-                                文案必须短 —— 系统字号放大（用户机 font_scale=1.12）时设备名会换行，
-                                长文案会被挤成「已连接 · 点…」（2026-10-10 真机实测） */}
-                            <p className="text-[13px] font-medium text-black/40 mt-0.5 truncate">
-                              {isConnecting ? "正在连接…" : isSelected ? "点击断开连接" : "点击连接"}
-                            </p>
-                          </div>
-                        </button>
-
-                        <div className="flex items-center gap-1.5 shrink-0 pl-2">
-                          {isConnecting ? (
-                            <CircleNotch className="w-5 h-5 animate-spin text-[#4361EE]" />
-                          ) : isSelected ? (
-                            <div className="w-6 h-6 rounded-full bg-[#4361EE] text-white flex items-center justify-center animate-in zoom-in-75">
-                              <Check className="w-3.5 h-3.5 stroke-[2]" />
-                            </div>
-                          ) : null}
-                          {/* 移除：只从列表里去掉（小米账号里不动），「重新导入设备列表」可找回 */}
-                          <button
-                            type="button"
-                            aria-label={`移除 ${device.name}`}
-                            onClick={() => setDeviceRemoveConfirm(device)}
-                            className="w-8 h-8 rounded-full flex items-center justify-center text-black/25 hover:text-[#FF3B30] hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
-                          >
-                            <X className="w-4 h-4 stroke-[2.5]" />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
+                  {/* 排序与标注都按「选中的设备」而不是「已连接的设备」：
+                      没连上的时候也该看得出当前盯的是哪一台（参考图里就是「当前设备 / 未连接」）。
+                      每张卡延迟 30ms 依次进场，视觉上是被托盘甩出来、间距一段段拉开。 */}
+                  {orderDevicesForSwitch(mockDevicesList, selectedDevice.id).map((device, index) => (
+                    <div
+                      key={device.id}
+                      className="card-in"
+                      style={{ animationDelay: `${40 + index * 30}ms` }}
+                    >
+                      <DeviceCard
+                        device={device}
+                        isCurrent={selectedDevice.id === device.id}
+                        isConnecting={connectingId === device.id}
+                        isConnected={isDeviceConnected && selectedDevice.id === device.id}
+                        onSelect={d =>
+                          isDeviceConnected && selectedDevice.id === d.id
+                            ? handleDisconnectDevice(d) // 点已连接的那台 = 主动断开
+                            : handleSelectDevice(d)
+                        }
+                        onMore={openDeviceMenu}
+                      />
+                    </div>
+                  ))}
                 </div>
               </div>
 
-              {/* 底部独立按钮操作区：规范高 44，全圆角 */}
-              <div className="pt-3 border-t border-black/5 flex flex-col gap-2">
+              {/* 底部：重新导入（托盘的收尾操作，固定不滚动） */}
+              <div className="px-4 pt-3 pb-[calc(16px+env(safe-area-inset-bottom,0px))] border-t border-black/5 shrink-0">
                 <button
                   type="button"
                   onClick={() => {
@@ -8924,10 +9328,7 @@ export default function App() {
                   <ArrowsClockwise className="w-4 h-4 text-black/60 stroke-[2]" />
                   <span>重新导入设备列表</span>
                 </button>
-
-                {/* 退出登录只保留在「设置」页（用户要求：浮窗里去掉，列表可操作空间更大） */}
               </div>
-
             </div>
           </div>
         )}
@@ -9073,6 +9474,45 @@ export default function App() {
         )}
 
         {/* 移除设备二次确认：只从列表移除，小米账号不动 */}
+        {/* 设备卡右侧「⋯」：贴着按钮弹出的小浮窗（只有两项，不遮挡整屏）。
+            连接是主操作（点卡片），断开与删除是次要操作，放这里避免误触。 */}
+        {deviceMenu && (
+          <>
+            {/* 点空白处关掉：透明遮罩，不压暗背景（这是小浮窗不是弹窗） */}
+            <div className="fixed inset-0 z-[58]" onClick={() => setDeviceMenu(null)} />
+            <div
+              className="fixed z-[59] w-[176px] rounded-2xl overflow-hidden bg-white border border-black/5 shadow-[0_10px_30px_rgba(0,0,0,0.16)] animate-in fade-in zoom-in-95 duration-150 origin-top-right"
+              style={{ left: deviceMenu.x, top: deviceMenu.y }}
+            >
+              <button
+                type="button"
+                disabled={!(isDeviceConnected && selectedDevice.id === deviceMenu.device.id)}
+                onClick={() => {
+                  const dev = deviceMenu.device;
+                  setDeviceMenu(null);
+                  // 断开连接 = 断开且**不再自动重连**（与点已连接那台同一套语义）
+                  handleDisconnectDevice(dev);
+                }}
+                className="w-full text-left px-4 py-3 text-[15px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer disabled:text-black/20 disabled:cursor-default disabled:active:bg-transparent"
+              >
+                断开连接
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  const dev = deviceMenu.device;
+                  setDeviceMenu(null);
+                  setDeviceRemoveConfirm(dev);
+                }}
+                className="w-full text-left px-4 py-3 text-[15px] font-bold text-[#FF3B30] border-t border-black/5 active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
+              >
+                删除设备
+              </button>
+            </div>
+          </>
+        )}
+
         {deviceRemoveConfirm && (
           <div
             className="absolute inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"

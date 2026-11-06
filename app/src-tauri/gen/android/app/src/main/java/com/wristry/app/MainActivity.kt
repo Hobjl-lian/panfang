@@ -70,13 +70,14 @@ class MainActivity : TauriActivity() {
 
   /**
    * 系统 WebView 过旧的原生兜底：低于 CHROME_MIN_MAJOR_WITH_WORKING_JS 的 Chromium
-   * 连前端 JS 都解析不了（成品按 ES2020+ 打包），页面是纯白，JS 侧的门禁页根本没机会显示。
-   * 能跑 JS 但样式会坏的一档（88~110）交给前端门禁页（App.tsx 的 WEBVIEW_MIN_MAJOR），
-   * 因为那边能给出「去更新」按钮和「仍然继续」。
+   * 连前端 JS 都解析不了，页面是纯白，JS 侧的门禁页根本没机会显示。
+   *
+   * 2026-11-05 起产物整体降到 Chrome 83 打包（`PF_LEGACY_WEBVIEW`，默认开启），
+   * 逻辑赋值已在构建期展开，所以门槛从 88 降到 83、探针改探**成品里仍然存在**的
+   * `?.` / `??`（Chrome 80 语法）：能解析说明 JS 跑得起来，就交给前端门禁页去提示。
    *
    * UA 里的版本号在部分国产 ROM 上会被冻住（引擎其实不旧），所以这里不直接信 UA：
-   * 先问引擎能不能解析成品里用到的那几个运算符，能解析就说明 JS 跑得起来，
-   * 那就交给前端门禁页去提示 —— 别把一个其实能用的用户关在门外。
+   * 先问引擎能不能解析，能解析就放行 —— 别把一个其实能用的用户关在门外。
    */
   private fun warnIfWebViewTooOld(ua: String?) {
     val major = ua?.let(::chromeMajor) ?: return // 取不到版本就放行：拿不准的机型宁可不拦
@@ -202,8 +203,11 @@ class MainActivity : TauriActivity() {
   }
 
   private companion object {
-    /** 低于这个 Chromium 主版本，前端产物（ES2020+，用到 ??= / ||= / &&=）可能连解析都过不了 → 白屏 */
-    const val CHROME_MIN_MAJOR_WITH_WORKING_JS = 88
+    /**
+     * 低于这个 Chromium 主版本，前端产物（构建期降到 chrome83）可能连解析都过不了 → 白屏。
+     * 与前端 `App.tsx` 的 `WEBVIEW_MIN_MAJOR`、Rust `diag.rs` 的上报门槛三处保持一致。
+     */
+    const val CHROME_MIN_MAJOR_WITH_WORKING_JS = 83
 
     /** Kotlin 写给 Rust 的探测文件（放在 app_data_dir 根下） */
     const val WEBVIEW_PROBE_FILE = "webview_probe"
@@ -212,10 +216,11 @@ class MainActivity : TauriActivity() {
     const val PROBE_TIMEOUT_MS = 4000L
 
     /**
-     * 问引擎「成品里这几个运算符你解析得了吗」：逻辑赋值是 Chrome 85 的语法，
-     * 解析不了就是白屏，解析得了就说明 JS 侧门禁页能跑起来。
+     * 问引擎「成品里这几个语法你解析得了吗」：可选链与空值合并是 Chrome 80 的语法，
+     * 构建期没有也不需要降级它们 —— 解析不了就说明成品跑不起来，解析得了就交给前端门禁页。
+     * （原来的 `??=` 探针随产物降级一起作废：成品里已经没有逻辑赋值了，再探它只会误杀。）
      */
     const val JS_PARSE_PROBE =
-      "(function(){try{eval('var a=1;a??=2;a||=3;a&&=4');return '1'}catch(e){return '0'}})()"
+      "(function(){try{eval('var a={b:1};var c=a?.b??2;var d=[1]?.length;');return '1'}catch(e){return '0'}})()"
   }
 }

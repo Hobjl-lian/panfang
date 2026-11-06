@@ -36,6 +36,50 @@ class ConnKeepService : Service() {
          *  插件侧发起 start 时是异步的、回调还没跑，所以那个 setter 必须对外可写。 */
         @Volatile
         var running: Boolean = false
+
+        /**
+         * 改写通知正文（连接状态变了由 Rust 侧调，见 conn.rs 的 set_keepalive_text）。
+         *
+         * 为什么要有：通知以前只在 start 时写死「<设备名> · 已连接」，之后**再不改**。
+         * 手环断了、正在重连、放弃了，通知还挂着「已连接」——买家据此以为链路好好的，
+         * 装表盘失败时也想不到是连接没了。现在让通知跟着连接总管的状态走。
+         *
+         * 服务没在跑（已断开/已停止）就什么都不做：那时不该有这条通知。
+         */
+        fun updateText(ctx: Context, text: String) {
+            if (!running) return
+            try {
+                val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                // 同一个 id notify = 原地改内容，不会多出一条
+                nm.notify(NOTIF_ID, build(ctx, text))
+            } catch (e: Exception) {
+                // 权限被撤销（Android 13+）等情况：静默失败，不影响连接
+                android.util.Log.w("ConnKeep", "更新通知失败: ${e.message}")
+            }
+        }
+
+        private fun build(ctx: Context, text: String): Notification {
+            val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+            val contentIntent = launch?.let {
+                PendingIntent.getActivity(
+                    ctx,
+                    0,
+                    it,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            }
+            val builder = NotificationCompat.Builder(ctx, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setContentTitle("盘坊正在保持与手环的连接")
+                .setContentText(text)
+                .setOngoing(true)
+                .setShowWhen(false)
+                .setSilent(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            if (contentIntent != null) builder.setContentIntent(contentIntent)
+            return builder.build()
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -47,7 +91,7 @@ class ConnKeepService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val name = intent?.getStringExtra(EXTRA_NAME)?.trim().orEmpty().ifEmpty { "手环" }
-        val notification = buildNotification("$name · 已连接")
+        val notification = build(this, "$name · 已连接")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         } else {
@@ -80,28 +124,5 @@ class ConnKeepService : Service() {
             setSound(null, null)
         }
         nm.createNotificationChannel(channel)
-    }
-
-    private fun buildNotification(text: String): Notification {
-        val launch = packageManager.getLaunchIntentForPackage(packageName)
-        val contentIntent = launch?.let {
-            PendingIntent.getActivity(
-                this,
-                0,
-                it,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-        }
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("盘坊正在保持与手环的连接")
-            .setContentText(text)
-            .setOngoing(true)
-            .setShowWhen(false)
-            .setSilent(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-        if (contentIntent != null) builder.setContentIntent(contentIntent)
-        return builder.build()
     }
 }

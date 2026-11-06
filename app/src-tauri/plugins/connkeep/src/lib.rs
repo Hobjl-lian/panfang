@@ -40,6 +40,11 @@ struct StartArg<'a> {
     addr: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+struct StatusArg<'a> {
+    text: &'a str,
+}
+
 /// 手机型号/系统（诊断打点用；不含账号信息）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PhoneInfo {
@@ -92,6 +97,14 @@ impl<R: Runtime> ConnKeep<R> {
     pub fn stop(&self) -> Result<(), String> {
         self.handle
             .run_mobile_plugin::<()>("stop", ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 改通知正文（链路断了 / 正在重连 / 已放弃时调）。
+    /// 服务没在跑时是空操作 —— 那时本来就不该有这条通知。
+    pub fn set_status(&self, text: &str) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin::<()>("updateStatus", StatusArg { text })
             .map_err(|e| e.to_string())
     }
 
@@ -179,6 +192,9 @@ impl<R: Runtime> ConnKeep<R> {
     }
     pub fn stop(&self) -> Result<(), String> {
         Err("连接保活仅安卓可用".into())
+    }
+    pub fn set_status(&self, _text: &str) -> Result<(), String> {
+        Ok(())
     }
     pub fn is_running(&self) -> Result<bool, String> {
         Ok(false)

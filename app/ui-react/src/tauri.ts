@@ -152,7 +152,7 @@ export interface LocalPayloadProbe {
  * 只是候选值；确认页会再和手环上已有的 ID 比对。
  */
 export function randomWatchfaceId(): string {
-  // 界面门槛是 Chromium 111+，crypto.getRandomValues 必然可用
+  // 界面门槛是 Chromium 83+，crypto.getRandomValues 必然可用
   const bytes = new Uint8Array(12);
   crypto.getRandomValues(bytes);
   let s = String(1 + (bytes[0] % 9));
