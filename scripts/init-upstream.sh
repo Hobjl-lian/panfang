@@ -42,13 +42,13 @@ else
 fi
 git -C "$DEST" checkout "$PINNED_COMMIT"
 
-echo "==> 2/4 拉取公开模块（abtools sync）"
+echo "==> 2/5 拉取公开模块（abtools sync）"
 if command -v python >/dev/null 2>&1; then PY=python; else PY=python3; fi
 ( cd "$DEST" && "$PY" abtools.py sync ) || {
   echo "!! abtools sync 未完全成功（私有模块会失败，属正常）。请确认 core/pb/account/bluetooth 已存在。"
 }
 
-echo "==> 3/4 把各模块钉到本版本验证过的提交"
+echo "==> 3/5 把各模块钉到本版本验证过的提交"
 while read -r rel sha; do
   [ -z "${rel:-}" ] && continue
   if [ -d "$DEST/src-tauri/$rel/.git" ]; then
@@ -65,10 +65,31 @@ while read -r rel sha; do
   fi
 done <<< "$PINNED_MODULES"
 
-echo "==> 4/4 放置 netcfg 占位模块"
+echo "==> 4/5 放置 netcfg 占位模块"
 mkdir -p "$DEST/src-tauri/modules/netcfg/src"
 cp "$ROOT/vendor/netcfg/Cargo.toml" "$DEST/src-tauri/modules/netcfg/Cargo.toml"
 cp "$ROOT/vendor/netcfg/src/lib.rs"  "$DEST/src-tauri/modules/netcfg/src/lib.rs"
+
+echo "==> 5/5 应用 inappbrowser 本地改动"
+# App 侧直接调用的几个方法（set_system_bars / set_back_lock / set_keep_screen_on /
+# open_webview_settings）以及 ConnectError::Failed 只存在于本地插件里，上游没有。
+# 补丁路径相对插件根，所以必须在该目录里 apply；已经打过的再跑一次会失败，按幂等处理。
+PATCH="$ROOT/docs/patches/inappbrowser-local-changes.patch"
+PLUGIN="$DEST/src-tauri/plugins/inappbrowser"
+if [ -f "$PATCH" ]; then
+  if git -C "$PLUGIN" apply --check "$PATCH" 2>/dev/null; then
+    git -C "$PLUGIN" apply "$PATCH"
+    echo "    已应用 inappbrowser-local-changes.patch"
+  elif git -C "$PLUGIN" apply --reverse --check "$PATCH" 2>/dev/null; then
+    echo "    补丁已应用过，跳过"
+  else
+    echo "!! 补丁与当前插件提交对不上（先核对 PINNED_MODULES 里的 inappbrowser 提交）" >&2
+    exit 1
+  fi
+else
+  echo "!! 找不到 $PATCH" >&2
+  exit 1
+fi
 
 echo
 echo "完成。接下来："

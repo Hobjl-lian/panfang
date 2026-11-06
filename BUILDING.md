@@ -10,10 +10,12 @@ App 通过 **Cargo 路径依赖** 复用 [AstroBox-NG](https://github.com/Astral
 本仓库不含其源码：
 
 ```bash
-bash scripts/init-upstream.sh      # 克隆 AstroBox-NG 到 repos/AstroBox-NG，并按钉住的提交检出
+bash scripts/init-upstream.sh      # 克隆 AstroBox-NG、钉住各模块提交、打本地补丁
 ```
 
-钉住的提交（`4735de6`，对应 AstroBox-NG 2.2.0）已包含本项目需要的全部改动，检出后无需再打补丁。
+钉住的提交已包含本项目需要的上游改动；`init-upstream.sh` 还会把
+`docs/patches/inappbrowser-local-changes.patch` 应用到 `inappbrowser` 插件
+（本项目依赖的少量行为改动，脚本自动完成，无需手工操作）。
 
 （与上游的关系见 README「开源许可与署名」一节。）
 
