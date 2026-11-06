@@ -1,0 +1,11 @@
+{
+  "title": "盘坊 - 可穿戴表盘安装与编辑",
+  "description": "简洁高效的工具助用户通过兑换码一键安装和轻量编辑小米手环付费表盘，提升个性化体验，操作路径极简。",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
