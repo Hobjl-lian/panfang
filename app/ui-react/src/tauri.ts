@@ -686,6 +686,8 @@ export interface MarketFace {
   has_update?: boolean;
   /** 后台勾了「屏蔽小米手环 9 Pro」（9 Pro 请求时服务端已把这条筛掉，仅作状态兜底） */
   block9Pro?: boolean;
+  /** 资源来源：'own' = 自家，'ext' = 第三方（AstroBox 官方源同步进来的）。老服务端没有这字段 = 自家。 */
+  source?: string;
   size?: number;
 }
 

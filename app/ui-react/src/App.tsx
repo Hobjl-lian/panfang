@@ -76,23 +76,34 @@ import {
 } from "@phosphor-icons/react";
 
 /**
- * 集市封面圆角比例（相对预览宽度）。
+ * 集市封面的裁剪圆角：**按设备的真实物理圆角**裁，而不是一刀切某个比例。
  *
- * 封面是**作者导出时就把圆角烤进 PNG** 的：2026-11-05 量了线上 27 张，半径分三档 ——
- * 18 张 = 宽度的 **13.5%**（230 宽取 r≈31px）、5 张 = 24.3%（432 宽的红米手表6 那批）、
- * 4 张 = 47%（作者直接做成半宽胶囊）。四角 alpha=0，弧线上只有 1px 抗锯齿。
+ * 与 Rust 的 `screen_info_for_size` 同一套数值（那是权威来源）：
+ *   212×520 → 104（两端半圆）、192×490 → 280（半圆）、336×480 → 45、432×514 → 104。
+ * 半径按**画布像素**算再等比缩到预览尺寸，所以同一张图在列表和详情页圆角一致。
  *
- * 问题在于那 18 张源图只有 230px 宽，4 倍屏上要铺到 470 物理像素 → 放大约 2 倍，
- * 1px 的弧线被插值成 4px 的软边，看着就是「圆角毛边、有点脏」。
- *
- * 解法：在容器上再裁一次圆角。**半径必须大于作者烤的那个（13.5%）才盖得住** ——
- * 小了等于没裁（已实测：12% 时页面输出与不裁逐像素一致），取 17% 时弧线整体被换成
- * 由设备分辨率重绘的圆角，边缘从 4px 软边变成 1px 硬边。
- * 半径按宽度算而不是写死 px，详情页放大后同样成立。
- * 24.3% 与胶囊那 9 张半径本就比我们大，裁不到，保持作者原样（不会变差）。
+ * 为什么不用固定比例：作者导出时烤的圆角深浅不一（实测有 13.5% / 24.3% / 47% 三档），
+ * 固定比例要么盖不住、要么把作者做好的大圆角裁成小角。按物理圆角裁才是设备真实的形状。
  */
-const PREVIEW_CORNER_RATIO = 0.17;
-const previewCornerRadius = (width: number) => Math.round(width * PREVIEW_CORNER_RATIO);
+function previewCornerRadius(screen: [number, number], displayW: number): number {
+  const [w, h] = screen;
+  const r = (() => {
+    if (w === h) return w / 2;
+    switch (`${w}x${h}`) {
+      case "212x520": return 104;
+      case "192x490": return 280;
+      case "336x480": return 45;
+      case "432x514": return 104;
+      case "390x450": return 90;
+      case "320x385": return 82;
+      case "410x502": return 116;
+      case "280x456": return 36;
+      default: return Math.round(Math.min(w, h) * 0.13);
+    }
+  })();
+  // 半径不能超过宽的一半；再按「画布宽 → 预览宽」等比缩放
+  return Math.max(1, Math.round(Math.min(r, w / 2) * (displayW / w)));
+}
 
 /** 画一条圆角矩形路径（预览画布用；`roundRect` 是 Chrome 99+，旧内核走这条兜底） */
 function roundRectPath(
@@ -939,6 +950,12 @@ function marketTagOptions(faces: MarketFace[]): string[] {
 }
 
 /**
+ * 集市预览图的最大高度（一排 3 个时按这个高度算自然宽度）。
+ * 列宽放不下就等比缩，所以 336/432 这种宽画布不会撑出列。
+ */
+const PREVIEW_MAX_H = 200;
+
+/**
  * 集市卡片名称下的那一行：免费固定「免费」，付费拼 `¥{价}`。
  * 服务端的价格已经是「3.9」这种短字符串；没填就只显示「付费」。
  */
@@ -1016,7 +1033,26 @@ function shuffleBySeed<T>(arr: T[], seed: number): T[] {
 }
 
 /**
- * 按标签 + 搜索词筛（null/空 = 全部），再按当前窗口的种子排序。
+ * 集市排序：**自家付费优先，其次自家免费，最后第三方免费**。
+ *
+ * 用户要求（2026-11-13）：
+ *   1. 自家付费表盘尽量多推、排在最前；
+ *   2. 其次是自家做的免费表盘；
+ *   3. 第三方免费表盘尽量往后靠。
+ *
+ * 分组内部仍按窗口种子洗牌（同一小时内顺序固定，不同买家看到的前排不同），
+ * 这样「多推自家」的同时不会让所有人看到同一批。
+ */
+function marketGroup(f: MarketFace): number {
+  const isOwn = (f.source || "own") === "own";
+  if (isOwn && f.kind === "paid") return 0;
+  if (isOwn) return 1;
+  return 2;
+}
+
+/**
+ * 按标签 + 搜索词筛（null/空 = 全部），再按「自家付费 → 自家免费 → 第三方免费」分组，
+ * 组内按当前窗口的种子洗牌。
  * 筛选在本地做，集市条目只有几十个。
  * 搜索匹配表盘名与标签（关键字），不分大小写。
  */
@@ -1028,7 +1064,10 @@ function filterMarketFaces(faces: MarketFace[], tag: string | null, query = ""):
     const hay = [f.name || "", ...(f.tags || [])].join(" ").toLowerCase();
     return hay.includes(q);
   });
-  return shuffleBySeed(hit, marketRotateSeed());
+  const seed = marketRotateSeed();
+  const groups: MarketFace[][] = [[], [], []];
+  for (const f of hit) groups[marketGroup(f)].push(f);
+  return groups.flatMap(g => shuffleBySeed(g, seed));
 }
 
 /**
@@ -1727,6 +1766,28 @@ export default function App() {
   const marketListRef = useRef<HTMLDivElement | null>(null);
   const marketScrollTopRef = useRef(0);
   const restoreMarketScrollRef = useRef(false);
+  /** 集市卡片网格与实测可用的图片宽度（一排 3 个，宽画布要等比缩） */
+  const marketGridRef = useRef<HTMLDivElement | null>(null);
+  const [marketCardInnerW, setMarketCardInnerW] = useState(0);
+  /**
+   * 量一次集市卡片的内宽：列宽 = (网格宽 - 两个 gap) / 3，再减卡片左右 padding。
+   * 用 ResizeObserver 而不是 CSS aspect-ratio —— 降级构建要跑 Chrome 83（aspect-ratio 要 88+）。
+   */
+  useLayoutEffect(() => {
+    if (currentStep !== "main" || activeTab !== "market") return;
+    const el = marketGridRef.current;
+    if (!el) return;
+    const measure = () => {
+      // 没有白卡、也没有卡片内边距：列宽 = (网格宽 - 两个 gap) / 3
+      const w = Math.floor((el.clientWidth - 24) / 3);
+      if (w > 0) setMarketCardInnerW(prev => (w === prev ? prev : w));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStep, activeTab, marketLoaded]);
   /** 集市安装失败后「重试安装」用 */
   const marketTarget = useRef<{ face: MarketFace; addr: string } | null>(null);
 
@@ -6607,27 +6668,32 @@ export default function App() {
                   )}
 
                   {!marketError && filterMarketFaces(marketFaces, marketTag, marketQuery).length > 0 && (
-                    <div className="grid grid-cols-2 gap-3">
+                    <div ref={marketGridRef} className="grid grid-cols-3 gap-x-3 gap-y-5">
                       {filterMarketFaces(marketFaces, marketTag, marketQuery).map(face => {
-                        // 预览高度统一 168，宽度按画布比例；与小米运动健康首页的卡片同高
-                        const previewH = 168;
-                        const previewW = Math.max(
+                        // 一排 3 个、没有白卡：预览按「高 200 的自然宽度」算，列宽放不下就等比缩
+                        const naturalW = Math.max(
                           1,
-                          Math.round((face.screen[0] * previewH) / face.screen[1])
+                          Math.round((face.screen[0] * PREVIEW_MAX_H) / face.screen[1])
+                        );
+                        const previewW =
+                          marketCardInnerW > 0 ? Math.min(naturalW, marketCardInnerW) : naturalW;
+                        const previewH = Math.max(
+                          1,
+                          Math.round((previewW * face.screen[1]) / face.screen[0])
                         );
                         return (
                           <button
                             key={face.id}
                             type="button"
                             onClick={() => openMarketFace(face)}
-                            className="min-w-0 flex flex-col items-center bg-white rounded-3xl pt-4 pb-4 px-3 text-center cursor-pointer active:scale-[0.97] transition-transform"
+                            className="min-w-0 flex flex-col items-center text-center cursor-pointer active:scale-[0.97] transition-transform"
                           >
                             <div
                               className="relative overflow-hidden shrink-0"
                               style={{
                                 width: previewW,
                                 height: previewH,
-                                borderRadius: previewCornerRadius(previewW)
+                                borderRadius: previewCornerRadius(face.screen, previewW)
                               }}
                             >
                               <img
@@ -6642,10 +6708,10 @@ export default function App() {
                                 </span>
                               )}
                             </div>
-                            <div className="mt-3 w-full text-[15px] font-bold text-black leading-snug truncate">
+                            <div className="mt-2.5 w-full text-[15px] font-bold text-black leading-snug truncate">
                               {face.name}
                             </div>
-                            <div className="mt-0.5 text-[14px] font-medium text-black/40">
+                            <div className="mt-0.5 text-[13px] font-medium text-black/40">
                               {marketPriceLabel(face)}
                             </div>
                           </button>
@@ -7066,7 +7132,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.82"}，开源许可与开发者
+                              盘坊 v{appVersion ?? "0.3.84"}，开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -7079,7 +7145,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.3.82"}
+                      盘坊 v{appVersion ?? "0.3.84"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -7941,7 +8007,7 @@ export default function App() {
                       style={{
                         width: previewW,
                         height: previewH,
-                        borderRadius: previewCornerRadius(previewW)
+                        borderRadius: previewCornerRadius(face.screen, previewW)
                       }}
                       className="block drop-shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
                     />
@@ -9446,7 +9512,7 @@ export default function App() {
                     盘坊
                   </h2>
                   <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.82"}
+                    v{appVersion ?? "0.3.84"}
                   </span>
                 </div>
 
@@ -9490,7 +9556,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.82"}`}
+                            : `当前版本 v${appVersion ?? "0.3.84"}`}
                         </p>
                       </div>
                     </div>
