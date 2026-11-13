@@ -1669,6 +1669,52 @@ pub fn render_preview(
     Ok((r.canvas, cw, ch))
 }
 
+/// 表盘自带的默认壁纸（照片表盘的背景图）：**只画背景层**，不画表盘元素/相框。
+///
+/// 用途：用户换过壁纸之后，还能从留档 `.bin` 里把原图取回来（编辑页的「默认」缩略图）。
+/// 背景图在 .bin 里就是整张壁纸（相框已烙在图里），所以这里按背景层的位置铺满画布，
+/// 画布外的空白按设备底色补黑，编码后可直接当壁纸下发。
+pub fn default_wallpaper(
+    d: &[u8],
+    model: &LayerModelDoc,
+    theme_index: usize,
+    color_group: Option<u32>,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let (cw, ch) = (model.width, model.height);
+    let t = Tables::build(d)?;
+    // 多配色：默认照片跟着当前配色走（该配色没存这张图时回退基础配色）
+    let cg = color_group.unwrap_or(0).min(t.color_groups.saturating_sub(1));
+    t.set_color_group(cg);
+    let theme = model
+        .themes
+        .iter()
+        .find(|t| t.index == theme_index)
+        .or_else(|| model.themes.iter().find(|t| t.kind == "normal"))
+        .ok_or_else(|| anyhow::anyhow!("样式不存在"))?;
+    if theme.kind == "aod" {
+        anyhow::bail!("息屏样式没有可恢复的照片");
+    }
+    let bg_idx = theme
+        .bg_image
+        .ok_or_else(|| anyhow::anyhow!("这个样式没有背景照片"))?;
+    let (rgba, iw, ih) = t
+        .image_rgba(d, bg_idx)
+        .ok_or_else(|| anyhow::anyhow!("背景照片解码失败"))?;
+    let pos = theme
+        .layers
+        .iter()
+        .find(|l| l.kind == "image" && l.r == bg_idx)
+        .map(|l| (l.x, l.y))
+        .unwrap_or((0, 0));
+    // 壁纸要整张不透明：没被背景图盖住的地方按设备底色黑
+    let mut canvas = vec![0u8; (cw as usize) * (ch as usize) * 4];
+    for px in canvas.chunks_mut(4) {
+        px[3] = 255;
+    }
+    blit(&mut canvas, cw, ch, &rgba, iw, ih, pos.0, pos.1);
+    Ok((canvas, cw, ch))
+}
+
 /// 用户照片铺满背景层区域：基础 cover 裁切 + 可选缩放/平移/旋转（裁剪界面产出）
 ///
 /// 反向映射：目标像素 → （去平移、反旋转、除缩放）→ 源图坐标。

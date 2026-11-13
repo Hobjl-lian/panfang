@@ -129,3 +129,81 @@ body {
 }
 
 /* 顶栏 / 底栏一律不透明纯色（见 App.tsx：状态栏条 #F5F6F9、底部 Tab 栏与固定操作栏 #FFF） */
+
+/* —— 壁纸生成器「纯色」自定义滑杆 ——
+   轨道用 CSS 变量传入（色相彩虹条 / 黑-当前色-白），拇指统一白色圆点。
+   Chrome 83 起支持 ::-webkit-slider-runnable-track / thumb。 */
+.gen-color-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 36px;
+  background: transparent;
+  cursor: pointer;
+}
+.gen-color-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--gen-track, #e5e7eb);
+}
+.gen-color-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 2px solid rgba(0, 0, 0, 0.15);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+.gen-color-range:focus {
+  outline: none;
+}
+
+/* —— 壁纸生成器的数值滑杆（缩放/旋转/压暗/模糊）——
+   **必须自己画 thumb**：原生 accent-color 的圆点大小由内核决定，
+   Chrome 83 与新内核长得不一样 → 同一屏里两个滑杆一大一小。
+   这里跟 .gen-color-range 用同一套尺寸（轨道 6px、白点 20px + 描边）。 */
+.gen-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 36px;
+  background: transparent;
+  cursor: pointer;
+}
+.gen-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.1);
+}
+.gen-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 2px solid rgba(0, 0, 0, 0.15);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+.gen-slider:focus {
+  outline: none;
+}
+
+/* —— 浮层动效（已停用）——
+   2026-11-07 起生成器页改成单页滚动，不再有弹出托盘，这两组 keyframes 保留只为
+   兼容可能残留的类名；新代码不要再引用。 */
+
+/* —— 色板容器 ——
+   2026-11-07：**这里不能自己做滚动**。外层编辑区已经是 `overflow-y-auto`，
+   再套一层 `overflow-y:auto` 就是嵌套滚动，WebView 里手指一进去手势就被内层吃掉，
+   整页刷不动（用户报的「选纯色后列表卡住」）。
+   现在只留内边距，色板跟着页面一起滚。 */
+.gen-swatch-scroll {
+  padding: 10px 6px;
+}
+
+/* 色球逐个弹出：**已停用**。
+   每个球挂 will-change 会把它提成独立合成层，十几个层叠在一起，
+   滚动时明显发涩（用户报「滑动很不流畅」）。色板只是静态选项，不需要动效。 */

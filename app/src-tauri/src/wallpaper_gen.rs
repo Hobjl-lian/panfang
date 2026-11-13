@@ -164,6 +164,14 @@ pub struct GenWindow {
     pub rot: f32,
 }
 
+/// 某个配色下对某一层的强制设定（用户不可编辑）
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GenLock {
+    /// 强制纯色填充（`#RRGGBB`）；空 = 这条锁不限制填充
+    pub fill: String,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct GenColor {
@@ -176,6 +184,10 @@ pub struct GenColor {
     pub src: String,
     #[serde(default)]
     pub sha256: String,
+    /// 这个配色下被锁死的层：key = 照片层 id（如 `bg`），value = 强制设定。
+    /// 不需要按配色限制时整个字段省略（旧版 App 不认识这个字段，读到时自然忽略）。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub locks: std::collections::BTreeMap<String, GenLock>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -190,6 +202,7 @@ pub struct GenFrame {
 
 /// 一个表盘的壁纸方案
 #[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct GenConfig {
     #[serde(default = "default_version")]
     pub version: i64,
@@ -197,6 +210,9 @@ pub struct GenConfig {
     pub photos: Vec<GenPhoto>,
     #[serde(default)]
     pub frame: Option<GenFrame>,
+    /// 纯色预设色板（每个表盘一份，第一个是默认色）。App 侧使用，合成不依赖它。
+    #[serde(default)]
+    pub solid_colors: Vec<String>,
 }
 
 impl GenConfig {
@@ -236,6 +252,24 @@ impl GenConfig {
                 }
             }
         }
+        // 配色锁：只能锁已经存在的照片层，fill 必须是真的 #RRGGBB
+        if let Some(f) = self.frame.as_ref() {
+            for c in &f.colors {
+                for (id, lock) in &c.locks {
+                    if !self.photos.iter().any(|p| &p.id == id) {
+                        bail!("配色 {} 锁了一个不存在的层: {}", c.i, id);
+                    }
+                    if !lock.fill.is_empty() {
+                        let ok = lock.fill.len() == 7
+                            && lock.fill.starts_with('#')
+                            && lock.fill[1..].chars().all(|ch| ch.is_ascii_hexdigit());
+                        if !ok {
+                            bail!("配色 {} 的 {} 填充色不是 #RRGGBB: {}", c.i, id, lock.fill);
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -255,6 +289,8 @@ pub struct GenParams {
     /// 拖动平移（参考框像素；相框里那张的位移记在画框的旋转坐标系里）
     pub dx: Option<f32>,
     pub dy: Option<f32>,
+    /// 纯色填充（`#RRGGBB`）。有值 = 这一层画纯色，忽略照片与六个基础功能。
+    pub fill: Option<String>,
 }
 
 /// 一张照片 + 它的参数
@@ -320,8 +356,6 @@ pub fn compose(
 
     for (i, p) in cfg.photos.iter().enumerate() {
         let Some(inp) = inputs.get(i) else { continue };
-        let Some((src, sw, sh)) = inp.rgba else { continue };
-        let t = &p.controls;
         // 参考框：底图 = 整张画布；框内照片 = 相框窗口（位置/倾角都听配置的）
         let (ref_rect, base_rot, clip) = match p.base.as_str() {
             "frame" => {
@@ -338,6 +372,17 @@ pub fn compose(
             }
             _ => ((0.0, 0.0, cw as f32, ch as f32), 0.0, canvas_clip.clone()),
         };
+        // 纯色：直接按这一层的遮罩填，不参与照片的六个基础功能
+        // （缩放/旋转/翻转对纯色没有意义，压暗会让「选的颜色」和成品不一致）
+        if let Some(fill) = inp.params.fill.as_deref() {
+            let Some(color) = parse_hex_color(fill) else {
+                bail!("颜色格式不对: {fill}");
+            };
+            fill_masked(&mut canvas, cw, ch, color, clip.as_deref());
+            continue;
+        }
+        let Some((src, sw, sh)) = inp.rgba else { continue };
+        let t = &p.controls;
         draw_photo_layer(
             &mut canvas, cw, ch, src, sw, sh, ref_rect, base_rot, clip, &inp.params, t,
         )?;
@@ -357,6 +402,44 @@ fn compose_clip(a: Option<&[u8]>, b: &[u8]) -> Vec<u8> {
     match a {
         Some(a) => a.iter().zip(b.iter()).map(|(x, y)| ((*x as u32 * *y as u32) / 255) as u8).collect(),
         None => b.to_vec(),
+    }
+}
+
+/// 解析 `#RRGGBB`（也接受不带 `#` 的六位十六进制）
+fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
+/// 用纯色填一块遮罩区域（遮罩 255 = 全填，0 = 不填；边缘按遮罩 alpha 混合）
+fn fill_masked(canvas: &mut [u8], cw: u32, ch: u32, color: [u8; 3], clip: Option<&[u8]>) {
+    for idx in 0..(cw as usize * ch as usize) {
+        let a = match clip {
+            Some(m) => m[idx] as u32,
+            None => 255,
+        };
+        if a == 0 {
+            continue;
+        }
+        let di = idx * 4;
+        if a == 255 {
+            canvas[di] = color[0];
+            canvas[di + 1] = color[1];
+            canvas[di + 2] = color[2];
+            canvas[di + 3] = 255;
+            continue;
+        }
+        let inv = 255 - a;
+        for c in 0..3 {
+            canvas[di + c] = ((color[c] as u32 * a + canvas[di + c] as u32 * inv) / 255) as u8;
+        }
+        canvas[di + 3] = (a + canvas[di + 3] as u32 * inv / 255).min(255) as u8;
     }
 }
 
@@ -888,5 +971,112 @@ mod tests {
             assert_eq!((ow, oh), (w, h));
             assert_eq!(out.len(), (w * h * 4) as usize);
         }
+    }
+
+    /// 纯色底图：整张画布都应是指定颜色
+    #[test]
+    fn solid_fills_canvas() {
+        let cfg: GenConfig = serde_json::from_str(
+            r#"{"version":1,"canvas":{"w":212,"h":520},
+                "photos":[{"id":"bg","base":"canvas"}]}"#,
+        )
+        .unwrap();
+        let inputs = vec![PhotoInput {
+            rgba: None,
+            params: GenParams {
+                fill: Some("#3366CC".into()),
+                ..Default::default()
+            },
+        }];
+        let (out, w, h) = compose(&cfg, &inputs, None).unwrap();
+        assert_eq!((w, h), (212, 520));
+        for (x, y) in [(0u32, 0u32), (106, 260), (211, 519)] {
+            let i = ((y * w + x) * 4) as usize;
+            assert_eq!(&out[i..i + 4], &[0x33, 0x66, 0xCC, 255][..], "({x},{y})");
+        }
+    }
+
+    /// 纯色相框：只填画框窗口，框外仍是底图
+    #[test]
+    fn solid_frame_fills_window_only() {
+        let cfg: GenConfig = serde_json::from_str(
+            r#"{"version":1,"canvas":{"w":212,"h":520},
+                "photos":[{"id":"bg","base":"canvas"},
+                          {"id":"inner","base":"frame"}],
+                "frame":{"window":{"x":9,"y":90,"w":192,"h":302,"radius":17,"rot":0},
+                         "colors":[{"i":1,"src":"1.png"}]}}"#,
+        )
+        .unwrap();
+        let sw = 100u32;
+        let red = vec![255u8, 0, 0, 255].repeat((sw * sw) as usize);
+        let inputs = vec![
+            PhotoInput {
+                rgba: Some((&red, sw, sw)),
+                params: GenParams::default(),
+            },
+            PhotoInput {
+                rgba: None,
+                params: GenParams {
+                    fill: Some("#0000FF".into()),
+                    ..Default::default()
+                },
+            },
+        ];
+        let empty = vec![0u8; (212 * 520 * 4) as usize];
+        let (out, w, _) = compose(&cfg, &inputs, Some((&empty, 212, 520))).unwrap();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            (out[i], out[i + 1], out[i + 2])
+        };
+        let (r, g, b) = at(106, 240);
+        assert!(b > 200 && r < 60 && g < 60, "框内应为蓝色，实际 {r},{g},{b}");
+        let (r2, g2, b2) = at(10, 10);
+        assert!(r2 > 200 && g2 < 60 && b2 < 60, "框外应为底图红色，实际 {r2},{g2},{b2}");
+    }
+
+    /// 纯色优先于照片，也不吃压暗/模糊/旋转的默认值
+    #[test]
+    fn solid_ignores_photo_and_controls() {
+        let cfg: GenConfig = serde_json::from_str(
+            r#"{"version":1,"canvas":{"w":212,"h":520},
+                "photos":[{"id":"bg","base":"canvas","controls":{
+                  "darken":{"default":0.5,"min":0,"max":1,"step":0.01,"adjustable":true},
+                  "blur":{"default":20,"min":0,"max":40,"step":1,"adjustable":true},
+                  "rotation":{"default":45,"min":-180,"max":180,"step":1,"adjustable":true}}}]}"#,
+        )
+        .unwrap();
+        let sw = 10u32;
+        let white = vec![255u8; (sw * sw * 4) as usize];
+        let inputs = vec![PhotoInput {
+            rgba: Some((&white, sw, sw)),
+            params: GenParams {
+                fill: Some("#112233".into()),
+                ..Default::default()
+            },
+        }];
+        let (out, w, _) = compose(&cfg, &inputs, None).unwrap();
+        let i = ((260 * w + 106) * 4) as usize;
+        assert_eq!(&out[i..i + 4], &[0x11, 0x22, 0x33, 255][..]);
+    }
+
+    /// 纯色也遵守画布圆角：屏幕外的角保持画布初始黑色
+    #[test]
+    fn solid_respects_canvas_radius() {
+        let cfg: GenConfig = serde_json::from_str(
+            r#"{"version":1,"canvas":{"w":212,"h":520,"radius":106},
+                "photos":[{"id":"bg","base":"canvas"}]}"#,
+        )
+        .unwrap();
+        let inputs = vec![PhotoInput {
+            rgba: None,
+            params: GenParams {
+                fill: Some("#FFFFFF".into()),
+                ..Default::default()
+            },
+        }];
+        let (out, w, _) = compose(&cfg, &inputs, None).unwrap();
+        let center = ((260 * w + 106) * 4) as usize;
+        assert_eq!(&out[center..center + 4], &[255, 255, 255, 255][..]);
+        assert_eq!(&out[0..4], &[0, 0, 0, 255][..], "左上角应在屏幕圆角外");
     }
 }

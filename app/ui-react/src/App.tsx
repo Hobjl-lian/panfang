@@ -44,12 +44,17 @@ import {
   appUpdateInstall,
   type AppUpdateCheck,
   type GenConfig,
+  type GenColorEntry,
   type GenNumCtl,
   type GenParams,
+  type GenPhoto,
   type GenPlan,
   defaultGenParams,
   genericGenPlan,
+  genSolidDefaultColor,
   genRefFrameOf,
+  genLocksOf,
+  applyGenLocks,
   resolveCtl,
   rotateVec,
   randomWatchfaceId,
@@ -66,6 +71,7 @@ import {
   Footprints, CaretDown, Plus, GearSix, ArrowsDownUp, ArrowSquareOut,
   Info, ShieldCheck, FileText, Scroll, Code, DotsThree, ArrowClockwise,
   ArrowCounterClockwise, MagnifyingGlassPlus, MagnifyingGlass, SunDim, Drop, IconContext,
+  LockSimple,
   User, Storefront, Copy
 } from "@phosphor-icons/react";
 
@@ -110,7 +116,104 @@ function roundRectPath(
   ctx.closePath();
 }
 
-/** 生成器里的一行滑杆（范围/步进都读方案，不写死；浅色皮肤与外面一致） */
+/**
+ * 自绘滑杆的「轨道 + 白点」。
+ *
+ * **只有白点周围 44px 的圆形热区能起拖，轨道本身完全不响应触摸**（用户 2026-11-13）：
+ * 原来用原生 `<input type=range>`，手指按在轨道任意位置都会立刻跳值并开始拖，
+ * 一页里两层照片各有四根滑杆，上下滑动列表时几乎每次都误触。
+ * 现在轨道只是画出来的，不接事件；改动参数必须按住白点。
+ *
+ * 白点热区用 `touch-action:none` 吃掉垂直手势，避免拖动时连带滚动整页。
+ */
+function DragSlider(props: {
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+  /** 轨道外观（纯色色板用渐变），默认灰底 */
+  trackStyle?: React.CSSProperties;
+  className?: string;
+}) {
+  const { value, min, max, step, onChange, trackStyle, className } = props;
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const dragging = useRef(false);
+  const [active, setActive] = useState(false);
+
+  const lo = Math.min(min, max);
+  const hi = Math.max(min, max);
+  const st = step > 0 ? step : 0.01;
+  const cur = Math.min(hi, Math.max(lo, value));
+  const pct = hi > lo ? (cur - lo) / (hi - lo) : 0;
+
+  const setFromClientX = (clientX: number) => {
+    const el = trackRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0) return;
+    const k = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+    const snapped = Math.round((lo + (hi - lo) * k) / st) * st;
+    onChange(Math.min(hi, Math.max(lo, Number(snapped.toFixed(6)))));
+  };
+
+  return (
+    <div className="flex-1 min-w-0 h-10 flex items-center">
+      <div
+        ref={trackRef}
+        className={`relative w-full h-1.5 rounded-full ${className || "bg-black/10"}`}
+        style={trackStyle}
+      >
+        <div
+          role="slider"
+          aria-valuemin={lo}
+          aria-valuemax={hi}
+          aria-valuenow={cur}
+          className="absolute top-1/2 w-11 h-11 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center cursor-grab active:cursor-grabbing"
+          style={{ left: `${pct * 100}%`, touchAction: "none" }}
+          onPointerDown={e => {
+            dragging.current = true;
+            setActive(true);
+            try {
+              e.currentTarget.setPointerCapture(e.pointerId);
+            } catch {
+              /* 老内核拿不到 capture 也能靠后续 move 事件 */
+            }
+          }}
+          onPointerMove={e => {
+            if (dragging.current) setFromClientX(e.clientX);
+          }}
+          onPointerUp={e => {
+            if (!dragging.current) return;
+            dragging.current = false;
+            setActive(false);
+            try {
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch {
+              /* 已经释放 */
+            }
+          }}
+          onPointerCancel={() => {
+            dragging.current = false;
+            setActive(false);
+          }}
+        >
+          <div
+            className={`w-5 h-5 rounded-full bg-white border-2 shadow-[0_1px_4px_rgba(0,0,0,0.2)] transition-colors ${
+              active ? "border-[#4361EE]" : "border-black/15"
+            }`}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 生成器里的一行滑杆（图标 + 标签 + 轨道 + 数值）。
+ * 三列宽度固定（标签 52 / 轨道自适应 / 数值 44），行与行上下对齐；
+ * 标签列 `whitespace-nowrap`，否则「缩放」会被拆成两行、行高跟着跳。
+ */
 function GenSlider(props: {
   icon: React.ReactNode;
   label: string;
@@ -121,21 +224,21 @@ function GenSlider(props: {
 }) {
   const { icon, label, value, ctl, text, onChange } = props;
   return (
-    <div className="flex items-center gap-2.5">
-      <div className="flex items-center gap-1.5 w-[62px] shrink-0 text-black/45">
+    <div className="flex items-center gap-2.5 h-10">
+      <div className="flex items-center gap-1 w-[52px] shrink-0 text-black/45 whitespace-nowrap">
         {icon}
         <span className="text-[12px] font-medium">{label}</span>
       </div>
-      <input
-        type="range"
+      <DragSlider
+        value={value}
         min={ctl.min}
         max={ctl.max}
         step={ctl.step}
-        value={value}
-        onChange={e => onChange(parseFloat(e.target.value))}
-        className="flex-1 h-1.5 bg-black/10 rounded-lg appearance-none cursor-pointer accent-[#4361EE]"
+        onChange={onChange}
       />
-      <span className="text-[11px] font-mono font-medium text-black/55 w-[46px] text-right">{text}</span>
+      <span className="text-[11px] font-mono font-medium text-black/55 w-[44px] text-right shrink-0">
+        {text}
+      </span>
     </div>
   );
 }
@@ -146,12 +249,195 @@ function GenToggle(props: { label: string; on: boolean; onClick: () => void }) {
     <button
       type="button"
       onClick={props.onClick}
-      className={`flex-1 h-[34px] rounded-xl text-[12px] font-semibold active:scale-95 transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+      className={`flex-1 h-10 rounded-xl text-[12px] font-semibold active:scale-95 transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
         props.on ? "bg-[#4361EE] text-white" : "bg-black/5 text-black/60"
       }`}
     >
       {props.label}
     </button>
+  );
+}
+
+/** 大小写不敏感地比较两个 #RRGGBB */
+function sameHexColor(a: string, b: string) {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
+/** #RRGGBB → 色相（0~360）+ 深浅（0~1，用 HSL 亮度近似；滑杆位置只是起点，颜色以预览为准） */
+function hexToHueShade(hex: string): { hue: number; shade: number } {
+  const h = hex.replace("#", "");
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return { hue: 0, shade: 1 };
+  const r = parseInt(h.slice(0, 2), 16) / 255;
+  const g = parseInt(h.slice(2, 4), 16) / 255;
+  const b = parseInt(h.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  const d = max - min;
+  let hue = 0;
+  if (d > 1e-6) {
+    if (max === r) hue = ((g - b) / d + 6) % 6;
+    else if (max === g) hue = (b - r) / d + 2;
+    else hue = (r - g) / d + 4;
+    hue *= 60;
+  }
+  return { hue, shade: l };
+}
+
+/** HSL → RGB（0~255） */
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = (((h % 360) + 360) % 360) / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (hp < 1) [r, g, b] = [c, x, 0];
+  else if (hp < 2) [r, g, b] = [x, c, 0];
+  else if (hp < 3) [r, g, b] = [0, c, x];
+  else if (hp < 4) [r, g, b] = [0, x, c];
+  else if (hp < 5) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  const m = l - c / 2;
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+}
+
+/**
+ * 色相 + 深浅 → #RRGGBB。
+ * 深浅 0 = 黑，0.5 = 当前色相的标准色，1 = 白；中间线性过渡。
+ * 比二维色板少两个维度，但覆盖纯黑、纯白和常用深浅色，用户只需要理解两个词。
+ */
+function hueShadeToHex(hue: number, shade: number): string {
+  const [r, g, b] = hslToRgb(hue, 1, 0.5);
+  const t = Math.max(0, Math.min(1, shade));
+  let rr: number;
+  let gg: number;
+  let bb: number;
+  if (t <= 0.5) {
+    const k = t * 2;
+    rr = r * k;
+    gg = g * k;
+    bb = b * k;
+  } else {
+    const k = (t - 0.5) * 2;
+    rr = r + (255 - r) * k;
+    gg = g + (255 - g) * k;
+    bb = b + (255 - b) * k;
+  }
+  const to2 = (v: number) => Math.round(v).toString(16).padStart(2, "0");
+  return `#${to2(rr)}${to2(gg)}${to2(bb)}`.toUpperCase();
+}
+
+/** 层卡片/浮层上的短标签：背景照片 → 背景，相框内照片 → 相框内 */
+function genSlotLabel(photo: GenPhoto, count: number) {
+  const s = (photo.label || "").replace(/照片|图片/g, "").trim();
+  if (s) return s;
+  if (count === 1) return "照片";
+  return photo.base === "frame" ? "相框内" : "背景";
+}
+
+/**
+ * 色板（纯色预设 / 相框色号共用同一个组件，保证两处观感完全一致）。
+ *
+ * - 8 列网格，圆球尺寸一致；
+ * - 容器可滚 + 吃掉 overscroll：颜色多时能滚，且不会带着整页跑；
+ * - 内边距给选中环留位置，避免环被容器裁掉（之前横向滚动条切掉了球顶）；
+ * - 每个球逐个弹出（延迟递增），像一串珠子被弹开，不是「啪」地一下全出来。
+ */
+function GenSwatchGrid(props: {
+  items: { key: string; color: string; name?: string; on: boolean }[];
+  onPick: (key: string) => void;
+}) {
+  const { items, onPick } = props;
+  return (
+    <div className="gen-swatch-scroll">
+      {/* 6 列 + 大圆点：8 列时每个格子里圆点几乎顶满，选中环会被容器边缘切掉。
+          列间距给足，圆点缩在格子中间，环怎么都不会碰到裁剪边界。 */}
+      <div className="grid grid-cols-6 gap-x-3 gap-y-3 justify-items-center">
+        {items.map(it => (
+          <button
+            key={it.key}
+            type="button"
+            onClick={() => onPick(it.key)}
+            title={it.name || it.color}
+            className={`w-10 h-10 rounded-full transition-transform duration-150 cursor-pointer active:scale-90 ${
+              it.on ? "ring-2 ring-[#4361EE] ring-offset-1 ring-offset-white" : "ring-1 ring-black/10"
+            }`}
+            style={{ background: it.color }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 纯色自定义面板：只有两根滑杆（颜色 / 深浅），不做二维色板、HEX、RGB。
+ * **内联**在纯色分区里展开，不再是一层浮层，所以没有自己的标题栏和返回/完成按钮
+ * （开合由上面那颗「自定义颜色 / 收起自定义颜色」按钮负责）。
+ */
+function GenCustomColorPanel(props: {
+  value: string;
+  onChange: (hex: string) => void;
+}) {
+  const { value, onChange } = props;
+  // 只在打开时从当前颜色估一个起点；之后以滑杆为准（value 会被父层实时更新）
+  const init = useRef(hexToHueShade(value));
+  const [hue, setHue] = useState(init.current.hue);
+  const [shade, setShade] = useState(init.current.shade);
+
+  const setHueAndKeepVisible = (v: number) => {
+    // 起点是纯黑/纯白时，单拖色相看不到变化 → 自动回到标准色，避免「滑了没反应」
+    const nextShade = shade <= 0.02 || shade >= 0.98 ? 0.5 : shade;
+    setHue(v);
+    setShade(nextShade);
+    onChange(hueShadeToHex(v, nextShade));
+  };
+  const setShadeAndApply = (v: number) => {
+    setShade(v);
+    onChange(hueShadeToHex(hue, v));
+  };
+
+  const hueTrack =
+    "linear-gradient(to right, #ff0000 0%, #ffff00 16.66%, #00ff00 33.33%, #00ffff 50%, #0000ff 66.66%, #ff00ff 83.33%, #ff0000 100%)";
+  const shadeTrack = `linear-gradient(to right, #000000, hsl(${Math.round(hue)}, 100%, 50%), #ffffff)`;
+
+  return (
+    <div>
+      <div className="h-12 rounded-2xl border border-black/5 mb-3" style={{ background: value }} />
+
+      <div className="flex items-center gap-2.5 h-10">
+        <span className="text-[12px] font-medium text-black/45 w-[52px] shrink-0 whitespace-nowrap">
+          颜色
+        </span>
+        <DragSlider
+          value={hue}
+          min={0}
+          max={360}
+          step={1}
+          onChange={setHueAndKeepVisible}
+          trackStyle={{ background: hueTrack }}
+        />
+      </div>
+
+      <div className="flex items-center gap-2.5 h-10">
+        <span className="text-[12px] font-medium text-black/45 w-[52px] shrink-0 whitespace-nowrap">
+          深浅
+        </span>
+        <DragSlider
+          value={Math.round(shade * 100)}
+          min={0}
+          max={100}
+          step={1}
+          onChange={v => setShadeAndApply(v / 100)}
+          trackStyle={{ background: shadeTrack }}
+        />
+      </div>
+      <div className="flex justify-between text-[10px] font-medium text-black/35 px-1 -mt-1">
+        <span className="w-[52px]">黑</span>
+        <span>白</span>
+      </div>
+    </div>
   );
 }
 
@@ -1900,6 +2186,14 @@ export default function App() {
   // 多图壁纸状态（支持 10+ 张正方形预览与上传添加）
   const [wallpapers, setWallpapers] = useState<string[]>(INITIAL_WALLPAPERS);
   const [currentWallpaperIndex, setCurrentWallpaperIndex] = useState(0);
+  /**
+   * 表盘自带的默认照片（从留档 .bin 的背景图取出来）。
+   * `key` = 样式序号:配色序号：换样式/配色后图会重新取，应用时靠它确认手上这张是当前那版。
+   * 选中它时 currentWallpaperIndex = -1。
+   */
+  const [dialDefaultPhoto, setDialDefaultPhoto] = useState<{ b64: string; key: string } | null>(null);
+  const [dialDefaultLoading, setDialDefaultLoading] = useState(false);
+  const dialDefaultSeq = useRef(0);
 
   // ---------------------- 壁纸生成器（照片表盘统一走这一页：有无模板由方案决定） ----------------------
   /** 当前表盘的壁纸方案（null = 还没取到 / 取不到） */
@@ -1914,6 +2208,17 @@ export default function App() {
   const [genActive, setGenActive] = useState(0);
   /** 相框色号（配置里的 i） */
   const [genColor, setGenColor] = useState<number | null>(null);
+  /**
+   * 当前配色锁死的层（照片层 id → 强制纯色）。
+   * 方案给某几个配色写了 `locks`：选到它时那一层只画这个纯色，界面不给编辑。
+   */
+  const genLockFills = genPlan?.config ? genLocksOf(genPlan.config, genColor) : {};
+  const genHasLocks = Object.keys(genLockFills).length > 0;
+  /** 真正拿去预览/生成的参数（在用户值上叠加配色锁） */
+  const genEffParams =
+    genHasLocks && genPlan?.config
+      ? applyGenLocks(genPlan.config, genColor, genParams)
+      : genParams;
   /** 合成结果（PNG data URL） */
   const [genRendering, setGenRendering] = useState(false);
   /** 这次合成是「保存」触发的（按钮上转圈用） */
@@ -1925,6 +2230,16 @@ export default function App() {
   const genFrame = useRef<{ key: string; img: HTMLImageElement | null }>({ key: "", img: null });
   /** 拖动中的实时位移（不经过 React 状态，松手才写回） */
   const genLiveDrag = useRef<{ layer: number; dx: number; dy: number } | null>(null);
+  /** 每层最近一次选的纯色：切回「照片」再切回来时恢复，不清空 */
+  const genLastFill = useRef<Record<number, string>>({});
+  /**
+   * 纯色里「自定义颜色」展开在哪一层（null = 都没展开）。
+   *
+   * 2026-11-07 二次改版：**去掉所有弹出托盘**。用户反馈托盘会盖住表盘预览、
+   * 每次弹出高度还不一样。现在是「预览固定 + 分区滚动 + 底部固定按钮」的单页结构，
+   * 内容区自己滚，预览永远露着，高度不会跳。
+   * 纯色也不再折叠：切到纯色就直接给色相/深浅两根滑杆。
+   */
   /** 进这一页时的壁纸数量：返回时问「是否保存」要靠它区分「这次做的」 */
   const genEntryCount = useRef<number | null>(null);
   const [genExitAsk, setGenExitAsk] = useState(false);
@@ -2543,6 +2858,54 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentStep, selectedStyle, selectedColorName, currentWallpaperIndex, containers, wallpapers]);
 
+  /** 默认照片对应的「样式:配色」标识：换样式/配色后拿来判断手上的图是不是最新的 */
+  const dialDefaultPhotoKey = () => {
+    const m = binSession.current?.model;
+    if (!m) return "";
+    const pos = (dialOptions.current?.colorNames || []).indexOf(selectedColorName);
+    const cg = pos >= 0 ? dialOptions.current!.colorIds[pos] : null;
+    const useCg = (m.colorGroups || []).length > 1 ? cg : null;
+    return `${themeIndexOf(selectedStyle)}:${useCg ?? -1}`;
+  };
+
+  // 默认照片：进编辑页 / 换样式 / 换配色时，从留档 .bin 的背景图取当前这一版。
+  // 不另存一份：留档 .bin 就是安装时留下的原件，用户换过壁纸之后原图还在里面。
+  useEffect(() => {
+    if (currentStep !== "dial_edit") return;
+    const session = binSession.current;
+    const m = session?.model;
+    if (!invoke || !session?.dataB64 || !m?.photoAlbum) {
+      setDialDefaultPhoto(null);
+      setDialDefaultLoading(false);
+      return;
+    }
+    const themeIndex = themeIndexOf(selectedStyle);
+    const pos = (dialOptions.current?.colorNames || []).indexOf(selectedColorName);
+    const cg = pos >= 0 ? dialOptions.current!.colorIds[pos] : null;
+    const useCg = (m.colorGroups || []).length > 1 ? cg : null;
+    const key = `${themeIndex}:${useCg ?? -1}`;
+    const mySeq = ++dialDefaultSeq.current;
+    setDialDefaultLoading(true);
+    void (async () => {
+      try {
+        const png = (await invoke("watchface_default_wallpaper", {
+          dataB64: session.dataB64,
+          themeIndex,
+          deviceModel: connected.current.model || null,
+          colorGroup: useCg
+        })) as string | null;
+        if (mySeq !== dialDefaultSeq.current) return;
+        setDialDefaultPhoto(png ? { b64: png, key } : null);
+      } catch {
+        // 取不到就不显示「默认」：不影响页面的其它操作
+        if (mySeq === dialDefaultSeq.current) setDialDefaultPhoto(null);
+      } finally {
+        if (mySeq === dialDefaultSeq.current) setDialDefaultLoading(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStep, dialSessionState, selectedStyle, selectedColorName]);
+
   /** 编辑页入口：留档 .bin → 图层模型 → 选项数组 / 相册 / 预览图
    *  （**真机上不许拿设计稿的演示数据充数**：没连设备/拿不到留档时留成 failed，界面会明确提示） */
   const loadDialSession = async (dial: InstalledDial) => {
@@ -2648,7 +3011,11 @@ export default function App() {
       setDials(prev => prev.map(d => (d.id === dial.id ? { ...d, isPhotoDial: isPhoto } : d)));
       setEditingDial(prev => (prev && prev.id === dial.id ? { ...prev, isPhotoDial: isPhoto } : prev));
 
-      if (isPhoto) await loadDialAlbum(dial.id, () => !stale());
+      if (isPhoto) {
+        await loadDialAlbum(dial.id, () => !stale());
+        // 自己的相册是空的：默认照片就是唯一能用的壁纸，直接选中它（应用 = 恢复默认）
+        if (!wallpaperMeta.current.length && !stale()) setCurrentWallpaperIndex(-1);
+      }
       await renderDialPreview({ styleName: startStyle, colorName: colorNames[startColorPos >= 0 ? startColorPos : 0], wallIdx: 0 });
       if (stale()) return;
       setDialSessionState("ready");
@@ -3634,6 +4001,9 @@ export default function App() {
     setIsApplying(false);
     setAppliedSuccess(false);
     setRenderPreviewUrl(null);
+    // 默认照片不能带到下一个表盘：先清空，等这一页的 .bin 读出来再取
+    setDialDefaultPhoto(null);
+    setDialDefaultLoading(!!invoke);
     setDialScreens({ dial: null, device: null });
     binSession.current = null;
     dialOptions.current = null;
@@ -4101,15 +4471,15 @@ export default function App() {
     setPaidError(null);
     setPaidLoaded(false);
     try {
-      if (!paidScreen) {
-        try {
-          const s = (await inv("paid_device_screen", {
-            model: connected.current.model || ""
-          })) as { screen?: [number, number] | null } | null;
-          if (s?.screen) setPaidScreen(s.screen);
-        } catch {
-          /* 型号认不出：列表按「可安装」展示，卡片上写明适配机型 */
-        }
+      // 每次进列表都重认一次本机屏幕：型号表认不出来就是空，
+      // 卡片按「暂不支持你的设备」展示，绝不拿上一台设备/别的型号去凑。
+      try {
+        const s = (await inv("paid_device_screen", {
+          model: connected.current.model || ""
+        })) as { screen?: [number, number] | null } | null;
+        setPaidScreen(s?.screen ?? null);
+      } catch {
+        setPaidScreen(null);
       }
       const d = (await inv("paid_list")) as PaidListResponse | null;
       setPaidProducts(d?.products ?? []);
@@ -4172,6 +4542,35 @@ export default function App() {
       /* 静默：读不到就当作「都没装过」，宁可不标也不乱标 */
     }
   };
+
+  /**
+   * 接上 / 换设备后重新认一次本机屏幕。
+   * `paidScreen` 是「我的表盘」匹配设备行的唯一依据：换设备后沿用它，就会拿上一台
+   * 手表的屏幕去配包（也和 2026-11-12 的错发同一类）。认不出型号就留空 → 列表显示
+   * 「暂不支持你的设备」，不再退而求其次。
+   */
+  useEffect(() => {
+    const inv = invoke;
+    if (!inv) return;
+    if (!isDeviceConnected) {
+      setPaidScreen(null);
+      return;
+    }
+    let alive = true;
+    void (async () => {
+      try {
+        const s = (await inv("paid_device_screen", {
+          model: connected.current.model || ""
+        })) as { screen?: [number, number] | null } | null;
+        if (alive) setPaidScreen(s?.screen ?? null);
+      } catch {
+        if (alive) setPaidScreen(null);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [invoke, isDeviceConnected, connectedId]);
 
   // ================= 集市（免费表盘） =================
 
@@ -4283,10 +4682,13 @@ export default function App() {
       showToast("请先连接手环设备", "error");
       return;
     }
-    if (
-      marketScreen &&
-      (face.screen[0] !== marketScreen[0] || face.screen[1] !== marketScreen[1])
-    ) {
+    // 认不出本机屏幕（新型号不在型号表里）：没有匹配依据就不装，
+    // 否则只能盲发一个包过去，等手表用 OpNotSupport 拒绝（2026-11-12 事故）。
+    if (!marketScreen) {
+      showToast("暂不支持你的设备", "error");
+      return;
+    }
+    if (face.screen[0] !== marketScreen[0] || face.screen[1] !== marketScreen[1]) {
       showToast("这个表盘不适配你的设备", "error");
       return;
     }
@@ -4396,15 +4798,18 @@ export default function App() {
     return map;
   })();
 
-  /** 这个资源里能装哪个设备行（按本机屏幕匹配；认不出屏幕时取第一行） */
+  /**
+   * 这个资源里能装哪个设备行（按本机屏幕匹配）。
+   * 认不出屏幕（新型号不在型号表里）时**绝不猜**：宁可显示「暂不支持你的设备」，
+   * 也不能取第一行 —— 那会把别的型号的包发给用户（2026-11-12 红米手表6 活力版
+   * q65acn 被发成手环 10/11，装一次失败一次）。
+   */
   const matchPaidVariant = (p: PaidProduct): { variant: PaidVariant | null; screenKnown: boolean } => {
-    if (paidScreen) {
-      const hit = p.variants.find(
-        v => v.screen?.[0] === paidScreen[0] && v.screen?.[1] === paidScreen[1]
-      );
-      return { variant: hit ?? null, screenKnown: true };
-    }
-    return { variant: p.variants[0] ?? null, screenKnown: false };
+    if (!paidScreen) return { variant: null, screenKnown: false };
+    const hit = p.variants.find(
+      v => v.screen?.[0] === paidScreen[0] && v.screen?.[1] === paidScreen[1]
+    );
+    return { variant: hit ?? null, screenKnown: true };
   };
 
   /**
@@ -4422,8 +4827,13 @@ export default function App() {
     }
     // 型号防呆（防御性兜底）：设备行屏幕 ≠ 本机屏幕就拦下
     // （列表页本来就按本机屏幕过滤，这里是防止误点了别的型号的行）
+    // 认不出本机屏幕（新型号不在型号表里）同样拦下：没有匹配依据就不装。
     const vs = variant.screen;
-    if (vs?.[0] && vs[1] && paidScreen && (vs[0] !== paidScreen[0] || vs[1] !== paidScreen[1])) {
+    if (!paidScreen) {
+      showToast("暂不支持你的设备", "error");
+      return;
+    }
+    if (vs?.[0] && vs[1] && (vs[0] !== paidScreen[0] || vs[1] !== paidScreen[1])) {
       showToast("该表盘不适配你的设备，请选择正确型号的表盘后再试。", "error");
       return;
     }
@@ -4836,6 +5246,7 @@ export default function App() {
       setGenActive(0);
       genImgs.current = new Map();
       genFrame.current = { key: "", img: null };
+      genLastFill.current = {};
     };
     try {
       const p = watchfaceId
@@ -4989,6 +5400,25 @@ export default function App() {
     });
   };
 
+  /** 切换某一层的来源：照片 / 纯色。切到纯色时优先恢复上次颜色，否则用方案预设的第一个 */
+  const setGenSolidMode = (layerIdx: number, solid: boolean) => {
+    const cfg = genPlan?.config;
+    if (!cfg) return;
+    if (solid) {
+      const color = genLastFill.current[layerIdx] || genSolidDefaultColor(cfg);
+      genLastFill.current[layerIdx] = color;
+      setGenParam(layerIdx, { fill: color });
+    } else {
+      setGenParam(layerIdx, { fill: undefined });
+    }
+  };
+
+  /** 选一个纯色（色板或自定义）：立即生效，并记住这一层上次的颜色 */
+  const setGenFillColor = (layerIdx: number, color: string) => {
+    genLastFill.current[layerIdx] = color;
+    setGenParam(layerIdx, { fill: color });
+  };
+
   /**
    * 预览：**与 Rust 合成同一套语义，但画在 WebView 的画布上**。
    *
@@ -5022,16 +5452,37 @@ export default function App() {
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
     const cr = Math.max(0, Math.min(cfg.canvas.radius || 0, W / 2, H / 2));
-    const hasPhoto = cfg.photos.some((_, i) => {
+    const hasContent = cfg.photos.some((_, i) => {
+      if (genEffParams[i]?.fill) return true;
       const im = genImgs.current.get(genLayers[i]?.prev || "");
       return !!im && im.complete && !!im.naturalWidth;
     });
 
     cfg.photos.forEach((photo, i) => {
+      const p = { ...defaultGenParams(photo), ...(genEffParams[i] || {}) };
+      const win = photo.base === "frame" ? cfg.frame?.window || null : null;
+      // 纯色：裁进这一层的形状后整块填色，不参与照片的六个基础功能
+      // （与 Rust `compose` 的 fill 分支同一套语义）
+      if (p.fill) {
+        ctx.save();
+        if (win) {
+          const r = Math.max(0, Math.min(win.radius || 0, win.w / 2, win.h / 2));
+          ctx.beginPath();
+          ctx.save();
+          ctx.translate(win.x + win.w / 2, win.y + win.h / 2);
+          ctx.rotate(((win.rot || 0) * Math.PI) / 180);
+          roundRectPath(ctx, -win.w / 2, -win.h / 2, win.w, win.h, r);
+          ctx.restore();
+          ctx.clip();
+        }
+        ctx.fillStyle = p.fill;
+        ctx.fillRect(0, 0, W, H);
+        ctx.restore();
+        return;
+      }
       const url = genLayers[i]?.prev || "";
       const img = url ? genImgs.current.get(url) : null;
       if (!img || !img.complete || !img.naturalWidth) return;
-      const p = { ...defaultGenParams(photo), ...(genParams[i] || {}) };
       // 拖动中：用实时位移画（不经过 React 状态，手指停/松才写回去）
       const live = genLiveDrag.current;
       if (live && live.layer === i) {
@@ -5039,7 +5490,6 @@ export default function App() {
         p.dy = live.dy;
       }
       const c = photo.controls;
-      const win = photo.base === "frame" ? cfg.frame?.window || null : null;
       const ref = win ? { x: win.x, y: win.y, w: win.w, h: win.h } : { x: 0, y: 0, w: W, h: H };
       const baseRot = win ? win.rot || 0 : 0;
       const cover = Math.max(ref.w / img.naturalWidth, ref.h / img.naturalHeight) * 1.15;
@@ -5082,7 +5532,7 @@ export default function App() {
     // 没选照片的空态：先把屏幕形状画出来（没模板的通用方案也要有个「照片放哪」的底）。
     // 有模板时再盖模板（用户 2026-10-16：「默认加载第一个配色的模板、照片位空着」）。
     const fimg = genFrame.current.img;
-    if (!hasPhoto) {
+    if (!hasContent) {
       ctx.fillStyle = "#E7E9EF";
       if (cr > 0.5) {
         ctx.beginPath();
@@ -5169,6 +5619,8 @@ export default function App() {
     const cfg = genPlan?.config;
     const photo = cfg?.photos[genActive];
     if (!cv || !cfg || !photo) return;
+    // 纯色层没有位移，拖动不响应
+    if (genEffParams[genActive]?.fill) return;
     const rect = cv.getBoundingClientRect();
     if (rect.width <= 0) return;
     const k = cfg.canvas.w / rect.width; // CSS px → 画布 px
@@ -5203,8 +5655,9 @@ export default function App() {
     return (await inv("watchface_generator_render", {
       watchfaceId: session.model.watchfaceId,
       configJson: JSON.stringify(plan.config),
-      paramsJson: JSON.stringify(genParams),
-      photosB64: genLayers.map(l => l.full || l.prev || ""),
+      paramsJson: JSON.stringify(genEffParams),
+      // 纯色层不传照片：Rust 见 fill 就按遮罩填色
+      photosB64: genLayers.map((l, i) => (genEffParams[i]?.fill ? "" : (l.full || l.prev || ""))),
       colorI: genColor
     })) as string | null;
   };
@@ -5228,14 +5681,15 @@ export default function App() {
     setGenActive(0);
     genImgs.current = new Map();
     genLiveDrag.current = null;
+    genLastFill.current = {};
   };
 
   /** 生成器「生成壁纸」：用原图合成一张成品 → 进壁纸列表，并把现场清干净做下一张 */
   const handleGenerateWallpaper = async () => {
     const plan = genPlan;
     if (!plan?.config) return;
-    if (genLayers.slice(0, plan.config.photos.length).some(l => !l.full)) {
-      showToast(plan.config.photos.length > 1 ? "两张照片都要选" : "请先选一张照片", "error");
+    if (!plan.config.photos.every((_, i) => !!genEffParams[i]?.fill || !!genLayers[i]?.full)) {
+      showToast("还有位置没选照片或颜色", "error");
       return;
     }
     setGenRendering(true);
@@ -5246,7 +5700,7 @@ export default function App() {
       // 生成完把现场清干净（用户 2026-10-16：不清掉会以为还没做完）：
       // 照片清空、参数回默认 → 直接引导选下一张
       resetGenEditing(plan.config);
-      showToast(`已生成第 ${total} 张，换张照片继续，或点「保存」回去`);
+      showToast(`已生成第 ${total} 张，继续做下一张，或点「保存」回去`);
     } catch (err) {
       showToast(humanize(err, "generator"), "error");
     } finally {
@@ -5266,9 +5720,10 @@ export default function App() {
 
   /** 这次进来新做了几张（0 = 没什么可保存的） */
   const genSessionMade = Math.max(0, wallpapers.length - (genEntryCount.current ?? wallpapers.length));
-  /** 照片都选齐了、但还没点「生成」——保存时要顺手把它生成出来（别让用户觉得丢了东西） */
+  /** 照片或纯色都齐了、但还没点「生成」——保存时要顺手把它生成出来（别让用户觉得丢了东西） */
   const genPendingEdit =
-    !!genPlan?.config && genLayers.slice(0, genPlan.config.photos.length).every(l => l.full);
+    !!genPlan?.config &&
+    genPlan.config.photos.every((_, i) => !!genEffParams[i]?.fill || !!genLayers[i]?.full);
   /** 这一页有需要问「是否保存」东西：做好的 + 还没生成的 */
   const genDirty = genSessionMade > 0 || genPendingEdit;
 
@@ -5354,6 +5809,14 @@ export default function App() {
         showToast("请先连接设备并载入该表盘的留档", "error");
         return;
       }
+      // 选中「默认」但图还没取回来/已过期：别把空相册发下去
+      if (
+        currentWallpaperIndex === -1 &&
+        (!dialDefaultPhoto?.b64 || dialDefaultPhoto.key !== dialDefaultPhotoKey())
+      ) {
+        showToast("默认照片还没读出来，请稍后再点应用", "error");
+        return;
+      }
       const opt = dialOptions.current;
       const styleName = selectedStyle;
       setIsApplying(true);
@@ -5365,6 +5828,11 @@ export default function App() {
           // 1) 逐张合成待下发壁纸（照片 + 该张自己的裁剪变换，画布尺寸；表盘元素由设备绘制）
           const photosPngB64: string[] = [];
           if (m.photoAlbum) {
+            // 选中「默认」：把表盘自带的那张放第一张（设备按第一张显示），
+            // 自己的壁纸照旧全部保留在相册里，不会因为恢复默认被清掉。
+            if (currentWallpaperIndex === -1 && dialDefaultPhoto) {
+              photosPngB64.push(dialDefaultPhoto.b64);
+            }
             for (let i = 0; i < wallpapers.length; i++) {
               const meta = wallpaperMeta.current[i];
               if (!meta?.b64) continue;
@@ -5431,7 +5899,11 @@ export default function App() {
           // 壁纸被设备拒绝时要说清楚，别把失败报成成功（其余情况沿用设计稿文案）
           const imgOk = report?.imageCode === null || report?.imageCode === undefined || report.imageCode === 0;
           if (imgOk) {
-            showToast(`已应用「${editingDial.name}」配置`);
+            showToast(
+              currentWallpaperIndex === -1
+                ? "已恢复默认照片"
+                : `已应用「${editingDial.name}」配置`
+            );
           } else {
             showToast(`已应用样式/容器；壁纸被设备拒绝（imageCode=${report?.imageCode}）`, "error");
           }
@@ -6546,7 +7018,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.73"}，开源许可与开发者
+                              盘坊 v{appVersion ?? "0.3.80"}，开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -6559,7 +7031,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.3.73"}
+                      盘坊 v{appVersion ?? "0.3.80"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -7339,7 +7811,7 @@ export default function App() {
                         <p className="text-[13px] font-medium text-black/40 mt-1">
                           {v
                             ? `适配 ${v.name}${v.installed && v.installed_version ? `，已装 ${v.installed_version}` : ""}`
-                            : m.screenKnown
+                            : m.screenKnown || isDeviceConnected
                               ? "暂不支持你的设备"
                               : "连接手环后安装"}
                         </p>
@@ -7386,9 +7858,11 @@ export default function App() {
                 ) ?? ownedPaid.variants[0]
               : undefined;
             const canInstall = !!ownedPaid && !!ownedVariant;
-            const compatible =
-              !marketScreen ||
-              (face.screen[0] === marketScreen[0] && face.screen[1] === marketScreen[1]);
+            // 认不出本机屏幕（新型号不在型号表里）：连着设备时就按「不适配」拦下；
+            // 没连设备时仍允许点（点了会提示先连接）。
+            const compatible = marketScreen
+              ? face.screen[0] === marketScreen[0] && face.screen[1] === marketScreen[1]
+              : !isDeviceConnected;
             // 后台勾了「屏蔽小米手环 9 Pro」：列表里本来就不出现，
             // 这里兜住「详情页开着时换成 9 Pro」的情况，别让按钮还能点
             const blockedHere = !!face.block9Pro && marketNinePro;
@@ -7972,7 +8446,11 @@ export default function App() {
                         {/* 背景壁纸实时联动预览 */}
                         {editingDial.isPhotoDial ? (
                           <img
-                            src={wallpapers[currentWallpaperIndex] || wallpapers[0] || undefined}
+                            src={
+                              currentWallpaperIndex === -1 && dialDefaultPhoto
+                                ? b64ToDataUrl(dialDefaultPhoto.b64, "image/png")
+                                : wallpapers[currentWallpaperIndex] || wallpapers[0] || undefined
+                            }
                             alt="表盘壁纸"
                             className="absolute inset-0 w-full h-full object-cover opacity-90 transition-all duration-300"
                           />
@@ -8101,8 +8579,8 @@ export default function App() {
                         </button>
                       </div>
 
-                      {/* 正方形壁纸缩略图横向滑动网格（带 C5 空态样例 3：无照片） */}
-                      {wallpapers.length === 0 ? (
+                      {/* 默认照片 + 自己做的壁纸一排；两边都没有时才显示空态 */}
+                      {wallpapers.length === 0 && !dialDefaultPhoto && !dialDefaultLoading ? (
                         <div className="py-6 flex flex-col items-center justify-center text-center">
                           <p className="text-[14px] font-medium text-black/40 mb-3">
                             {genPlanError || "还没有壁纸，点下面去做一张"}
@@ -8116,7 +8594,44 @@ export default function App() {
                           </button>
                         </div>
                       ) : (
-                        <div className="flex items-center gap-2.5 overflow-x-auto no-scrollbar py-1">
+                        // 留出 padding：滚动容器会裁掉子元素的 ring，不给内边距时
+                        // 第一张的蓝框会被左边切掉一截（用户反馈过）
+                        <div className="flex items-center gap-2.5 overflow-x-auto no-scrollbar py-1 px-1 -mx-1">
+                          {/* 表盘自带的默认照片：不可删除；选中后「应用」= 恢复默认 */}
+                          {dialDefaultPhoto ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCurrentWallpaperIndex(-1);
+                                showToast("已切换至默认照片");
+                              }}
+                              title="表盘自带的默认照片"
+                              className={`relative w-15 h-15 rounded-xl overflow-hidden shrink-0 transition-all cursor-pointer active:scale-95 ${
+                                currentWallpaperIndex === -1
+                                  ? "ring-2 ring-[#4361EE]"
+                                  : "opacity-75 hover:opacity-100 ring-1 ring-black/5"
+                              }`}
+                            >
+                              <img
+                                src={b64ToDataUrl(dialDefaultPhoto.b64, "image/png")}
+                                alt="默认照片"
+                                className="w-full h-full object-cover"
+                              />
+                              <span className="absolute inset-x-0 bottom-0 pt-3 pb-1 bg-gradient-to-t from-black/70 to-transparent text-white text-[10px] font-bold text-center leading-none">
+                                默认
+                              </span>
+                              {dialDefaultLoading && (
+                                <span className="absolute inset-0 bg-white/45" aria-hidden="true" />
+                              )}
+                            </button>
+                          ) : (
+                            dialDefaultLoading && (
+                              <div
+                                className="w-15 h-15 rounded-xl shrink-0 bg-black/[0.05] animate-pulse"
+                                aria-hidden="true"
+                              />
+                            )
+                          )}
                           {wallpapers.map((url, idx) => {
                             const isSelected = currentWallpaperIndex === idx;
                             return (
@@ -8129,7 +8644,7 @@ export default function App() {
                                 }}
                                 className={`relative w-15 h-15 rounded-xl overflow-hidden shrink-0 transition-all cursor-pointer active:scale-95 group ${
                                   isSelected
-                                    ? "ring-2 ring-[#4361EE] scale-105"
+                                    ? "ring-2 ring-[#4361EE]"
                                     : "opacity-75 hover:opacity-100 ring-1 ring-black/5"
                                 }`}
                               >
@@ -8149,18 +8664,18 @@ export default function App() {
                                   <X className="w-3.5 h-3.5 stroke-[2.5]" />
                                 </span>
 
-                                {/* 选中勾号角标 */}
-                                {isSelected && (
-                                  <div className="absolute inset-0 bg-[#4361EE]/20 flex items-center justify-center">
-                                    <div className="w-5 h-5 rounded-full bg-[#4361EE] text-white flex items-center justify-center shadow-xs">
-                                      <Check className="w-3.5 h-3.5 stroke-[2]" />
-                                    </div>
-                                  </div>
-                                )}
+                                {/* 选中只靠外圈蓝框表示：原来叠的蓝色勾会跟右上角的叉号撞在一起 */}
                               </button>
                             );
                           })}
                         </div>
+                      )}
+
+                      {/* 只有默认照片、还没做过壁纸：给一句引导，不占大块空态 */}
+                      {wallpapers.length === 0 && dialDefaultPhoto && (
+                        <p className="text-[13px] font-medium text-black/35 text-center">
+                          还没有自己做的壁纸，点「去制作」做一张
+                        </p>
                       )}
                     </div>
                   )}
@@ -8443,13 +8958,232 @@ export default function App() {
           {currentStep === "photo_generator" && genPlan?.config && (() => {
             const cfg = genPlan.config!;
             const photos = cfg.photos;
-            const active = Math.min(genActive, photos.length - 1);
-            const photo = photos[active];
-            const p = { ...defaultGenParams(photo), ...(genParams[active] || {}) };
-            const c = photo.controls;
             const colors = cfg.frame?.colors || [];
             const missingAssets = (genPlan.missing || []).length > 0;
-            const allPicked = genLayers.slice(0, photos.length).every(l => l.full);
+            const allReady = photos.every(
+              (_, i) => !!genEffParams[i]?.fill || !!genLayers[i]?.full
+            );
+            const nextEmpty = photos.findIndex(
+              (_, i) => !genEffParams[i]?.fill && !genLayers[i]?.full
+            );
+            const activeIdx = Math.min(genActive, photos.length - 1);
+            const activePhoto = photos[activeIdx];
+            const activeParams = {
+              ...defaultGenParams(activePhoto),
+              ...(genEffParams[activeIdx] || {})
+            };
+            const activeLayer = genLayers[activeIdx] || { prev: "", full: "" };
+            const canDragPreview = !!activeLayer.full && !activeParams.fill;
+
+            /** 一层照片的分区：来源切换 + 照片/纯色内容 */
+            const renderPhotoSection = (photo: typeof photos[number], i: number) => {
+              const ctl = photo.controls;
+              const p = { ...defaultGenParams(photo), ...(genEffParams[i] || {}) };
+              const layer = genLayers[i] || { prev: "", full: "" };
+              const isSolid = !!p.fill;
+              const fillColor = p.fill || "";
+              // 方案给这个配色锁了这一层：整块只读，不给来源切换/上传/滑杆
+              const lockFill = genLockFills[photo.id];
+              if (lockFill) {
+                return (
+                  <section
+                    key={photo.id}
+                    id={`gen-sec-${i}`}
+                    className="bg-white rounded-2xl p-4 flex flex-col gap-3"
+                  >
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-[15px] font-bold text-black">
+                        {genSlotLabel(photo, photos.length)}
+                      </h3>
+                      <span className="text-[12px] font-medium text-black/35">已固定</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <div
+                        className="w-14 h-14 rounded-xl shrink-0"
+                        style={{ background: lockFill, boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.08)" }}
+                      />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[13px] font-semibold text-black/70">该配色下固定为纯色</p>
+                        <p className="text-[12px] font-mono text-black/40 mt-0.5">{lockFill}</p>
+                      </div>
+                      <LockSimple weight="bold" className="w-4 h-4 text-black/25 shrink-0" />
+                    </div>
+                    <p className="text-[12px] text-black/35">换一个相框颜色即可编辑这一层</p>
+                  </section>
+                );
+              }
+              /**
+               * 注意：**不在 section 上挂 onPointerDown 去 setGenActive**。
+               * 那样手指一按下就触发一次重渲染，WebView 会把滚动手势打断 → 整个列表卡住不动
+               * （用户 2026-11-07 报的 bug）。改成「只有真正操作这一层的控件时才切 active」。
+               */
+              const patch = (q: Parameters<typeof setGenParam>[1]) => {
+                setGenActive(i);
+                setGenParam(i, q);
+              };
+              return (
+                <section
+                  key={photo.id}
+                  id={`gen-sec-${i}`}
+                  className="bg-white rounded-2xl p-4 flex flex-col gap-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-[15px] font-bold text-black">
+                      {genSlotLabel(photo, photos.length)}
+                    </h3>
+                    <span className="text-[12px] font-medium text-black/35">
+                      {isSolid ? "纯色" : layer.full ? "照片" : "未选择"}
+                    </span>
+                  </div>
+
+                  {/* 来源切换（两粒胶囊，整行等分） */}
+                  <div className="flex rounded-full bg-black/5 p-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGenActive(i);
+                        setGenSolidMode(i, false);
+                      }}
+                      className={`flex-1 h-9 rounded-full text-[13px] font-semibold transition-all cursor-pointer ${
+                        !isSolid
+                          ? "bg-white text-black shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
+                          : "text-black/50"
+                      }`}
+                    >
+                      照片
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGenActive(i);
+                        setGenSolidMode(i, true);
+                      }}
+                      className={`flex-1 h-9 rounded-full text-[13px] font-semibold transition-all cursor-pointer ${
+                        isSolid
+                          ? "bg-white text-black shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
+                          : "text-black/50"
+                      }`}
+                    >
+                      纯色
+                    </button>
+                  </div>
+
+                  {!isSolid ? (
+                    layer.full ? (
+                      <>
+                        {/* 缩略图与按钮同高（都是 56px），不再一大一小 */}
+                        <div className="flex items-stretch gap-3">
+                          <img
+                            src={layer.prev}
+                            alt=""
+                            className="w-14 h-14 rounded-xl object-cover bg-black/5 shrink-0"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => pickGenPhoto(i)}
+                            className="flex-1 h-14 rounded-xl bg-black/5 hover:bg-black/10 active:scale-[0.99] transition-all text-[13px] font-semibold text-black/70 cursor-pointer"
+                          >
+                            更换照片
+                          </button>
+                        </div>
+
+                        {ctl.scale.adjustable && (
+                          <GenSlider
+                            icon={<MagnifyingGlassPlus className="w-4 h-4" />}
+                            label="缩放"
+                            value={p.scale ?? 1}
+                            ctl={ctl.scale}
+                            text={`${(p.scale ?? 1).toFixed(2)}x`}
+                            onChange={v => patch({ scale: v })}
+                          />
+                        )}
+                        {ctl.rotation.adjustable && (
+                          <GenSlider
+                            icon={<ArrowClockwise className="w-4 h-4" />}
+                            label="旋转"
+                            value={p.rotation ?? 0}
+                            ctl={ctl.rotation}
+                            text={`${(p.rotation ?? 0) > 0 ? "+" : ""}${Math.round(p.rotation ?? 0)}°`}
+                            onChange={v => patch({ rotation: v })}
+                          />
+                        )}
+                        {ctl.darken.adjustable && (
+                          <GenSlider
+                            icon={<SunDim className="w-4 h-4" />}
+                            label="压暗"
+                            value={p.darken ?? 0}
+                            ctl={ctl.darken}
+                            text={`${Math.round((p.darken ?? 0) * 100)}%`}
+                            onChange={v => patch({ darken: v })}
+                          />
+                        )}
+                        {ctl.blur.adjustable && (
+                          <GenSlider
+                            icon={<Drop className="w-4 h-4" />}
+                            label="模糊"
+                            value={p.blur ?? 0}
+                            ctl={ctl.blur}
+                            text={`${Math.round(p.blur ?? 0)}`}
+                            onChange={v => patch({ blur: v })}
+                          />
+                        )}
+
+                        {(ctl.flipX.adjustable || ctl.flipY.adjustable) && (
+                          <div className="flex items-center gap-2">
+                            {ctl.flipX.adjustable && (
+                              <GenToggle
+                                label="水平翻转"
+                                on={!!p.flipX}
+                                onClick={() => patch({ flipX: !p.flipX })}
+                              />
+                            )}
+                            {ctl.flipY.adjustable && (
+                              <GenToggle
+                                label="垂直翻转"
+                                on={!!p.flipY}
+                                onClick={() => patch({ flipY: !p.flipY })}
+                              />
+                            )}
+                          </div>
+                        )}
+
+                        {/* 整行长条按钮，不再是一小段文字 */}
+                        <button
+                          type="button"
+                          onClick={() => resetGenLayer(i)}
+                          className="w-full h-11 rounded-xl bg-black/5 hover:bg-black/10 active:scale-[0.99] transition-all text-[13px] font-semibold text-black/55 cursor-pointer flex items-center justify-center gap-1.5"
+                        >
+                          <ArrowCounterClockwise className="w-4 h-4" />
+                          恢复默认
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => pickGenPhoto(i)}
+                        className="w-full h-24 rounded-2xl border border-dashed border-black/15 bg-black/[0.02] flex flex-col items-center justify-center gap-1.5 text-black/45 active:scale-[0.99] transition-transform cursor-pointer"
+                      >
+                        <Plus className="w-6 h-6" />
+                        <span className="text-[13px] font-semibold">选择照片</span>
+                      </button>
+                    )
+                  ) : (
+                    /* 纯色：直接给自定义色板（色相 + 深浅两根滑杆）。
+                       预设色板整块去掉——用户 2026-11-07 明确说那一排圆点不要了。 */
+                    <div className="rounded-2xl bg-black/[0.03] p-3">
+                      <GenCustomColorPanel
+                        value={fillColor || "#FFFFFF"}
+                        onChange={hex => {
+                          setGenActive(i);
+                          setGenFillColor(i, hex);
+                        }}
+                      />
+                    </div>
+                  )}
+                </section>
+              );
+            };
+
             return (
               <div className="flex-1 flex flex-col overflow-hidden bg-[#F5F6F9] page-enter-anim select-none relative">
                 {/* 顶部：返回（问是否保存）/ 标题 / 保存 */}
@@ -8464,7 +9198,6 @@ export default function App() {
                   >
                     返回
                   </button>
-                  {/* 标题按整屏居中（不是夹在两个按钮中间） */}
                   <span className="absolute left-1/2 -translate-x-1/2 text-[17px] font-bold tracking-tight text-black">
                     制作壁纸
                   </span>
@@ -8479,13 +9212,25 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* 预览：画布（形状 = 方案的屏幕圆角）；拖动 = 平移当前层照片 */}
+                {/* 预览：固定 30vh，永远露在上面；选中某层照片后可拖动平移 */}
                 <div
-                  className="flex-1 relative flex items-center justify-center overflow-hidden touch-none px-6 py-2 cursor-grab active:cursor-grabbing"
+                  className={`h-[30vh] shrink-0 relative flex items-center justify-center overflow-hidden touch-none px-6 py-2 ${
+                    canDragPreview ? "cursor-grab active:cursor-grabbing" : ""
+                  }`}
                   onMouseDown={e => {
+                    if (!canDragPreview) return;
                     genDrag.current.active = true;
-                    genDragStart.current = { x: e.clientX, y: e.clientY, dx: p.dx || 0, dy: p.dy || 0 };
-                    genLiveDrag.current = { layer: active, dx: p.dx || 0, dy: p.dy || 0 };
+                    genDragStart.current = {
+                      x: e.clientX,
+                      y: e.clientY,
+                      dx: activeParams.dx || 0,
+                      dy: activeParams.dy || 0
+                    };
+                    genLiveDrag.current = {
+                      layer: activeIdx,
+                      dx: activeParams.dx || 0,
+                      dy: activeParams.dy || 0
+                    };
                   }}
                   onMouseMove={e => {
                     if (genDrag.current.active) genDragDelta(e.clientX, e.clientY);
@@ -8499,14 +9244,19 @@ export default function App() {
                     genDragCommit();
                   }}
                   onTouchStart={e => {
+                    if (!canDragPreview) return;
                     genDrag.current.active = true;
                     genDragStart.current = {
                       x: e.touches[0].clientX,
                       y: e.touches[0].clientY,
-                      dx: p.dx || 0,
-                      dy: p.dy || 0
+                      dx: activeParams.dx || 0,
+                      dy: activeParams.dy || 0
                     };
-                    genLiveDrag.current = { layer: active, dx: p.dx || 0, dy: p.dy || 0 };
+                    genLiveDrag.current = {
+                      layer: activeIdx,
+                      dx: activeParams.dx || 0,
+                      dy: activeParams.dy || 0
+                    };
                   }}
                   onTouchMove={e => {
                     if (genDrag.current.active) genDragDelta(e.touches[0].clientX, e.touches[0].clientY);
@@ -8521,18 +9271,6 @@ export default function App() {
                     className="block pointer-events-none select-none max-h-full max-w-full drop-shadow-[0_6px_20px_rgba(0,0,0,0.10)]"
                     style={{ height: "100%", width: "auto" }}
                   />
-                  {/* 重置当前层：浮在托盘上方的空白区（托盘里不放了，用户 2026-10-16 要求） */}
-                  <button
-                    type="button"
-                    onClick={() => resetGenLayer(active)}
-                    title="重置这一层的参数"
-                    // 它在拖动区里：拦掉按下事件，免得点重置时顺带把照片挪一两像素
-                    onMouseDown={e => e.stopPropagation()}
-                    onTouchStart={e => e.stopPropagation()}
-                    className="absolute right-3 bottom-3 w-9 h-9 rounded-full bg-white shadow-[0_1px_4px_rgba(0,0,0,0.10)] border border-black/5 flex items-center justify-center text-black/55 active:scale-90 transition-transform cursor-pointer z-10"
-                  >
-                    <ArrowCounterClockwise className="w-4 h-4" />
-                  </button>
                   {missingAssets && (
                     <div className="absolute top-1 left-6 right-6 text-center pointer-events-none">
                       <p className="text-[12px] font-medium text-[#D4973B]">
@@ -8542,144 +9280,37 @@ export default function App() {
                   )}
                 </div>
 
-                {/* 底部面板：照片 / 相框颜色 / 六个基础功能 / 已生成列表 / 生成 */}
+                {/* 编辑区：固定占据下半屏，内部可滚 */}
+                <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-4 pt-1 pb-3 flex flex-col gap-3">
+                  {photos.map((ph, i) => renderPhotoSection(ph, i))}
+
+                  {/* 相框颜色：直接铺在列表底部，不再需要点开浮层 */}
+                  {colors.length > 1 && (
+                    <section className="bg-white rounded-2xl p-4 flex flex-col gap-3">
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-[15px] font-bold text-black">相框颜色</h3>
+                        <span className="text-[12px] font-medium text-black/35">
+                          {colors.find(c => c.i === (genColor ?? colors[0]?.i))?.name || ""}
+                        </span>
+                      </div>
+                      <GenSwatchGrid
+                        items={colors.map(col => ({
+                          key: String(col.i),
+                          color: col.swatch || "#888",
+                          name: col.name,
+                          on: (genColor ?? colors[0]?.i) === col.i
+                        }))}
+                        onPick={key => setGenColor(Number(key))}
+                      />
+                    </section>
+                  )}
+                </div>
+
+                {/* 底部固定：已生成数量 + 生成按钮 */}
                 <div
                   data-pf-bottombar
-                  className="px-4 pt-3 safe-bottom-panel bg-white border-t border-black/5 flex flex-col gap-2.5 z-30 shrink-0"
+                  className="px-4 pt-2 safe-bottom-panel bg-white border-t border-black/5 flex flex-col gap-2 shrink-0 z-30"
                 >
-                  {/* 照片：拍立得两张，各自一块；点一块 = 切到那一层调 */}
-                  <div className="flex items-center gap-2.5">
-                    {photos.map((ph, i) => {
-                      const on = i === active;
-                      const has = !!genLayers[i]?.full;
-                      return (
-                        <button
-                          key={ph.id}
-                          type="button"
-                          onClick={() => {
-                            setGenActive(i);
-                            if (!has) pickGenPhoto(i);
-                          }}
-                          className={`flex items-center gap-2 pl-1 pr-2.5 py-1 rounded-xl transition-all cursor-pointer active:scale-95 ${
-                            on ? "bg-[#4361EE]/10 ring-1 ring-[#4361EE]" : "bg-black/5 ring-1 ring-black/5"
-                          }`}
-                        >
-                          <span className="w-7 h-9 rounded-lg overflow-hidden bg-black/5 flex items-center justify-center shrink-0">
-                            {has ? (
-                              <img src={genLayers[i].prev} alt="" className="w-full h-full object-cover" />
-                            ) : (
-                              <Plus className="w-3.5 h-3.5 text-black/40" />
-                            )}
-                          </span>
-                          <span className={`text-[12px] font-semibold ${on ? "text-black" : "text-black/55"}`}>
-                            {ph.label}
-                          </span>
-                        </button>
-                      );
-                    })}
-                    {genLayers[active]?.full ? (
-                      <button
-                        type="button"
-                        onClick={() => pickGenPhoto(active)}
-                        title="换掉这一层的照片"
-                        className="ml-auto h-[34px] px-3.5 rounded-xl bg-black/5 hover:bg-black/10 active:scale-95 transition-all text-[12px] font-semibold text-black/75 cursor-pointer shrink-0"
-                      >
-                        换照片
-                      </button>
-                    ) : (
-                      <span className="ml-auto" />
-                    )}
-                  </div>
-
-                  {/* 相框颜色（方案里给了多个色号才显示） */}
-                  {colors.length > 1 && (
-                    <div className="flex items-center gap-2">
-                      <span className="text-[12px] font-medium text-black/45 w-[62px] shrink-0">相框</span>
-                      {/* 留出环与选中放大的空间：滚动容器会裁剪超出内边距的部分，之前 py-0.5 把球顶/球底切掉了 */}
-                      <div className="flex items-center gap-2 overflow-x-auto no-scrollbar px-1 py-1">
-                        {colors.map(col => {
-                          const on = (genColor ?? colors[0].i) === col.i;
-                          return (
-                            <button
-                              key={col.i}
-                              type="button"
-                              onClick={() => setGenColor(col.i)}
-                              title={col.name}
-                              className={`w-7 h-7 rounded-full shrink-0 transition-all cursor-pointer active:scale-90 ${
-                                on ? "ring-2 ring-[#4361EE] scale-105" : "ring-1 ring-black/15"
-                              }`}
-                              style={{ background: col.swatch || "#888" }}
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* 六个基础功能：方案里 adjustable 的才出控件 */}
-                  {c.scale.adjustable && (
-                    <GenSlider
-                      icon={<MagnifyingGlassPlus className="w-3.5 h-3.5" />}
-                      label="缩放"
-                      value={p.scale ?? 1}
-                      ctl={c.scale}
-                      text={`${(p.scale ?? 1).toFixed(2)}x`}
-                      onChange={v => setGenParam(active, { scale: v })}
-                    />
-                  )}
-                  {c.rotation.adjustable && (
-                    <GenSlider
-                      icon={<ArrowClockwise className="w-3.5 h-3.5" />}
-                      label="旋转"
-                      value={p.rotation ?? 0}
-                      ctl={c.rotation}
-                      text={`${(p.rotation ?? 0) > 0 ? "+" : ""}${Math.round(p.rotation ?? 0)}°`}
-                      onChange={v => setGenParam(active, { rotation: v })}
-                    />
-                  )}
-                  {c.darken.adjustable && (
-                    <GenSlider
-                      icon={<SunDim className="w-3.5 h-3.5" />}
-                      label="压暗"
-                      value={p.darken ?? 0}
-                      ctl={c.darken}
-                      text={`${Math.round((p.darken ?? 0) * 100)}%`}
-                      onChange={v => setGenParam(active, { darken: v })}
-                    />
-                  )}
-                  {c.blur.adjustable && (
-                    <GenSlider
-                      icon={<Drop className="w-3.5 h-3.5" />}
-                      label="模糊"
-                      value={p.blur ?? 0}
-                      ctl={c.blur}
-                      text={`${Math.round(p.blur ?? 0)}`}
-                      onChange={v => setGenParam(active, { blur: v })}
-                    />
-                  )}
-
-                  {/* 翻转（两态）：按方案决定出不出 */}
-                  {(c.flipX.adjustable || c.flipY.adjustable) && (
-                    <div className="flex items-center gap-2">
-                      {c.flipX.adjustable && (
-                        <GenToggle
-                          label="水平翻转"
-                          on={!!p.flipX}
-                          onClick={() => setGenParam(active, { flipX: !p.flipX })}
-                        />
-                      )}
-                      {c.flipY.adjustable && (
-                        <GenToggle
-                          label="垂直翻转"
-                          on={!!p.flipY}
-                          onClick={() => setGenParam(active, { flipY: !p.flipY })}
-                        />
-                      )}
-                    </div>
-                  )}
-
-                  {/* 已生成几张：只留一行文字（原来那排缩略图会把托盘顶高、画布被挤小）。
-                      说的是「这次」——列表里可能有之前做的，别让用户以为丢了 */}
                   <div className="h-[18px] flex items-center">
                     <span className="text-[12px] font-medium text-black/40">
                       {genSessionMade > 0
@@ -8690,13 +9321,19 @@ export default function App() {
                     </span>
                   </div>
 
-                  {/* 主按钮：有照片 → 生成壁纸；没有 → 添加图片（选图）。
-                      保存/返回在上面那两个入口里管（顶栏），不占主按钮 */}
-                  {allPicked ? (
+                  {missingAssets ? (
+                    <button
+                      type="button"
+                      disabled
+                      className="w-full h-[52px] rounded-full bg-black/10 text-black/35 font-bold text-[17px] flex items-center justify-center"
+                    >
+                      相框素材没下齐
+                    </button>
+                  ) : allReady ? (
                     <button
                       type="button"
                       onClick={handleGenerateWallpaper}
-                      disabled={genRendering || missingAssets}
+                      disabled={genRendering}
                       className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/10 disabled:text-black/35 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
                     >
                       {genRendering ? (
@@ -8711,11 +9348,19 @@ export default function App() {
                   ) : (
                     <button
                       type="button"
-                      onClick={() => pickGenPhoto(active)}
-                      disabled={missingAssets}
-                      className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/10 disabled:text-black/35 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
+                      onClick={() => {
+                        if (nextEmpty < 0) return;
+                        setGenActive(nextEmpty);
+                        // 滚到缺的那一层，不然点了没反应（内容区是滚动的）
+                        document
+                          .getElementById(`gen-sec-${nextEmpty}`)
+                          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                      }}
+                      className="w-full h-[52px] rounded-full bg-black/10 text-black/45 font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center"
                     >
-                      <span>添加图片</span>
+                      {nextEmpty >= 0
+                        ? `还差${genSlotLabel(photos[nextEmpty], photos.length)}`
+                        : "还差内容"}
                     </button>
                   )}
                 </div>
@@ -8753,7 +9398,7 @@ export default function App() {
                     盘坊
                   </h2>
                   <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.73"}
+                    v{appVersion ?? "0.3.80"}
                   </span>
                 </div>
 
@@ -8797,7 +9442,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.73"}`}
+                            : `当前版本 v${appVersion ?? "0.3.80"}`}
                         </p>
                       </div>
                     </div>

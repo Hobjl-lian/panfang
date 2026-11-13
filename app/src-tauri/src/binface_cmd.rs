@@ -151,6 +151,34 @@ pub async fn watchface_compose_photo(
     .map_err(|e| format!("{e:#}"))
 }
 
+/// 表盘自带的默认壁纸（照片表盘的背景图）→ PNG base64。
+///
+/// 「恢复默认照片」用：用户把壁纸换掉之后，从留档 `.bin` 里把原图取回来。
+/// 只画背景层、不画表盘元素；多配色表盘按 `color_group` 取对应配色。
+#[tauri::command]
+pub async fn watchface_default_wallpaper(
+    data_b64: String,
+    theme_index: Option<usize>,
+    device_model: Option<String>,
+    color_group: Option<u32>,
+) -> Result<String, String> {
+    let data = decode_b64(&data_b64)?;
+    let theme_index = theme_index.unwrap_or(0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let model = crate::watchface_render::derive_model(&data, device_model.as_deref())?;
+        let (rgba, w, h) = crate::watchface_render::default_wallpaper(
+            &data,
+            &model,
+            theme_index,
+            color_group,
+        )?;
+        watchface_bin::encode_png_pub(&rgba, w, h)
+    })
+    .await
+    .map_err(|e| format!("解析任务失败: {e}"))?
+    .map_err(|e| format!("{e:#}"))
+}
+
 /// 渲染预览（PNG base64）：背景（用户照片或原背景图）→ 逐层（图片 / 槽位→动作→数据项）
 ///
 /// `slot_choices`：可编辑容器的选择（槽位序号 → 动作序号）；不传则每槽取第一个候选。

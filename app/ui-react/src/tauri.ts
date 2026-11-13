@@ -353,6 +353,11 @@ export interface GenColorEntry {
   name: string;
   swatch: string;
   src: string;
+  /**
+   * 这个配色下被锁死的层：key = 照片层 id（`bg` / `inner`）。
+   * 有锁 = 这一层强制走 `fill` 纯色，界面上不给编辑。
+   */
+  locks?: Record<string, { fill?: string }>;
 }
 export interface GenFrame {
   window?: GenWindow | null;
@@ -370,6 +375,8 @@ export interface GenConfig {
   canvas: { w: number; h: number; radius?: number };
   photos: GenPhoto[];
   frame?: GenFrame | null;
+  /** 纯色预设色板（每个表盘一份，第一个是默认色） */
+  solidColors?: string[];
 }
 /** 用户在界面上调出来的值（缺省 = 用方案里的默认值） */
 export interface GenParams {
@@ -382,6 +389,8 @@ export interface GenParams {
   /** 拖动平移（参考框像素；相框里那张的位移记在画框的旋转坐标系里） */
   dx?: number;
   dy?: number;
+  /** 纯色填充（#RRGGBB）。有值 = 这一层画纯色，忽略照片与六个基础功能。 */
+  fill?: string;
 }
 /** `watchface_generator_plan` 的返回 */
 export interface GenPlan {
@@ -468,6 +477,90 @@ export function defaultGenParams(photo: GenPhoto): GenParams {
     dx: 0,
     dy: 0,
   };
+}
+
+const GEN_HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
+
+/** 是不是一个可用的 #RRGGBB */
+export function isGenHexColor(s: string | null | undefined): s is string {
+  return !!s && GEN_HEX_COLOR.test(s);
+}
+
+/** 去重（大小写不敏感，保留第一次出现的写法与顺序） */
+function dedupeColors(list: string[]): string[] {
+  const seen = new Set<string>();
+  return list.filter(c => {
+    const k = c.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+/**
+ * 纯色色板（按优先级）：
+ * 1. 方案预设 `solidColors`，原样使用，第一个是默认色；
+ * 2. 没有预设 → 相框色号，补上黑/白（相框色号不一定有）；
+ * 3. 连相框都没有 → 白、黑、灰。
+ */
+export function genSolidPalette(cfg: GenConfig): string[] {
+  const preset = dedupeColors((cfg.solidColors || []).filter(isGenHexColor));
+  if (preset.length) return preset;
+  const frame = dedupeColors(
+    (cfg.frame?.colors || []).map(c => c.swatch).filter(isGenHexColor)
+  );
+  if (frame.length) {
+    const out = [...frame];
+    for (const c of ["#FFFFFF", "#000000"]) {
+      if (!out.some(v => v.toLowerCase() === c.toLowerCase())) out.push(c);
+    }
+    return out;
+  }
+  return ["#FFFFFF", "#000000", "#8A8A8E"];
+}
+
+/** 进入纯色模式时的默认色 = 色板第一个 */
+export function genSolidDefaultColor(cfg: GenConfig): string {
+  return genSolidPalette(cfg)[0] || "#FFFFFF";
+}
+
+/** 当前选中/默认的相框色号（缺省取第一个，与 Rust `GenConfig::color` 同口径） */
+export function genColorOf(cfg: GenConfig, colorI: number | null): GenColorEntry | null {
+  const colors = cfg.frame?.colors || [];
+  if (!colors.length) return null;
+  const want = colorI ?? colors[0].i;
+  return colors.find(c => c.i === want) || colors[0];
+}
+
+/**
+ * 某个配色下被锁死的层：照片层 id → 强制纯色（#RRGGBB 大写）。
+ *
+ * 例：黑色/白色相框不给底图，方案里写 `locks: { bg: { fill: "#51504D" } }`，
+ * 用户选到这个配色时底图这一层就只认这个颜色。
+ */
+export function genLocksOf(cfg: GenConfig, colorI: number | null): Record<string, string> {
+  const hit = genColorOf(cfg, colorI);
+  const out: Record<string, string> = {};
+  for (const [id, lock] of Object.entries(hit?.locks || {})) {
+    const fill = lock?.fill;
+    if (isGenHexColor(fill)) out[id] = fill.toUpperCase();
+  }
+  return out;
+}
+
+/** 把配色锁合并进用户参数：锁死的层一律覆盖成方案给的颜色，其余原样 */
+export function applyGenLocks(
+  cfg: GenConfig,
+  colorI: number | null,
+  params: GenParams[]
+): GenParams[] {
+  const locks = genLocksOf(cfg, colorI);
+  if (!Object.keys(locks).length) return params;
+  return params.map((p, i) => {
+    const id = cfg.photos[i]?.id;
+    const fill = id ? locks[id] : undefined;
+    return fill ? { ...p, fill } : p;
+  });
 }
 
 /**

@@ -162,6 +162,7 @@ pub fn run() {
             binface_cmd::watchface_layer_model,
             binface_cmd::watchface_render_preview,
             binface_cmd::watchface_compose_photo,
+            binface_cmd::watchface_default_wallpaper,
             bridge::watchface_apply_edit,
             bridge::watchface_album_get,
             bridge::watchface_archive_list,
