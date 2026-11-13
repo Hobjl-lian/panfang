@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useLayoutEffect } from "react";
 import developerAvatar from "./assets/developer-avatar.png";
 import appIcon from "./assets/app-icon.png";
 import afdianIcon from "./assets/afdian-icon.svg";
@@ -492,6 +492,8 @@ interface PaidProduct {
 interface PaidListResponse {
   products?: PaidProduct[];
   afdian?: { user_id?: string; name?: string } | null;
+  /** 会员档位（老服务端没有这段）：top = 尊享/金主，basic = 轻悦；口径是历史上买过就算 */
+  member?: { is_member?: boolean; tier?: "top" | "basic" | null } | null;
 }
 
 /** 一个版本里的包体（`paid_latest_file` 的 files 项；勾选安装用 file_id） */
@@ -934,6 +936,16 @@ function marketTagOptions(faces: MarketFace[]): string[] {
   return [...counts.keys()].sort(
     (a, b) => rank(a) - rank(b) || (counts.get(b) || 0) - (counts.get(a) || 0) || a.localeCompare(b)
   );
+}
+
+/**
+ * 集市卡片名称下的那一行：免费固定「免费」，付费拼 `¥{价}`。
+ * 服务端的价格已经是「3.9」这种短字符串；没填就只显示「付费」。
+ */
+function marketPriceLabel(face: MarketFace): string {
+  if (face.kind !== "paid") return "免费";
+  const p = (face.price || "").trim();
+  return p ? `¥${p}` : "付费";
 }
 
 /**
@@ -1543,10 +1555,19 @@ export default function App() {
   const [paidAfdianName, setPaidAfdianName] = useState("");
   const [miUserId, setMiUserId] = useState("");
   /**
-   * 从 `paid_list`（= 服务端 `/v1/me`）的响应里取爱发电身份。
+   * 会员档位：`top` = 尊享 / 金主（8 元及以上），`basic` = 轻悦（6 元）。
+   * 只用于集市显示会员价，真正扣款按爱发电那边配的会员价。
+   */
+  const [memberTier, setMemberTier] = useState<"top" | "basic" | null>(null);
+  /**
+   * 从 `paid_list`（= 服务端 `/v1/me`）的响应里取爱发电身份与会员档位。
    * 老服务端没有 `afdian` 段就什么都不做，保持原值（账号页退回显示尾号）。
    */
   const applyAfdianIdentity = (d: PaidListResponse | null) => {
+    // 会员档位（集市显示会员价用）：老服务端没有 `member` 段 → 按非会员处理
+    setMemberTier(
+      d?.member?.tier === "top" ? "top" : d?.member?.tier === "basic" ? "basic" : null
+    );
     if (!d?.afdian) return;
     setPaidAfdianId(d.afdian.user_id ?? "");
     setPaidAfdianName(d.afdian.name ?? "");
@@ -1639,6 +1660,25 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, currentStep]);
 
+  /**
+   * 从集市详情返回：把列表滚回进去之前的位置。
+   * 详情是独立 step（market_detail），整个 Tab 容器会卸载重挂，滚动位置本来必丢；
+   * 这里在重挂后的第一次布局里补回来（内容来自内存里的 marketFaces，不会等数据）。
+   */
+  useLayoutEffect(() => {
+    if (currentStep !== "main" || activeTab !== "market") return;
+    if (!restoreMarketScrollRef.current) return;
+    restoreMarketScrollRef.current = false;
+    const el = marketListRef.current;
+    if (!el) return;
+    const top = marketScrollTopRef.current;
+    el.scrollTop = top;
+    // 顶栏大标题的折叠进度也跟着回到原样（上面那个 effect 刚把它复位成 0）
+    collapseScrollRef.current = top;
+    applyCollapse(top);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStep, activeTab]);
+
   useEffect(
     () => () => {
       if (collapseRafRef.current !== null) cancelAnimationFrame(collapseRafRef.current);
@@ -1683,6 +1723,10 @@ export default function App() {
   const [marketQuery, setMarketQuery] = useState("");
   const [marketBannerIndex, setMarketBannerIndex] = useState(0);
   const marketBannerRef = useRef<HTMLDivElement | null>(null);
+  /** 集市列表滚动容器与上次位置：进详情页时整个列表会卸载，回来要滚回原位 */
+  const marketListRef = useRef<HTMLDivElement | null>(null);
+  const marketScrollTopRef = useRef(0);
+  const restoreMarketScrollRef = useRef(false);
   /** 集市安装失败后「重试安装」用 */
   const marketTarget = useRef<{ face: MarketFace; addr: string } | null>(null);
 
@@ -4607,7 +4651,9 @@ export default function App() {
       const marketDeviceName = isDeviceConnected ? connected.current.name : null;
       const marketArgs: Record<string, string | number | null> = {
         model: model || null,
-        device: marketDeviceName || null
+        device: marketDeviceName || null,
+        // 会员档位：服务端据此把付费条目换成 ¥1 / ¥0（只影响显示）
+        member: memberTier || null
       };
       if (screen) {
         marketArgs.w = screen[0];
@@ -4641,15 +4687,17 @@ export default function App() {
   /** 后台静默问一次（启动时把「免费表盘有更新」的角标点亮，不打扰界面） */
   const refreshMarketUpdatesBg = () => loadMarket(true);
 
-  /** 进集市、切设备（连接状态或选中设备变了）都刷新一次 */
+  /** 进集市、切设备（连接状态或选中设备变了）都刷新一次；会员档位到手后也要重算价格 */
   useEffect(() => {
     if (currentStep !== "main" || activeTab !== "market") return;
     void loadMarket();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentStep, activeTab, isDeviceConnected, selectedDevice.id]);
+  }, [currentStep, activeTab, isDeviceConnected, selectedDevice.id, memberTier]);
 
   /** 点表盘卡 → 详情页（详情对象在内存里；重启后回到集市列表） */
   const openMarketFace = (face: MarketFace) => {
+    // 记一笔：从详情返回时把列表滚回原位（列表容器在详情页会卸载）
+    restoreMarketScrollRef.current = true;
     setMarketDetail(face);
     pushRoute("market/item");
   };
@@ -6392,7 +6440,10 @@ export default function App() {
 
               {/* Tab 2: 集市（免费表盘） */}
               {activeTab === "market" && (
-                <div key="tab-market" onScroll={handleTabScroll} className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-market" ref={marketListRef} onScroll={e => {
+                  handleTabScroll(e);
+                  marketScrollTopRef.current = e.currentTarget.scrollTop;
+                }} className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   {/* 大标题在全局顶栏里（折叠动画）；这里留出同样的高度，标题到设备卡仍是 28px */}
                   <div className="h-[60px] shrink-0" aria-hidden="true" />
 
@@ -6556,13 +6607,7 @@ export default function App() {
                   )}
 
                   {!marketError && filterMarketFaces(marketFaces, marketTag, marketQuery).length > 0 && (
-                    <div
-                      className={`grid gap-x-3 gap-y-6 ${
-                        marketScreen && marketScreen[1] / marketScreen[0] < 2
-                          ? "grid-cols-2"
-                          : "grid-cols-3"
-                      }`}
-                    >
+                    <div className="grid grid-cols-2 gap-3">
                       {filterMarketFaces(marketFaces, marketTag, marketQuery).map(face => {
                         // 预览高度统一 168，宽度按画布比例；与小米运动健康首页的卡片同高
                         const previewH = 168;
@@ -6575,10 +6620,10 @@ export default function App() {
                             key={face.id}
                             type="button"
                             onClick={() => openMarketFace(face)}
-                            className="min-w-0 text-center cursor-pointer active:scale-[0.97] transition-transform"
+                            className="min-w-0 flex flex-col items-center bg-white rounded-3xl pt-4 pb-4 px-3 text-center cursor-pointer active:scale-[0.97] transition-transform"
                           >
                             <div
-                              className="relative mx-auto overflow-hidden"
+                              className="relative overflow-hidden shrink-0"
                               style={{
                                 width: previewW,
                                 height: previewH,
@@ -6597,8 +6642,11 @@ export default function App() {
                                 </span>
                               )}
                             </div>
-                            <div className="mt-2 text-[15px] font-bold text-black leading-snug truncate">
+                            <div className="mt-3 w-full text-[15px] font-bold text-black leading-snug truncate">
                               {face.name}
+                            </div>
+                            <div className="mt-0.5 text-[14px] font-medium text-black/40">
+                              {marketPriceLabel(face)}
                             </div>
                           </button>
                         );
@@ -7018,7 +7066,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.80"}，开源许可与开发者
+                              盘坊 v{appVersion ?? "0.3.82"}，开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -7031,7 +7079,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.3.80"}
+                      盘坊 v{appVersion ?? "0.3.82"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -9398,7 +9446,7 @@ export default function App() {
                     盘坊
                   </h2>
                   <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.80"}
+                    v{appVersion ?? "0.3.82"}
                   </span>
                 </div>
 
@@ -9442,7 +9490,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.80"}`}
+                            : `当前版本 v${appVersion ?? "0.3.82"}`}
                         </p>
                       </div>
                     </div>

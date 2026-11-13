@@ -673,6 +673,13 @@ export interface MarketFace {
   buyUrl?: string | null;
   /** kind=paid 时对应的付费资源 id（与 paid_list 的 product_id 对上 = 已购买） */
   paidProductId?: string | null;
+  /** 卡片名称下的价格：免费固定显示「免费」；付费显示 `¥{price}`，没填就显示「付费」。
+   *  会员登录时这里是服务端算好的会员价（¥1 / 尊享表盘 ¥0）。 */
+  price?: string | null;
+  /** 原价（会员对照用；非会员时与 `price` 相同） */
+  listPrice?: string | null;
+  /** 带「会员尊享」标签：8 元及以上会员 0 元，6 元会员按原价 */
+  memberOnly?: boolean;
   /** 本机装过这个设备行 */
   installed?: boolean;
   /** 装过，且服务端内容已变（可更新） */

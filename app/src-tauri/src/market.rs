@@ -27,6 +27,7 @@ pub async fn list(
     app: &str,
     model: Option<&str>,
     device: Option<&str>,
+    member: Option<&str>,
 ) -> Result<Value> {
     let mut url = format!("{}/v1/market/list", base.trim_end_matches('/'));
     let mut sep = '?';
@@ -40,6 +41,10 @@ pub async fn list(
     }
     if let Some(d) = device.map(str::trim).filter(|s| !s.is_empty()) {
         url.push_str(&format!("&device={}", urlencode(d)));
+    }
+    // 会员档位：top = 尊享/金主，basic = 轻悦。服务端只拿它算「显示价」
+    if let Some(m) = member.map(str::trim).filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&member={}", urlencode(m)));
     }
     let r = http()?.get(url).send().await?;
     let status = r.status();
@@ -206,6 +211,7 @@ pub async fn market_list(
     h: Option<u32>,
     model: Option<String>,
     device: Option<String>,
+    member: Option<String>,
 ) -> Result<Value, String> {
     let base = paid::service_base(&state)?;
     let version = app.package_info().version.to_string();
@@ -216,6 +222,7 @@ pub async fn market_list(
         &version,
         model.as_deref(),
         device.as_deref(),
+        member.as_deref(),
     )
     .await
     .map_err(|e| e.to_string())?;
