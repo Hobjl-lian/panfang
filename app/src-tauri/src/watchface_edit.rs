@@ -106,6 +106,41 @@ pub fn device_screen(model: &str) -> Option<(u32, u32)> {
     None
 }
 
+/// vivo 蓝河手表型号 → (宽, 高)。
+///
+/// 依据 `蓝河表盘/docs/VIVO蓝河表盘调研报告.md` 与在售机型：
+/// - WATCH GT 2 / iQOO WATCH GT 2：432×514（两款同屏同机身，合成一个设备组；
+///   与红米手表 5/6 同分辨率，靠 vendor 区分）
+/// - WATCH GT（一代）：390×450
+/// - WATCH 3 / 5 / 6、iQOO WATCH：466×466（圆表）
+///
+/// 认不出就返回 None，前端会让用户手动选屏幕，**不猜**。
+pub fn vivo_device_screen(model: &str) -> Option<(u32, u32)> {
+    let m = model.to_ascii_lowercase().replace([' ', '_', '-'], "");
+    if m.is_empty() {
+        return None;
+    }
+    if m.contains("gt2") {
+        return Some((432, 514));
+    }
+    // 官方设备型号：vivo WATCH GT 2 = WA2536B（iQOO 版形如 iWA2536B）。
+    // 广播名只有「iQOO WATCH」时靠它仍能认出是 GT 2 那块方屏。
+    if m.contains("wa2536") {
+        return Some((432, 514));
+    }
+    if m.contains("watchgt") && !m.contains("gt2") {
+        return Some((390, 450));
+    }
+    if m.contains("watch3")
+        || m.contains("watch5")
+        || m.contains("watch6")
+        || m.contains("iqoowatch")
+    {
+        return Some((466, 466));
+    }
+    None
+}
+
 /// 设备屏幕：宽高 + 圆角 + 形状 —— 编辑页预览框与裁剪蒙版按它等比缩放/裁切。
 ///
 /// 圆角取**外壳物理圆角**：设计流水线《设计稿交付映射规范》写明
@@ -383,3 +418,30 @@ pub fn model_from_device_name(name: &str) -> Option<(u32, u32)> {
 
 #[allow(dead_code)]
 fn unused(_: &BlockRecord) {}
+
+#[cfg(test)]
+mod tests {
+    use super::vivo_device_screen;
+
+    #[test]
+    fn vivo_gt2_and_iqoo_gt2_share_the_same_screen() {
+        for model in [
+            "vivo WATCH GT 2",
+            "vivo WATCH GT2",
+            "iQOO WATCH GT 2",
+            "iQOO WATCH GT2",
+            "WA2536B",
+            "iWA2536B",
+        ] {
+            assert_eq!(vivo_device_screen(model), Some((432, 514)), "{model}");
+        }
+    }
+
+    #[test]
+    fn other_vivo_watches_keep_their_own_screen() {
+        assert_eq!(vivo_device_screen("vivo WATCH GT"), Some((390, 450)));
+        assert_eq!(vivo_device_screen("iQOO WATCH GT"), Some((390, 450)));
+        assert_eq!(vivo_device_screen("vivo WATCH 5"), Some((466, 466)));
+        assert_eq!(vivo_device_screen("iQOO WATCH"), Some((466, 466)));
+    }
+}

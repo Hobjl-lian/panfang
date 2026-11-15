@@ -247,7 +247,7 @@ function GenSlider(props: {
         step={ctl.step}
         onChange={onChange}
       />
-      <span className="text-[11px] font-mono font-medium text-black/55 w-[44px] text-right shrink-0">
+      <span className="text-[12px] font-mono font-medium text-black/55 w-[44px] text-right shrink-0">
         {text}
       </span>
     </div>
@@ -459,7 +459,7 @@ const LEGAL_BASE = "https://api.hobjl-shop.top";
 const APP_BEIAN_NO = "粤ICP备2026135374号-2A";
 const BEIAN_URL = "https://beian.miit.gov.cn/";
 
-type FlowStep = "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "install_confirm" | "photo_generator" | "settings_account" | "settings_device" | "market_detail";
+type FlowStep = "welcome" | "vivo_scan" | "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "install_confirm" | "photo_generator" | "settings_account" | "settings_device" | "market_detail";
 
 /** 逐包更新状态（服务端 packages + App 安装快照逐包比较后补上 needs_update/new） */
 interface PaidPackageStatus {
@@ -467,6 +467,8 @@ interface PaidPackageStatus {
   file_name?: string;
   watchface_id?: string | null;
   version?: string | null;
+  /** bin（小米）/ rpk（vivo） */
+  format?: "bin" | "rpk" | string;
   needs_update?: boolean;
   new?: boolean;
 }
@@ -477,6 +479,8 @@ interface PaidVariant {
   name: string;
   device_models: string[];
   screen: [number | null, number | null];
+  /** xiaomi / vivo（老服务端没有这个字段，按包体扩展名兜底） */
+  vendor?: "xiaomi" | "vivo" | string;
   latest_version: string | null;
   /** 最新版本的**整行内容指纹**（老口径；新逻辑优先用 packages 逐包比较） */
   latest_sha?: string | null;
@@ -532,6 +536,8 @@ interface DeviceItem {
   model: string;
   /** 电量：未连接设备时拿不到真值 → null（界面显示 --%） */
   battery: number | null;
+  /** 设备品牌：缺省当小米（兼容旧数据）；vivo 设备只在本机存在，不来自小米云端 */
+  brand?: "xiaomi" | "vivo";
 }
 
 interface InstalledDial {
@@ -759,6 +765,75 @@ const UI_STORE_KEY = "panfang.ui";
 const HIDDEN_DEVICES_KEY = "panfang.hiddenDevices";
 
 /**
+ * 本机记住的 vivo 设备（扫描发现、连接成功后写入）。
+ * vivo 没有云端设备列表，刷新账号设备时不能被冲掉，所以单独存一份。
+ * 只记地址与名字，openId 由 Rust 侧按地址保存在应用数据目录，前端不碰。
+ */
+const VIVO_DEVICES_KEY = "panfang.vivoDevices";
+
+/**
+ * 首次启动在首屏选了哪一类手表（"xiaomi" / "vivo"）。
+ * 只影响「启动时该不该强制登录」：vivo 不需要小米账号，选过 vivo 且本机有表就允许直接进主界面。
+ */
+const ONBOARDING_KEY = "panfang.onboarding";
+
+type OnboardingSource = "xiaomi" | "vivo";
+
+function readOnboarding(): OnboardingSource | null {
+  try {
+    const v = localStorage.getItem(ONBOARDING_KEY);
+    return v === "xiaomi" || v === "vivo" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeOnboarding(src: OnboardingSource) {
+  try {
+    localStorage.setItem(ONBOARDING_KEY, src);
+  } catch {
+    /* 忽略：无 localStorage 时只在本次会话内生效 */
+  }
+}
+
+function readVivoDevices(): DeviceItem[] {
+  try {
+    const raw = localStorage.getItem(VIVO_DEVICES_KEY);
+    const arr = raw ? (JSON.parse(raw) as unknown) : null;
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter(
+        (x): x is { id: string; name?: string } =>
+          !!x && typeof (x as { id?: unknown }).id === "string"
+      )
+      .map(x => ({
+        id: x.id,
+        name: x.name || "vivo 手表",
+        model: "vivo 手表",
+        battery: null,
+        brand: "vivo" as const
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function storeVivoDevices(list: DeviceItem[]) {
+  try {
+    localStorage.setItem(
+      VIVO_DEVICES_KEY,
+      JSON.stringify(
+        list
+          .filter(d => d.brand === "vivo")
+          .map(d => ({ id: d.id, name: d.name }))
+      )
+    );
+  } catch {
+    /* 忽略：无 localStorage 时只在本次会话内生效 */
+  }
+}
+
+/**
  * 页面路由口径（唯一一套字符串）：login / devices / main/<tab> / redeem / install / dial-edit /
  * crop / about / about/developer / about/licenses。兑换流程三个阶段算同一页（"redeem"）、
  * 本地安装进度的全过程算同一页（"install"）：返回一次即回到进来之前，进度页/成功页不再单独入栈。
@@ -766,6 +841,10 @@ const HIDDEN_DEVICES_KEY = "panfang.hiddenDevices";
 
 /** 路由字符串 → 页面状态（恢复与返回时用） */
 function parseRoute(route: string): { step: FlowStep; tab: TabKey } {
+  // 首屏「选手表」：只有一台设备都没接过的首次启动才停在这里
+  if (route === "welcome") return { step: "welcome", tab: "home" };
+  // vivo 连接引导（两步说明 → 搜索）：瞬时过程，不进持久化恢复白名单
+  if (route === "vivo-scan") return { step: "vivo_scan", tab: "home" };
   if (route === "login") return { step: "login", tab: "home" };
   if (route === "devices") return { step: "device_select", tab: "home" };
   if (route === "paid") return { step: "paid_bind", tab: "home" };
@@ -802,6 +881,7 @@ function parseRoute(route: string): { step: FlowStep; tab: TabKey } {
 
 /** 已知路由集合（持久化恢复时的白名单） */
 const KNOWN_ROUTES = [
+  "welcome",
   "login",
   "devices",
   "paid",
@@ -878,12 +958,22 @@ function sanitizeBootStack(p: PersistedUi | null): string[] {
   const lastMain = [...raw].reverse().find(r => r.startsWith("main/"));
   const rest = raw.filter(r => !r.startsWith("main/"));
   const stack = (lastMain ? [lastMain, ...rest] : rest).slice(-20);
-  if (!stack.length) return ["login"];
-  // 只有「从来没登录过」才回登录页：账号资料（profile）就是「已登录」这个事实的持久化
-  // （第三轮 2）——登录页/选择设备页之外的路由都需要已登录。
+  if (!stack.length) return ["welcome"];
+  // 登录页不再是根页面：旧存档以 login 为根时补一层首屏，返回/侧滑能退回首屏
+  if (stack[0] === "login") stack.unshift("welcome");
+  // 「登录过小米账号」或「选过 vivo 且本机有手表」都算完成接入；否则只允许首屏/登录/选设备
   const loggedIn = !!p?.profile?.nickname;
-  if (!loggedIn && stack.some(r => r !== "login" && r !== "devices")) return ["login"];
-  if (stack[0] !== "login" && !stack[0].startsWith("main/")) return ["login"];
+  const vivoReady = readOnboarding() === "vivo" && readVivoDevices().length > 0;
+  if (
+    !loggedIn &&
+    !vivoReady &&
+    stack.some(r => r !== "welcome" && r !== "login" && r !== "devices")
+  ) {
+    return ["welcome"];
+  }
+  if (stack[0] !== "welcome" && stack[0] !== "login" && !stack[0].startsWith("main/")) {
+    return ["welcome"];
+  }
   // 编辑页/制作壁纸页的现场（留档字节、图层模型、照片）都在内存里，重启恢复不了：
   // 一律退回去 —— 否则编辑页会拿设计稿的演示数据充数（真机上出现过「假表盘」就是这个）。
   while (
@@ -926,6 +1016,17 @@ function profileFromAccount(acc: string): { nickname: string; phoneTail: string;
 /** 电量显示：拿不到真值时显示 --%（设计稿的 `{N}` 位） */
 function fmtBattery(battery: number | null | undefined): string {
   return battery === null || battery === undefined ? "--" : String(battery);
+}
+
+/**
+ * 包体大小（勾选安装时让用户心里有数）：< 1MB 用 KB，其余一位小数 MB。
+ * 拿不到大小（老服务端没有 size）返回空串，界面就不显示这一列。
+ */
+function fmtSize(bytes: number | null | undefined): string {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  const mb = bytes / 1024 / 1024;
+  return `${mb >= 100 ? Math.round(mb) : mb.toFixed(1)} MB`;
 }
 
 /**
@@ -1190,6 +1291,169 @@ function DeviceCard({
 }
 
 /**
+ * 全局橡皮筋：滚动容器加 data-rb="y" 或 data-rb="x" 即可。
+ * 手指把容器拖到边界外时，容器跟手位移；松手用带轻微过冲的缓动弹回。
+ * 只改 transform，不 setState，不触发 React 重渲染。
+ * 页面级列表加 data-rb-always="1"：内容不够长也允许回弹。
+ */
+function useRubberBand() {
+  useEffect(() => {
+    let node: HTMLElement | null = null;
+    let root: HTMLElement | null = null;
+    let target: HTMLElement | null = null;
+    let axis: "x" | "y" = "y";
+    let startX = 0;
+    let startY = 0;
+    let start = 0;
+    let dragging = false;
+    let always = false;
+    let atTop = false;
+    let atBottom = false;
+    let scrollable = false;
+    const MAX = 36;
+
+    /** 按手势方向找最近的同轴滚动容器：横滑就找 data-rb="x"，竖滑找 y。
+     *  内层列表没内容可滚时跳过，交给外层页面，避免短列表挡住整页滚动。 */
+    const find = (el: HTMLElement | null, want: "x" | "y") => {
+      while (el && el !== document.body) {
+        if (el.dataset.rb === want) {
+          if (el.dataset.rbAlways === "1") return el;
+          const max =
+            want === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth;
+          if (max > 2) return el;
+        }
+        el = el.parentElement;
+      }
+      return null;
+    };
+
+    const settle = (el: HTMLElement) => {
+      el.style.transition = "transform 420ms cubic-bezier(0.22, 1.35, 0.36, 1)";
+      el.style.transform = "";
+      const done = () => {
+        el.style.transition = "";
+        el.removeEventListener("transitionend", done);
+      };
+      el.addEventListener("transitionend", done);
+    };
+
+    /** 只给本次手势挂 touchmove，避免全局 non-passive 监听拖慢正常滚动 */
+    function attach(el: HTMLElement) {
+      detach();
+      root = el;
+      el.addEventListener("touchmove", onMove, { passive: false });
+      el.addEventListener("touchend", onEnd, { passive: true });
+      el.addEventListener("touchcancel", onEnd, { passive: true });
+    }
+
+    function detach() {
+      if (!root) return;
+      root.removeEventListener("touchmove", onMove);
+      root.removeEventListener("touchend", onEnd);
+      root.removeEventListener("touchcancel", onEnd);
+      root = null;
+    }
+
+    const onStart = (event: TouchEvent) => {
+      detach();
+      node = null;
+      target =
+        event.touches.length === 1 && event.target instanceof Element
+          ? (event.target as HTMLElement)
+          : null;
+      if (!target) return;
+      // 输入框里拖拽是选字/移动光标，不能当列表回弹吃掉
+      if (target.closest("input, textarea, [contenteditable='true']")) {
+        target = null;
+        return;
+      }
+      let box: HTMLElement | null = target;
+      while (box && box !== document.body && !box.dataset.rb) box = box.parentElement;
+      if (!box || box === document.body) {
+        target = null;
+        return;
+      }
+      startX = event.touches[0].clientX;
+      startY = event.touches[0].clientY;
+      dragging = false;
+      attach(box);
+    };
+
+    const onMove = (event: TouchEvent) => {
+      if (!target || event.touches.length !== 1) return;
+      const curX = event.touches[0].clientX;
+      const curY = event.touches[0].clientY;
+      if (!node) {
+        const dx = curX - startX;
+        const dy = curY - startY;
+        if (Math.max(Math.abs(dx), Math.abs(dy)) < 6) return;
+        const want: "x" | "y" = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+        const el = find(target, want);
+        if (!el) {
+          target = null;
+          return;
+        }
+        node = el;
+        axis = want;
+        always = el.dataset.rbAlways === "1";
+        const pos = axis === "y" ? el.scrollTop : el.scrollLeft;
+        const max =
+          axis === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth;
+        scrollable = max > 2;
+        atTop = pos <= 1;
+        atBottom = pos >= max - 1;
+        el.style.transition = "none";
+        start = axis === "y" ? curY : curX;
+      }
+      const el = node;
+      const cur = axis === "y" ? curY : curX;
+      const delta = cur - start;
+      if (!dragging) {
+        if (Math.abs(delta) < 4) return;
+        const outward = scrollable
+          ? (atTop && delta > 0) || (atBottom && delta < 0)
+          : always;
+        if (!outward) return;
+        dragging = true;
+        start = cur;
+        return;
+      }
+      if (event.cancelable) event.preventDefault();
+      const raw = cur - start;
+      let d = Math.sign(raw) * Math.min(MAX, Math.abs(raw) * 0.42);
+      if (scrollable) {
+        if (atTop && d < 0) d = 0;
+        if (atBottom && d > 0) d = 0;
+      }
+      el.style.transform =
+        axis === "y" ? `translate3d(0, ${d}px, 0)` : `translate3d(${d}px, 0, 0)`;
+    };
+
+    const onEnd = () => {
+      target = null;
+      const el = node;
+      node = null;
+      if (el) {
+        if (dragging) {
+          dragging = false;
+          settle(el);
+        } else {
+          el.style.transition = "";
+          el.style.transform = "";
+        }
+      }
+      detach();
+    };
+
+    document.addEventListener("touchstart", onStart, { passive: true });
+    return () => {
+      document.removeEventListener("touchstart", onStart);
+      detach();
+    };
+  }, []);
+}
+
+/**
  * 系统 WebView 过旧时的说明页（安卓专有；桌面与浏览器预览走不到这里）。
  * 为什么要有：低版本 WebView 上界面是「半透明面整片消失 + 滚动区失效」，用户只会以为
  * App 坏了。这里给一句人话 + 一个「去更新」的直达入口（原生打开系统 WebView 的应用详情页），
@@ -1207,7 +1471,7 @@ function WebViewGateScreen({ major, onContinue }: { major: number; onContinue: (
                 <ArrowsClockwise size={26} className="text-black/40" />
               </div>
               <h2 className="text-[18px] font-bold text-black mt-4">系统组件版本过旧</h2>
-              <p className="text-[14px] font-medium text-black/45 leading-relaxed mt-2 max-w-[280px]">
+              <p className="text-[13px] font-medium text-black/45 leading-relaxed mt-2 max-w-[280px]">
                 这台手机的系统 WebView 版本较低（Chrome {major}），盘坊的界面可能显示不全。
                 更新手机系统后重新打开盘坊。
               </p>
@@ -1216,14 +1480,14 @@ function WebViewGateScreen({ major, onContinue }: { major: number; onContinue: (
               <button
                 type="button"
                 onClick={() => openWebViewSettings()}
-                className="w-full h-[44px] rounded-full bg-[#4361EE] text-white font-bold text-[15px] active:scale-[0.98] transition-all cursor-pointer"
+                className="w-full h-[44px] rounded-full bg-[#4361EE] text-white font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer"
               >
                 去更新系统 WebView
               </button>
               <button
                 type="button"
                 onClick={onContinue}
-                className="w-full h-[44px] rounded-full bg-black/5 text-black/60 font-bold text-[15px] active:scale-[0.98] transition-all cursor-pointer"
+                className="w-full h-[44px] rounded-full bg-black/5 text-black/60 font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer"
               >
                 仍然继续（界面可能异常）
               </button>
@@ -1236,6 +1500,9 @@ function WebViewGateScreen({ major, onContinue }: { major: number; onContinue: (
 }
 
 export default function App() {
+  // 所有标了 data-rb 的滚动容器共用一套橡皮筋手势
+  useRubberBand();
+
   // 启动时读一次上次退出时的界面态：页面栈 + 账号资料 / 设备 / 表盘列表 / 编辑中的表盘
   const [boot] = useState(() => {
     const saved = readPersistedUi();
@@ -1339,7 +1606,7 @@ export default function App() {
    * 连接/扫描失败时**唯一的屏幕提示**（技术细节只进 console，长文与 MAC 不上屏）。
    * 手环不在「连接新手机」模式时后端各种失败原因都会归结到这一句可操作的话上。
    */
-  const CONNECT_HINT = "请在手环设置-系统管理中点击连接新手机，进入该模式后，才可扫描到手环";
+  const CONNECT_HINT = "请在设备上打开「设置 → 系统管理 → 连接新手机」，进入该模式后才能扫描到设备";
 
   /**
    * 连接失败时上屏的**一句操作指引**（按原因给，不再一律「请进连接新手机」）：
@@ -1359,7 +1626,10 @@ export default function App() {
       raw.includes("没有接受连接") ||
       raw.includes("target rejected")
     ) {
-      return "连接超时：手环没有回应，请确认它没被别的手机或小米运动健康占用";
+      // 占用蓝牙的官方 App 跟品牌走：vivo 用户被「小米运动健康」这句会看懵
+      const holder = deviceVendor() === "vivo" ? "vivo 健康" : "小米运动健康";
+      const word = deviceVendor() === "vivo" ? "手表" : "手环";
+      return `连接超时：${word}没有回应，请确认它没被别的手机或${holder}占用`;
     }
     return CONNECT_HINT;
   };
@@ -1448,6 +1718,20 @@ export default function App() {
     } else if (raw.includes("快应用文件不完整")) {
       code = "quickapp_invalid";
       msg = "这个快应用文件不完整，请重新下载后再试";
+    } else if (raw.includes("不是有效的 vivo 快应用包")) {
+      code = "quickapp_invalid";
+      msg = "这个 rpk 不是有效的 vivo 快应用，请重新下载后再试";
+    } else if (raw.includes("不是 vivo 的快应用")) {
+      code = "quickapp_invalid";
+      msg = "这个文件不能装到 vivo 手表，请确认是 vivo 的表盘或快应用";
+    } else if (raw.includes("这是 vivo 手表")) {
+      // 连着小米却拿了 vivo 的表盘/快应用
+      code = "wrong_vendor";
+      msg = "这是 vivo 手表的文件，请先连接 vivo 手表";
+    } else if (raw.includes("vivo quick-app v1 install rejected")) {
+      // vivo 手表拒绝安装（签名/版本/包体不适配）
+      code = "quickapp_install";
+      msg = "手表没有通过这个快应用，请换一个适配你设备的文件";
     } else if (raw.includes("third-party app install failed")) {
       // 手环对快应用的两种拒绝：校验不通过（签名/包体不适配）与安装失败
       code = "quickapp_install";
@@ -1730,7 +2014,7 @@ export default function App() {
   const installKindRef = useRef<"watchface" | "quickapp">("watchface");
   const [installProgress, setInstallProgress] = useState(0);
   const [progressPhase, setProgressPhase] = useState("正在验证兑换凭证...");
-  const [dialName, setDialName] = useState("雾屿蓝·动态");
+  const [dialName, setDialName] = useState("雾屿蓝");
   /** 这次安装来自哪里：兑换流程（演示）/ 本地 .bin 文件 / 集市 → 决定失败后「重试安装」怎么重试 */
   const [installSource, setInstallSource] = useState<"paid" | "local" | "market">("paid");
   /** 本地安装的待装文件（失败重试要用同一份字节，不再让用户重选文件） */
@@ -1800,6 +2084,10 @@ export default function App() {
     size: number;
     kind: LocalPayloadProbe["kind"];
     originalId: string | null;
+    /** vivo 快应用才有：manifest 里的应用名 / 包名 / 版本 */
+    appName: string | null;
+    appPackage: string | null;
+    appVersion: string | null;
   } | null>(null);
   /** 是否复写 ID（默认关：不改文件的行为和以前一致，用户自己选） */
   const [rewriteIdOn, setRewriteIdOn] = useState(false);
@@ -1956,9 +2244,26 @@ export default function App() {
   const connectFailStreak = useRef(0);
   const [showConnectHelpPrompt, setShowConnectHelpPrompt] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
+  /** 多包体安装中：用户可以「装完当前就停」（只有一次装多个包时才出现） */
+  const [installStoppable, setInstallStoppable] = useState(false);
+  /** 已经点了「装完当前就停」（按钮变成等待态，别再重复点） */
+  const [installStopRequested, setInstallStopRequested] = useState(false);
+  /** 中断后的安装结果：成功页要说清「装了 N/M 个」，不能假装全装完 */
+  const [installPartial, setInstallPartial] = useState<{ installed: number; total: number } | null>(null);
 
   // 空态样例触发与展示状态
-  const [mockDevicesList, setMockDevicesList] = useState<DeviceItem[]>(MOCK_DEVICES);
+  const [mockDevicesList, setMockDevicesList] = useState<DeviceItem[]>(() => {
+    // 真机上先挂本机记住的 vivo 设备（小米设备等账号恢复后再填）；
+    // 浏览器预览仍用演示设备。
+    if (invoke) return readVivoDevices();
+    return MOCK_DEVICES;
+  });
+  // —— vivo 扫描（附近的手表）——
+  const [vivoScanning, setVivoScanning] = useState(false);
+  /** 这一轮是否已经搜过（搜完没结果时按钮要变成「重新搜索」并给提示） */
+  const [vivoSearched, setVivoSearched] = useState(false);
+  const [vivoFound, setVivoFound] = useState<{ id: string; name: string }[]>([]);
+  const vivoScanTimer = useRef<number | null>(null);
   /** 已从设备列表移除的设备 id（mac）：小米账号里不动，只在本机记住「别再列出来」 */
   const [hiddenDeviceIds, setHiddenDeviceIds] = useState<string[]>(() => readStoredList(HIDDEN_DEVICES_KEY));
   /** 移除名单的最新值（applyCloudDevices 会被启动/登录/2FA 等多处旧闭包调用，闭包里读 state 会拿到旧值） */
@@ -2401,9 +2706,13 @@ export default function App() {
     // 用户手动移除过的设备不再出现在列表里（重新导入设备列表会清掉这个名单）
     const hidden = new Set(hiddenDeviceIdsRef.current);
     const mapped = all.filter(d => !hidden.has(d.id));
-    setMockDevicesList(mapped);
-    if (!mapped.length) return;
-    setSelectedDevice(prev => mapped.find(d => d.id === prev.id) ?? mapped[0]);
+    // vivo 设备不在小米账号里：本机记着的那几台要并回去，别被账号刷新冲掉
+    //（用户删掉的也要按「已移除」名单过滤，否则重新拉一次设备就又会冒出来）
+    const vivoSaved = readVivoDevices().filter(v => !hidden.has(v.id));
+    const merged = [...mapped, ...vivoSaved.filter(v => !mapped.some(m => m.id === v.id))];
+    setMockDevicesList(merged);
+    if (!merged.length) return;
+    setSelectedDevice(prev => merged.find(d => d.id === prev.id) ?? merged[0]);
   };
 
   /**
@@ -2418,6 +2727,10 @@ export default function App() {
     hiddenDeviceIdsRef.current = next;
     setHiddenDeviceIds(next);
     storeList(HIDDEN_DEVICES_KEY, next);
+    // vivo 设备只存在本机这一份名单里：删了要真的从名单里删掉，否则重开 App 又回来
+    if (device.brand === "vivo") {
+      storeVivoDevices(readVivoDevices().filter(d => d.id !== device.id));
+    }
     setMockDevicesList(prev => prev.filter(d => d.id !== device.id));
     if (connected.current.addr === device.id) {
       releaseStaleConnection(device.id);
@@ -2775,9 +3088,9 @@ export default function App() {
       const rec = all.slice(0, 20);
       if (rec.length) {
         lines.push("最近问题：");
-        for (const r of rec) {
+        for (const [i, r] of rec.entries()) {
           lines.push(
-            `· ${stampOf(r)} ${r.step || ""} ${r.code || ""} ${r.message || ""}`.replace(/\s+/g, " ").trim()
+            `${i + 1}. ${stampOf(r)} ${r.step || ""} ${r.code || ""} ${r.message || ""}`.replace(/\s+/g, " ").trim()
           );
         }
       } else {
@@ -2819,7 +3132,7 @@ export default function App() {
           </svg>
         </div>
         <div className="flex-1 min-w-0">
-          <p className="text-[15px] font-bold text-black leading-tight">
+          <p className="text-[16px] font-bold text-black leading-tight">
             没连上{failedDevice?.name ? `「${failedDevice.name}」` : ""}
           </p>
           <p className="text-[13px] font-medium text-black/45 mt-1 leading-snug">
@@ -2834,14 +3147,14 @@ export default function App() {
             helpFromDrawer.current = true; // 返回时把浮窗还回去
             pushRoute("connect-help");
           }}
-          className="flex-1 h-[40px] rounded-full bg-[#4361EE] text-white font-bold text-[14px] active:scale-[0.98] transition-all cursor-pointer"
+          className="flex-1 h-[40px] rounded-full bg-[#4361EE] text-white font-bold text-[13px] active:scale-[0.98] transition-all cursor-pointer"
         >
           看怎么连
         </button>
         <button
           type="button"
           onClick={() => failedDevice && handleSelectDevice(failedDevice)}
-          className="flex-1 h-[40px] rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[14px] active:scale-95 transition-all cursor-pointer"
+          className="flex-1 h-[40px] rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all cursor-pointer"
         >
           重试
         </button>
@@ -3018,7 +3331,7 @@ export default function App() {
     if (!invoke) return; // 浏览器预览：保持演示数据（设计稿那套）
     if (!addr) {
       setDialSessionState("failed");
-      showToast("请先在管理页连接手环", "error");
+      showToast("请先连接设备", "error");
       return;
     }
     setDialSessionState("loading");
@@ -3528,7 +3841,7 @@ export default function App() {
           if (p.reason) diagReport("connect", p.flap ? "flap_give_up" : "relink_give_up", String(p.reason));
           showToast(
             p.flap
-              ? "手环反复断开，已停止重连。请关闭小米运动健康后重连"
+              ? `手环反复断开，已停止重连。请关闭${deviceVendor() === "vivo" ? "vivo 健康" : "小米运动健康"}后重连`
               : "无法自动重连，请让手环进入「连接新手机」后重新连接",
             "error"
           );
@@ -3553,12 +3866,17 @@ export default function App() {
         applyCloudDevices(devices);
       } catch (err) {
         console.error("[xiaomi_restore] 本地登录凭证续期失败：", err);
-        setMockDevicesList([]); // 空态：不把演示设备当成账号下的设备
+        // 空态：不把演示设备当成账号下的设备；但本机记住的 vivo 设备要留下
+        //（以前这里直接清空列表 → vivo 用户重开 App 手表就从列表里"消失"了）
+        applyCloudDevices([]);
         setIsDeviceConnected(false);
         connected.current = { addr: null, model: null, name: null };
-        // 提示只说「请登录您的小米账号」：不再指引去「设置」（没登录时根本进不去设置）
-        // 已经停在登录页时就不弹了——登录页本身就是那句提示。
-        if (currentRoute() !== "login") showToast("请登录您的小米账号", "error");
+        // 只有**主动选了「我是小米用户」**才提示登录：首屏还没选、或选了 vivo 时，
+        // 一进来就弹「请登录您的小米账号」会让人以为必须登录（用户 2026-11-15 反馈）。
+        // 已经停在登录页时也不弹——登录页本身就是那句提示。
+        if (readOnboarding() === "xiaomi" && currentRoute() !== "login") {
+          showToast("请登录您的小米账号", "error");
+        }
       }
       // WebView 重建（进程还活着、前台服务保活的连接也还活着）：用后端的**真实状态**重新挂载，
       // 而不是一律当未连接 —— 否则用户会遇到「其实连着，界面却说未连接」。
@@ -3572,17 +3890,22 @@ export default function App() {
         if (st?.addr) {
           // 设备行按地址找回（云端设备列表里 mac 匹配；账号列表可能还没回来 → 用后端给的 name 兜底）
           const dev = accountDevices.current.find(d => d.mac === st.addr);
+          // ★ 品牌必须一起找回：丢了 brand 就会被当成小米 → 集市/已购按小米设备行匹配，
+          //   vivo 用户冷启动后会看到小米表盘、自己的 vivo 资源却「暂不支持」（2026-11-15 真机踩到）
+          const savedVivo = readVivoDevices().find(v => v.id === st.addr);
+          const devName = st.name || dev?.name || savedVivo?.name || dev?.model || "设备";
           setSelectedDevice({
             id: st.addr,
-            name: st.name || dev?.name || dev?.model || "手环",
-            model: dev?.model || "",
-            battery: batteryOf.current[st.addr] ?? null
+            name: devName,
+            model: dev?.model || savedVivo?.model || "",
+            battery: batteryOf.current[st.addr] ?? null,
+            brand: savedVivo ? "vivo" : dev ? "xiaomi" : undefined
           });
           if (st.connected) {
             connected.current = {
               addr: st.addr,
-              model: dev?.model || null,
-              name: st.name || dev?.name || null
+              model: dev?.model || savedVivo?.model || null,
+              name: devName
             };
             setIsDeviceConnected(true);
             connectedStateRef.current = true;
@@ -3592,8 +3915,8 @@ export default function App() {
             // 上次的连接还惦记着但还没连上：界面进「重连中…」，总管继续自己按退避表重试
             connected.current = {
               addr: st.addr,
-              model: dev?.model || null,
-              name: st.name || dev?.name || null
+              model: dev?.model || savedVivo?.model || null,
+              name: devName
             };
             setLinkRetrying(true);
           }
@@ -3786,18 +4109,9 @@ export default function App() {
   };
 
   /**
-   * 设备列表的橡皮筋：**只回弹，不自由滚动**。
-   *
-   * 上版留了 32px 上下内边距，结果内容比托盘高一点点 → 进入原生滚动 → 能停在任意位置，
-   * 手感就成了「不跟手」。现在内边距和位移上限都收成 12px：正常情况下列表滚不动，
-   * 拖出来的是那条空，松手弹回原位，永远停在同一个位置。
-   * （设备多到装不下时仍会退回原生滚动 —— 见外层 overflow-y-auto，那时确实需要能滚。）
+   * 设备列表的橡皮筋统一交给全局 useRubberBand（容器上标了 data-rb）。
+   * 设备多的时候照常原生滚动，滚到顶/底后继续拖才回弹。
    */
-  const deviceListRef = useRef<HTMLDivElement | null>(null);
-  const deviceListTouch = useRef<{ y: number; atTop: boolean; atBottom: boolean } | null>(null);
-  const [deviceListOffset, setDeviceListOffset] = useState(0);
-  const [deviceListDragging, setDeviceListDragging] = useState(false);
-  const BOUNCE_MAX = 20;
 
   /**
    * 托盘横杠的拖拽：按住可以把整个托盘跟手往下拉，松手超过 96px 就关，否则弹回。
@@ -3820,32 +4134,6 @@ export default function App() {
     setSheetDragging(false);
     if (sheetDrag > 96) requestCloseDeviceDrawer();
     else setSheetDrag(0);
-  };
-
-  const onDeviceListTouchStart = (event: React.TouchEvent) => {
-    const el = deviceListRef.current;
-    if (!el) return;
-    deviceListTouch.current = {
-      y: event.touches[0].clientY,
-      atTop: el.scrollTop <= 0,
-      atBottom: el.scrollTop + el.clientHeight >= el.scrollHeight - 1
-    };
-  };
-
-  const onDeviceListTouchMove = (event: React.TouchEvent) => {
-    const start = deviceListTouch.current;
-    if (!start) return;
-    const dy = event.touches[0].clientY - start.y;
-    if ((start.atTop && dy > 0) || (start.atBottom && dy < 0)) {
-      setDeviceListDragging(true);
-      setDeviceListOffset(Math.max(-BOUNCE_MAX, Math.min(BOUNCE_MAX, dy * 0.4)));
-    }
-  };
-
-  const onDeviceListTouchEnd = () => {
-    deviceListTouch.current = null;
-    setDeviceListDragging(false);
-    setDeviceListOffset(0);
   };
 
   const handleSelectDevice = (device: DeviceItem) => {
@@ -4014,7 +4302,9 @@ export default function App() {
           const info = (await invoke("device_connect", {
             name: cloud?.name || device.name,
             addr,
-            authkey
+            authkey,
+            // 小米缺省；vivo 走另一条握手（没有 authkey，openId 由后端读取）
+            brand: device.brand ?? "xiaomi"
           })) as { name?: string } | null;
           if (!isLive()) return; // 令牌已过期（又点了别的设备 / 已超时）→ 成功结果也忽略
           // 关键：蓝牙连上不代表握手成功（手环没进「连接新手机」时最常见）→ 用状态查询验证会话
@@ -4075,6 +4365,102 @@ export default function App() {
       finishSwitch();
     }, 700);
   };
+
+  // ================= vivo：扫描附近的手表 =================
+  // 小米设备来自云端账号；vivo 没有账号体系，靠 BLE 扫描发现（插件已只上报 vivo/iQOO 广播）。
+  // 扫描结果只在本机记地址与名字，openId 由 Rust 按地址保存。
+
+  /** 停止扫描并收掉「正在扫描」的转圈（不弹提示，静默收尾） */
+  const stopVivoScan = () => {
+    if (vivoScanTimer.current !== null) {
+      window.clearTimeout(vivoScanTimer.current);
+      vivoScanTimer.current = null;
+    }
+    setVivoScanning(false);
+    if (invoke) void invoke("stop_scan").catch(() => {});
+  };
+
+  /** 开始扫描：结果通过 Tauri Channel 逐条推过来 */
+  const startVivoScan = () => {
+    if (!invoke) {
+      showToast("浏览器预览不支持扫描");
+      return;
+    }
+    const ChannelCtor = (
+      globalThis as { __TAURI__?: { core?: { Channel?: new () => { onmessage: ((d: unknown) => void) | null } } } }
+    ).__TAURI__?.core?.Channel;
+    if (!ChannelCtor) {
+      showToast("当前系统不支持扫描，请稍后重试", "error");
+      return;
+    }
+    setVivoFound([]);
+    setVivoSearched(true);
+    setVivoScanning(true);
+    const ch = new ChannelCtor();
+    ch.onmessage = (raw: unknown) => {
+      const d = raw as { name?: string; addr?: string } | null;
+      const addr = d?.addr?.trim();
+      if (!addr) return;
+      setVivoFound(prev =>
+        prev.some(v => v.id === addr) ? prev : [...prev, { id: addr, name: d?.name || "vivo 手表" }]
+      );
+    };
+    void (async () => {
+      try {
+        // 扫描前先要把「附近的设备」权限要齐（Android 12+）；拒绝也继续试
+        try {
+          await invoke("device_ensure_bt_permissions");
+        } catch {
+          /* 权限弹窗失败不拦扫描，扫描本身会给出提示 */
+        }
+        await invoke("start_scan", { channel: ch });
+      } catch (err) {
+        console.error("[start_scan]", err);
+        showToast("扫描没有启动，请确认蓝牙与「附近的设备」权限", "error");
+        setVivoScanning(false);
+      }
+    })();
+    // 转圈只转 12 秒（扫描本身继续跑，结果还会陆续到）
+    if (vivoScanTimer.current !== null) window.clearTimeout(vivoScanTimer.current);
+    vivoScanTimer.current = window.setTimeout(() => {
+      vivoScanTimer.current = null;
+      setVivoScanning(false);
+    }, 12000);
+  };
+
+  /** 选一台扫描到的手表：记进本机列表 → 直接走统一连接流程 */
+  const handlePickVivoDevice = (item: { id: string; name: string }) => {
+    stopVivoScan();
+    const dev: DeviceItem = {
+      id: item.id,
+      name: item.name,
+      model: "vivo 手表",
+      battery: null,
+      brand: "vivo"
+    };
+    setMockDevicesList(prev => {
+      const next = prev.some(d => d.id === dev.id)
+        ? prev.map(d => (d.id === dev.id ? { ...d, ...dev } : d))
+        : [...prev, dev];
+      storeVivoDevices(next);
+      return next;
+    });
+    setSelectedDevice(dev);
+    handleSelectDevice(dev);
+  };
+
+  // 离开「连接 VIVO 手表」页就停扫描（别让扫描在后台空转耗电）
+  useEffect(() => {
+    if (currentStep !== "vivo_scan" && vivoScanning) stopVivoScan();
+  }, [currentStep, vivoScanning]);
+
+  // 每次进「连接 VIVO 手表」页都从干净状态开始（结果与「已搜过」标记清零）
+  useEffect(() => {
+    if (currentStep === "vivo_scan") {
+      setVivoFound([]);
+      setVivoSearched(false);
+    }
+  }, [currentStep]);
 
   /**
    * 打开编辑页。`fromRoot` = 从别处重置过来时的根页面（安装成功页「去做壁纸」用）：
@@ -4580,7 +4966,10 @@ export default function App() {
       // 卡片按「暂不支持你的设备」展示，绝不拿上一台设备/别的型号去凑。
       try {
         const s = (await inv("paid_device_screen", {
-          model: connected.current.model || ""
+          model: connected.current.model || "",
+          // vivo 的型号表认不出时，后端会先按设备名认、再向手表要 device_info.model
+          addr: connected.current.addr || null,
+          device: connected.current.name || null
         })) as { screen?: [number, number] | null } | null;
         setPaidScreen(s?.screen ?? null);
       } catch {
@@ -4665,7 +5054,9 @@ export default function App() {
     void (async () => {
       try {
         const s = (await inv("paid_device_screen", {
-          model: connected.current.model || ""
+          model: connected.current.model || "",
+          addr: connected.current.addr || null,
+          device: connected.current.name || null
         })) as { screen?: [number, number] | null } | null;
         if (alive) setPaidScreen(s?.screen ?? null);
       } catch {
@@ -4699,7 +5090,11 @@ export default function App() {
         "";
       let screen: [number, number] | null = null;
       try {
-        const s = (await inv("paid_device_screen", { model })) as {
+        const s = (await inv("paid_device_screen", {
+          model,
+          addr: connected.current.addr || null,
+          device: connected.current.name || selectedDevice.name || null
+        })) as {
           screen?: [number, number] | null;
         } | null;
         if (s?.screen) screen = s.screen;
@@ -4713,6 +5108,8 @@ export default function App() {
       const marketArgs: Record<string, string | number | null> = {
         model: model || null,
         device: marketDeviceName || null,
+        // 同屏跨品牌各看各的（vivo 432 与红米 432×514 撞屏）
+        vendor: deviceVendor(),
         // 会员档位：服务端据此把付费条目换成 ¥1 / ¥0（只影响显示）
         member: memberTier || null
       };
@@ -4788,7 +5185,7 @@ export default function App() {
     }
     const addr = connected.current.addr;
     if (!isDeviceConnected || !addr) {
-      showToast("请先连接手环设备", "error");
+      showToast("请先连接设备", "error");
       return;
     }
     // 认不出本机屏幕（新型号不在型号表里）：没有匹配依据就不装，
@@ -4808,6 +5205,9 @@ export default function App() {
     installKindRef.current = "watchface";
     setDialName(face.name);
     setInstallError(null);
+    // 集市安装是单包，没有中断出口；上一次付费安装的「部分完成」提示不能带到成功页
+    setInstallStoppable(false);
+    setInstallPartial(null);
     setInstallProgress(2);
     setProgressPhase("正在下载表盘…");
     if (currentRoute() === "install") setCurrentStep("redeem_installing");
@@ -4908,15 +5308,38 @@ export default function App() {
   })();
 
   /**
-   * 这个资源里能装哪个设备行（按本机屏幕匹配）。
+   * 当前设备品牌。同屏跨品牌（vivo 432×514 与红米 5/6）必须靠它选设备行，
+   * 只看屏幕会把 .bin 发给 vivo、把 .rpk 发给小米。
+   */
+  const deviceVendor = (): "xiaomi" | "vivo" =>
+    selectedDevice.brand === "vivo" ? "vivo" : "xiaomi";
+
+  /** 本机记着的 vivo 设备：账号页「VIVO 设备」卡与各处文案按品牌分流用 */
+  const vivoDeviceList = mockDevicesList.filter(d => d.brand === "vivo");
+
+  /** 这个设备行是不是当前品牌的（服务端没给 vendor 时按包体扩展名兜底） */
+  const variantMatchesVendor = (v: PaidVariant, vendor: "xiaomi" | "vivo"): boolean => {
+    if (v.vendor === "vivo" || v.vendor === "xiaomi") return v.vendor === vendor;
+    const first = (v.packages?.[0]?.file_name || "").toLowerCase();
+    if (first.endsWith(".rpk")) return vendor === "vivo";
+    if (first.endsWith(".bin") || first.endsWith(".mwz")) return vendor === "xiaomi";
+    return true; // 老数据/认不出格式：保持旧行为
+  };
+
+  /**
+   * 这个资源里能装哪个设备行（按本机屏幕 + 品牌匹配）。
    * 认不出屏幕（新型号不在型号表里）时**绝不猜**：宁可显示「暂不支持你的设备」，
    * 也不能取第一行 —— 那会把别的型号的包发给用户（2026-11-12 红米手表6 活力版
    * q65acn 被发成手环 10/11，装一次失败一次）。
    */
   const matchPaidVariant = (p: PaidProduct): { variant: PaidVariant | null; screenKnown: boolean } => {
     if (!paidScreen) return { variant: null, screenKnown: false };
+    const vendor = deviceVendor();
     const hit = p.variants.find(
-      v => v.screen?.[0] === paidScreen[0] && v.screen?.[1] === paidScreen[1]
+      v =>
+        v.screen?.[0] === paidScreen[0] &&
+        v.screen?.[1] === paidScreen[1] &&
+        variantMatchesVendor(v, vendor)
     );
     return { variant: hit ?? null, screenKnown: true };
   };
@@ -4931,7 +5354,7 @@ export default function App() {
     if (!inv) return;
     const addr = connected.current.addr;
     if (!isDeviceConnected || !addr) {
-      showToast("请先连接手环设备", "error");
+      showToast("请先连接设备", "error");
       return;
     }
     // 型号防呆（防御性兜底）：设备行屏幕 ≠ 本机屏幕就拦下
@@ -4944,6 +5367,10 @@ export default function App() {
     }
     if (vs?.[0] && vs[1] && (vs[0] !== paidScreen[0] || vs[1] !== paidScreen[1])) {
       showToast("该表盘不适配你的设备，请选择正确型号的表盘后再试。", "error");
+      return;
+    }
+    if (!variantMatchesVendor(variant, deviceVendor())) {
+      showToast("该表盘不适配你的设备品牌，请选择对应设备的表盘。", "error");
       return;
     }
     if (installBusyRef.current) return;
@@ -5048,7 +5475,7 @@ export default function App() {
     const addr = connected.current.addr;
     if (!isDeviceConnected || !addr) {
       installBusyRef.current = false;
-      showToast("请先连接手环设备", "error");
+      showToast("请先连接设备", "error");
       return;
     }
     installBusyRef.current = true;
@@ -5057,6 +5484,10 @@ export default function App() {
     installKindRef.current = "watchface";
     setDialName(product.name);
     setInstallError(null);
+    // 一次装多个包才给中断出口（单包没得中断）；重试时状态一起复位
+    setInstallStoppable(!!fileIds && fileIds.length > 1);
+    setInstallStopRequested(false);
+    setInstallPartial(null);
     setInstallProgress(2);
     setProgressPhase("正在验证授权…");
     if (currentRoute() === "install") setCurrentStep("redeem_installing");
@@ -5065,7 +5496,7 @@ export default function App() {
     installBeat.current = Date.now();
     void (async () => {
       try {
-        const installedId = (await withStallGuard(
+        const r = (await withStallGuard(
           linkLostRace(
             inv("paid_install", {
               addr,
@@ -5075,7 +5506,18 @@ export default function App() {
               fileIds
             })
           )
-        )) as string | null;
+        )) as {
+          lastId?: string | null;
+          installed?: number;
+          total?: number;
+          doneIds?: string[];
+          cancelled?: boolean;
+        } | null;
+        const installedId = r?.lastId ?? null;
+        // 用户选了「装完当前就停」：成功页要如实说装了几个（不能假装全装完）
+        setInstallPartial(
+          r?.cancelled ? { installed: r.installed ?? 0, total: r.total ?? fileIds?.length ?? 0 } : null
+        );
         setInstallProgress(100);
         setProgressPhase("安装完成，正在激活...");
         // 装完自动设为当前表盘（失败不打断：表盘已经装上了）
@@ -5088,10 +5530,9 @@ export default function App() {
         }
         await refreshDials(addr);
         // 装完后：只有把「需要更新/新增」的包都装了才清掉可更新标记；
-        // 用户手动取消某个包时保留角标，后台再按逐包指纹核对一次
-        const stillPending = (variant.update_file_ids ?? []).filter(
-          id => !!fileIds && !fileIds.includes(id)
-        );
+        // 用户手动取消或中途停止时保留角标，后台再按逐包指纹核对一次
+        const doneIds = r?.doneIds ?? fileIds ?? [];
+        const stillPending = (variant.update_file_ids ?? []).filter(id => !doneIds.includes(id));
         setPaidProducts(prev => prev.map(pp => pp.product_id !== product.product_id ? pp : {
           ...pp,
           variants: pp.variants.map(vv => vv.variant_id !== variant.variant_id ? vv : {
@@ -5115,8 +5556,23 @@ export default function App() {
       } finally {
         deviceBusy.current = false;
         installBusyRef.current = false;
+        setInstallStoppable(false);
       }
     })();
+  };
+
+  /**
+   * 「装完当前就停」：只打标记，Rust 在**包与包之间**检查 ——
+   * 正在下载/传输的那个包会完整装完，未开始的一个都不装。
+   */
+  const requestStopPaidInstall = () => {
+    if (!invoke || installStopRequested) return;
+    setInstallStopRequested(true);
+    // 按钮与说明文字会立刻改成「已收到」，不再弹 toast（会和底部按钮叠在一起）
+    void invoke("paid_install_stop_after_current").catch(() => {
+      setInstallStopRequested(false);
+      showToast("没能发送停止指令，请稍后再试", "error");
+    });
   };
 
   /**
@@ -5129,6 +5585,8 @@ export default function App() {
     b64: string;
     ext: string;
     name: string;
+    /** 文件类型（watchface / quickapp / unknown）：决定进度文案，也区分 vivo 表盘与小米快应用 */
+    kind?: string;
     /** 用户在确认页选的「复写表盘 ID」（不传 = 保持文件原 ID） */
     rewriteId?: string;
   }) => {
@@ -5141,10 +5599,14 @@ export default function App() {
       rewriteId: payload.rewriteId
     };
     setInstallSource("local");
-    const isQuickApp = payload.ext === "rpk";
+    // 注意：vivo 表盘也是 .rpk，不能只看扩展名（会被当成快应用）
+    const isQuickApp = payload.kind ? payload.kind === "quickapp" : payload.ext === "rpk";
     installKindRef.current = isQuickApp ? "quickapp" : "watchface";
     setDialName(payload.name);
     setInstallError(null);
+    // 本地安装是单文件，没有中断出口；上一次付费安装的「部分完成」提示不能带到成功页
+    setInstallStoppable(false);
+    setInstallPartial(null);
     setInstallProgress(6);
     setProgressPhase(isQuickApp ? "正在校验快应用文件..." : "正在校验表盘文件...");
     // 进安装进度页（与兑换流程同一套页面）：
@@ -5234,7 +5696,7 @@ export default function App() {
     const addr = connected.current.addr;
     // 未连接（用心跳维持的真实状态判断，不认残留的旧地址）→ 直接浮窗提示，不进安装流程
     if (!isDeviceConnected || !addr) {
-      showToast("请先连接手环设备", "error");
+      showToast("请先连接设备", "error");
       return;
     }
     const input = document.createElement("input");
@@ -5267,7 +5729,10 @@ export default function App() {
             name,
             size: probe?.size ?? u8.length,
             kind: probe?.kind ?? "unknown",
-            originalId: probe?.watchfaceId ? String(probe.watchfaceId) : null
+            originalId: probe?.watchfaceId ? String(probe.watchfaceId) : null,
+            appName: probe?.appName ?? null,
+            appPackage: probe?.appPackage ?? null,
+            appVersion: probe?.appVersion ?? null
           });
           setRewriteIdOn(false);
           setRewriteId(randomWatchfaceId());
@@ -5308,7 +5773,7 @@ export default function App() {
     const p = pendingLocal;
     if (!p) return;
     let rewrite: string | undefined;
-    if (p.kind === "watchface" && rewriteIdOn) {
+    if (p.kind === "watchface" && rewriteIdOn && selectedDevice.brand !== "vivo") {
       const id = rewriteId.trim();
       if (!isValidWatchfaceId(id)) {
         showToast("表盘 ID 需要 9 或 12 位字母数字", "error");
@@ -5321,7 +5786,14 @@ export default function App() {
       rewrite = id;
     }
     setPendingLocal(null);
-    runLocalInstall({ addr: p.addr, b64: p.b64, ext: p.ext, name: p.name, rewriteId: rewrite });
+    runLocalInstall({
+      addr: p.addr,
+      b64: p.b64,
+      ext: p.ext,
+      name: p.name,
+      kind: p.kind,
+      rewriteId: rewrite
+    });
   };
 
   // 离开确认页（取消 / 已开始安装）就把待装字节释放掉（可能是几十 MB）
@@ -6066,12 +6538,228 @@ export default function App() {
         {/* 核心内容视口容器（普通滚动，不再有全局拖拽形变；顶部假 iOS 状态栏已删） */}
         <div className="flex-1 flex flex-col overflow-hidden relative">
 
+          {/* 0. 首屏：选手表（只有两台都没接过的首次启动才出现） */}
+          {currentStep === "welcome" && (
+            <div className="flex-1 flex flex-col px-6 safe-top pb-10 page-enter-anim">
+              <div className="pt-10">
+                <h1 className="text-[34px] font-bold text-black tracking-tight leading-tight">
+                  连接手表
+                </h1>
+                <p className="text-[16px] font-medium text-black/45 mt-2">
+                  先告诉我你戴的是哪一种
+                </p>
+              </div>
+
+              <div className="flex-1 flex flex-col justify-center gap-5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    storeOnboarding("xiaomi");
+                    // 推入而不是替换：登录页左上角返回 / 侧滑都回到首屏
+                    pushRoute("login");
+                  }}
+                  className="relative w-full h-[200px] text-left rounded-[30px] p-6 bg-white overflow-hidden flex flex-col border border-white/60 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02)] cursor-pointer active:scale-[0.985] transition-transform duration-200"
+                >
+                  {/* 品牌淡渐变铺满整卡：角部径向光 + 对角线性底色，单色相、峰值叠加约 20% */}
+                  <div
+                    className="pointer-events-none absolute inset-0"
+                    style={{
+                      background:
+                        "radial-gradient(72% 62% at 0% 0%, rgba(255,106,0,0.12) 0%, rgba(255,106,0,0) 78%), linear-gradient(140deg, rgba(255,106,0,0.10) 0%, rgba(255,106,0,0.045) 48%, rgba(255,106,0,0.015) 100%)"
+                    }}
+                    aria-hidden="true"
+                  />
+                  <div className="relative">
+                    <div className="font-brand-serif text-[25px] text-black leading-tight">
+                      我是小米用户
+                    </div>
+                    <div className="text-[13px] font-medium text-black/45 mt-1">
+                      从小米账号连接设备
+                    </div>
+                  </div>
+                  <div className="relative mt-auto self-end w-8 h-8 rounded-full bg-white/75 shadow-[0_1px_2px_rgba(0,0,0,0.06)] flex items-center justify-center">
+                    <CaretRight className="w-4 h-4 text-black/30" />
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    storeOnboarding("vivo");
+                    // 进专门的连接引导页：先讲两步准备，再开始搜索
+                    pushRoute("vivo-scan");
+                  }}
+                  className="relative w-full h-[200px] text-left rounded-[30px] p-6 bg-white overflow-hidden flex flex-col border border-white/60 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02)] cursor-pointer active:scale-[0.985] transition-transform duration-200"
+                >
+                  <div
+                    className="pointer-events-none absolute inset-0"
+                    style={{
+                      background:
+                        "radial-gradient(72% 62% at 0% 0%, rgba(65,95,255,0.12) 0%, rgba(65,95,255,0) 78%), linear-gradient(140deg, rgba(65,95,255,0.10) 0%, rgba(65,95,255,0.045) 48%, rgba(65,95,255,0.015) 100%)"
+                    }}
+                    aria-hidden="true"
+                  />
+                  <div className="relative">
+                    <div className="font-brand-serif text-[25px] text-black leading-tight">
+                      我是 VIVO 用户
+                    </div>
+                    <div className="text-[13px] font-medium text-black/45 mt-1">
+                      搜索附近的设备
+                    </div>
+                  </div>
+                  <div className="relative mt-auto self-end w-8 h-8 rounded-full bg-white/75 shadow-[0_1px_2px_rgba(0,0,0,0.06)] flex items-center justify-center">
+                    <CaretRight className="w-4 h-4 text-black/30" />
+                  </div>
+                </button>
+              </div>
+
+              {/* 首屏只留备案号（App 备案要求显著位置可点开工信部系统） */}
+              <div className="pb-1 text-center">
+                <a
+                  href={BEIAN_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => {
+                    openLink(e, BEIAN_URL);
+                    showToast("正在打开工信部备案系统…");
+                  }}
+                  className="inline-flex items-center gap-1 text-[12px] font-medium text-black/35 hover:text-[#4361EE] transition-colors cursor-pointer"
+                >
+                  <span>{APP_BEIAN_NO}</span>
+                  <ArrowSquareOut className="w-3 h-3 stroke-[2]" />
+                </a>
+              </div>
+            </div>
+          )}
+
+          {/* 0b. vivo 连接引导：先讲两步准备，再开始搜索 */}
+          {currentStep === "vivo_scan" && (
+            <div className="flex-1 flex flex-col px-6 safe-top pb-10 page-enter-anim">
+              <button
+                type="button"
+                onClick={() => goBackOr("welcome")}
+                aria-label="返回"
+                className="w-11 h-11 -ml-2.5 mt-1 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
+              >
+                <CaretLeft className="w-6 h-6 stroke-[2]" />
+              </button>
+
+              <div className="pt-4">
+                <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
+                  连接 VIVO 手表
+                </h1>
+                <p className="text-[17px] font-medium text-black/45 mt-2">
+                  先做两步准备，再来搜索
+                </p>
+              </div>
+
+              <div className="bg-white rounded-3xl p-5 mt-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                <div className="flex gap-3.5">
+                  <div className="w-7 h-7 rounded-full bg-[#4361EE]/10 text-[#4361EE] text-[13px] font-bold flex items-center justify-center shrink-0">
+                    1
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[16px] font-bold text-black leading-tight">
+                      退出「vivo 健康」
+                    </p>
+                    <p className="text-[13px] font-medium text-black/40 mt-1 leading-relaxed">
+                      从最近任务里把它划掉，别让它占着手表
+                    </p>
+                  </div>
+                </div>
+                <div className="h-px bg-black/[0.06] my-4 ml-[42px]" />
+                <div className="flex gap-3.5">
+                  <div className="w-7 h-7 rounded-full bg-[#4361EE]/10 text-[#4361EE] text-[13px] font-bold flex items-center justify-center shrink-0">
+                    2
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[16px] font-bold text-black leading-tight">
+                      手表进入「连接新手机」
+                    </p>
+                    <p className="text-[13px] font-medium text-black/40 mt-1 leading-relaxed">
+                      手表「设置」→「系统管理」→「连接新手机」
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-5">
+                {vivoScanning && !vivoFound.length ? (
+                  <div className="w-full h-[52px] rounded-full bg-[#4361EE]/10 text-[#4361EE] font-bold text-[17px] flex items-center justify-center gap-2">
+                    <CircleNotch className="w-5 h-5 animate-spin" />
+                    正在搜索附近的手表…
+                  </div>
+                ) : vivoFound.length ? null : vivoSearched ? (
+                  <>
+                    <p className="text-[13px] font-medium text-black/40 text-center leading-relaxed mb-3">
+                      没有发现手表。确认两步都做好后，再搜一次
+                    </p>
+                    <button
+                      type="button"
+                      onClick={startVivoScan}
+                      className="w-full h-[52px] rounded-full bg-[#4361EE] text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer"
+                    >
+                      重新搜索
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={startVivoScan}
+                    className="w-full h-[52px] rounded-full bg-[#4361EE] text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer"
+                  >
+                    开始搜索
+                  </button>
+                )}
+              </div>
+
+              {vivoFound.length > 0 && (
+                <div className="mt-6 flex flex-col gap-2.5">
+                  <p className="text-[17px] font-medium text-black/45">
+                    发现 {vivoFound.length} 台，点按连接
+                  </p>
+                  {vivoFound.map(v => (
+                    <button
+                      key={v.id}
+                      type="button"
+                      onClick={() => handlePickVivoDevice(v)}
+                      className="w-full bg-white rounded-2xl px-4 py-3.5 flex items-center justify-between gap-3 text-left cursor-pointer active:scale-[0.99] transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-[16px] font-bold text-black truncate">{v.name}</div>
+                        <div className="text-[13px] font-medium text-black/40 mt-0.5">
+                          {connectingId === v.id ? "正在连接…" : v.id}
+                        </div>
+                      </div>
+                      <CaretRight className="w-5 h-5 shrink-0 text-black/20" />
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={startVivoScan}
+                    className="mt-1 h-[44px] rounded-full bg-black/5 text-black/75 font-semibold text-[16px] active:scale-95 transition-all cursor-pointer"
+                  >
+                    重新搜索
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* 1. 登录页 */}
           {currentStep === "login" && (
             <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim">
-              <div className="pt-6">
-                <h1 className="text-[36px] font-bold text-black tracking-tight leading-tight">
-                  盘坊
+              <div className="pt-4">
+                <button
+                  type="button"
+                  onClick={() => goBackOr("welcome")}
+                  aria-label="返回"
+                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
+                >
+                  <CaretLeft className="w-6 h-6 stroke-[2]" />
+                </button>
+                <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight mt-2">
+                  连接小米设备
                 </h1>
                 <p className="text-[17px] font-medium text-black/45 mt-2">
                   登录小米账号以连接手环
@@ -6124,7 +6812,7 @@ export default function App() {
 
                 {/* 状态 B · 异常兜底（平时不可见，只有异常才出现，一行行内次级动作） */}
                 {showLoginFallback && (
-                  <div className="flex items-center justify-center gap-3 mt-3.5 text-[14px] font-bold text-black/80 animate-in fade-in">
+                  <div className="flex items-center justify-center gap-3 mt-3.5 text-[13px] font-bold text-black/80 animate-in fade-in">
                     <button
                       type="button"
                       onClick={() => {
@@ -6163,13 +6851,21 @@ export default function App() {
                     </button>
                   </div>
                 )}
+                {/* 次要出口：vivo 用户不需要小米账号，别把人堵在登录页 */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    storeOnboarding("vivo");
+                    // 首屏 → 连接引导页（返回键回到首屏）
+                    resetStackTo("welcome", "vivo-scan");
+                  }}
+                  className="mt-5 text-[13px] font-semibold text-[#4361EE] text-center cursor-pointer active:scale-95 transition-all"
+                >
+                  我是 VIVO 用户
+                </button>
               </form>
 
               <div className="text-center space-y-2">
-                {/* 首次登录的疑虑打消：备案 + 账号用途/数据去向，就放在登录按钮正下方 */}
-                <p className="text-[12px] font-medium text-black/40 leading-relaxed px-1">
-                  本应用已通过工信部 App 备案。小米账号仅用于获取手环连接信息，这些信息只保存在本机。
-                </p>
                 {/* 取得同意的落点：登录前必须能看到协议与政策（也放进「关于应用」页） */}
                 <p className="text-[12px] font-medium text-black/35 leading-relaxed">
                   登录即表示同意
@@ -6189,98 +6885,112 @@ export default function App() {
                     《隐私政策》
                   </button>
                 </p>
-                <div className="flex flex-col items-center gap-1.5">
-                  <a
-                    href={BEIAN_URL}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    onClick={(e) => {
-                      openLink(e, BEIAN_URL);
-                      showToast("正在打开工信部备案系统…");
-                    }}
-                    className="inline-flex items-center gap-1 text-[12px] font-medium text-black/35 hover:text-[#4361EE] transition-colors cursor-pointer"
-                  >
-                    <span>{APP_BEIAN_NO}</span>
-                    <ArrowSquareOut className="w-3 h-3 stroke-[2]" />
-                  </a>
-                </div>
               </div>
             </div>
           )}
 
           {/* 2. 设备连接页 */}
           {currentStep === "device_select" && (
-            <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim">
-              <div>
+            <div className="flex-1 flex flex-col min-h-0 px-7 safe-top pb-8 page-enter-anim">
+              <div className="shrink-0 pt-1">
                 <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
                   选择设备
                 </h1>
-                <p className="text-[17px] font-medium text-black/45 mt-1.5">
-                  点按连接腕上手环
+                <p className="text-[13px] font-medium text-black/40 mt-1.5">
+                  点按连接腕上设备
                 </p>
               </div>
 
-              <div className="flex flex-col gap-3 my-auto">
-                {mockDevicesList.length === 0 ? (
-                  /* C5. 空态样例 1：无设备 */
-                  <div className="bg-white rounded-3xl p-5 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
-                    <p className="text-[14px] font-medium text-black/40 leading-relaxed mb-4">
-                      账号下暂无设备，可在手环端与小米账号绑定后重新导入
-                    </p>
+              <div className="flex-1 min-h-0 overflow-hidden mt-6 -mx-1">
+                <div
+                  data-rb="y"
+                  data-rb-always="1"
+                  className="h-full overflow-y-auto no-scrollbar px-1"
+                >
+                  <div className="flex flex-col gap-3 pb-6">
+                  {mockDevicesList.length === 0 ? (
+                    /* C5. 空态样例 1：无设备 */
+                    <div className="bg-white rounded-3xl p-5 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                      <p className="text-[13px] font-medium text-black/40 leading-relaxed mb-4">
+                        {userProfile.nickname
+                          ? "账号下暂无设备，可以重新导入小米账号设备"
+                          : "还没有设备，点下方扫描附近的 vivo 手表即可连接"}
+                      </p>
+                      {/* 重新导入是小米账号专属：没登录不出现（vivo 用户不需要小米账号） */}
+                      {userProfile.nickname && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            // 重新导入 = 把账号下的设备全拉回来：先清掉「已移除」名单
+                            clearHiddenDevices();
+                            // App 内：重新拉一次账号下的设备（本地凭证续期）
+                            if (invoke) {
+                              void (async () => {
+                                try {
+                                  const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
+                                  applyCloudDevices(devices);
+                                  showToast("已重新拉取小米设备");
+                                } catch (err) {
+                                  console.error("[xiaomi_restore] 重新导入失败：", err);
+                                  showToast("重新导入失败，请稍后重试", "error");
+                                }
+                              })();
+                              return;
+                            }
+                            setMockDevicesList(MOCK_DEVICES);
+                            showToast("已重新拉取小米设备");
+                          }}
+                          className="h-[44px] px-5 rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold text-[16px] cursor-pointer active:scale-95 transition-all"
+                        >
+                          重新导入小米设备
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    orderDevicesForSwitch(mockDevicesList, connectedId).map(device => (
+                      <DeviceCard
+                        key={device.id}
+                        device={device}
+                        isCurrent={!!connectedId && connectedId === device.id}
+                        isConnecting={connectingId === device.id}
+                        isConnected={!!connectedId && connectedId === device.id}
+                        surface="page"
+                        onSelect={handleSelectDevice}
+                        onMore={openDeviceMenu}
+                      />
+                    ))
+                  )}
+
+                  {connectGuideCard}
+
+                  {/* vivo 没有账号体系：附近的手表靠扫描发现（插件只上报 vivo / iQOO 广播）。
+                      小米账号用户这里不出现，避免和账号设备混在一起。 */}
+                  {!userProfile.nickname && (
                     <button
                       type="button"
-                      onClick={() => {
-                        // 重新导入 = 把账号下的设备全拉回来：先清掉「已移除」名单
-                        clearHiddenDevices();
-                        // App 内：重新拉一次账号下的设备（本地凭证续期）
-                        if (invoke) {
-                          void (async () => {
-                            try {
-                              const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
-                              applyCloudDevices(devices);
-                              showToast("已重新拉取手环设备");
-                            } catch (err) {
-                              console.error("[xiaomi_restore] 重新导入失败：", err);
-                              showToast("重新导入失败，请稍后重试", "error");
-                            }
-                          })();
-                          return;
-                        }
-                        setMockDevicesList(MOCK_DEVICES);
-                        showToast("已重新拉取手环设备");
-                      }}
-                      className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[14px] cursor-pointer active:scale-95 transition-all"
+                      onClick={startVivoScan}
+                      className="w-full h-[52px] rounded-2xl border border-dashed border-black/15 text-black/60 font-bold text-[16px] flex items-center justify-center gap-2 cursor-pointer active:scale-[0.99] transition-all"
                     >
-                      重新导入设备
+                      <Watch className="w-4 h-4" />
+                      扫描附近的手表
                     </button>
-                  </div>
-                ) : (
-                  orderDevicesForSwitch(mockDevicesList, connectedId).map(device => (
-                    <DeviceCard
-                      key={device.id}
-                      device={device}
-                      isCurrent={!!connectedId && connectedId === device.id}
-                      isConnecting={connectingId === device.id}
-                      isConnected={!!connectedId && connectedId === device.id}
-                      surface="page"
-                      onSelect={handleSelectDevice}
-                      onMore={openDeviceMenu}
-                    />
-                  ))
-                )}
-
-                {connectGuideCard}
+                  )}
+                </div>
               </div>
+            </div>
 
-              <div className="text-center flex flex-col items-center">
-                <button
-                  type="button"
-                  onClick={() => resetStackTo("login")}
-                  className="text-[14px] font-semibold text-[#4361EE] p-1 cursor-pointer active:scale-95 transition-all"
-                >
-                  切换账号
-                </button>
-              </div>
+              {/* 「切换账号」只对小米账号有意义；vivo 用户没有账号可切，别给他一个通往小米登录页的出口 */}
+              {userProfile.nickname && (
+                <div className="shrink-0 pt-4 text-center">
+                  <button
+                    type="button"
+                    onClick={() => pushRoute("login")}
+                    className="h-11 px-5 rounded-full bg-white border border-black/5 text-[16px] font-bold text-[#4361EE] shadow-[0_1px_3px_rgba(0,0,0,0.02)] cursor-pointer active:scale-95 transition-all"
+                  >
+                    切换小米账号
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -6308,7 +7018,7 @@ export default function App() {
               
               {/* Tab 1: 首页 */}
               {activeTab === "home" && (
-                <div key="tab-home" onScroll={handleTabScroll} className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-home" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   {/* 首屏没有大标题：内容从 68px 起点开始 */}
                   <div>
                     <div className="flex justify-center">
@@ -6345,11 +7055,11 @@ export default function App() {
                           <Scroll className="w-4.5 h-4.5 stroke-[2]" />
                         </span>
                         <span className="min-w-0">
-                          <span className="block text-[14px] font-bold text-black leading-tight">
+                          <span className="block text-[13px] font-bold text-black leading-tight">
                             第一次用？4 步上手
                           </span>
                           <span className="block text-[12px] font-medium text-black/45 mt-0.5 truncate">
-                            连手环、登录爱发电、安装已购表盘
+                            连设备、登录爱发电、安装已购表盘
                           </span>
                         </span>
                       </button>
@@ -6388,7 +7098,7 @@ export default function App() {
                             <CaretRight className="w-6 h-6 text-black/25 group-hover:text-black/45 group-hover:translate-x-0.5 transition-all" />
                           </div>
 
-                          <p className="text-[14px] font-medium text-black/45 mt-1.5">
+                          <p className="text-[13px] font-medium text-black/45 mt-1.5">
                             选择表盘或者快应用文件
                           </p>
                         </button>
@@ -6453,7 +7163,7 @@ export default function App() {
                             </svg>
                             {/* 有可更新的已购表盘 → 角标（点进去就能看到是哪几个） */}
                             {paidUpdateCount > 0 && (
-                              <span className="absolute -top-1.5 -right-1.5 min-w-[20px] h-5 px-1 rounded-full bg-[#D4973B] text-white text-[11px] font-bold flex items-center justify-center ring-2 ring-white">
+                              <span className="absolute -top-1.5 -right-1.5 min-w-[20px] h-5 px-1 rounded-full bg-[#D4973B] text-white text-[12px] font-bold flex items-center justify-center ring-2 ring-white">
                                 {paidUpdateCount}
                               </span>
                             )}
@@ -6466,7 +7176,7 @@ export default function App() {
                             <CaretRight className="w-6 h-6 text-black/25 group-hover:text-black/45 group-hover:translate-x-0.5 transition-all" />
                           </div>
 
-                          <p className="text-[14px] font-medium text-black/45 mt-1.5">
+                          <p className="text-[13px] font-medium text-black/45 mt-1.5">
                             {paidUpdateCount > 0
                               ? `有 ${paidUpdateCount} 个表盘可更新`
                               : "绑定爱发电，同步你买过的表盘"}
@@ -6504,13 +7214,13 @@ export default function App() {
                 <div key="tab-market" ref={marketListRef} onScroll={e => {
                   handleTabScroll(e);
                   marketScrollTopRef.current = e.currentTarget.scrollTop;
-                }} className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                }} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   {/* 大标题在全局顶栏里（折叠动画）；这里留出同样的高度，标题到设备卡仍是 28px */}
                   <div className="h-[60px] shrink-0" aria-hidden="true" />
 
                   {/* 搜索框 + 设备胶囊 + 标签胶囊：上面搜索，下面两颗胶囊共用一行 */}
                   <div className="mb-5 shrink-0">
-                    <div className="relative mb-3">
+                    <div className="relative mb-1.5">
                       <MagnifyingGlass className="w-4 h-4 text-black/25 stroke-[2] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
                       <input
                         value={marketQuery}
@@ -6518,7 +7228,7 @@ export default function App() {
                         placeholder="搜索表盘"
                         inputMode="search"
                         enterKeyHint="search"
-                        className="w-full h-11 pl-11 pr-11 rounded-full bg-white border border-black/5 text-[15px] font-medium text-black placeholder:text-black/30 outline-none"
+                        className="w-full h-11 pl-11 pr-11 rounded-full bg-white border border-black/5 text-[16px] font-medium text-black placeholder:text-black/30 outline-none"
                       />
                       {marketQuery.length > 0 && (
                         <button
@@ -6540,19 +7250,18 @@ export default function App() {
                         }`}
                       >
                         <span className={`w-2 h-2 rounded-full shrink-0 ${isDeviceConnected ? "bg-[#34C759]" : linkRetrying ? "bg-[#D4973B]" : "bg-[#FF3B30]"}`} />
-                        <span className="text-[15px] font-bold text-black tracking-tight truncate">
+                        <span className="text-[13px] font-bold text-black tracking-tight truncate">
                           {isDeviceConnected ? selectedDevice.name : linkRetrying ? "重连中…" : "未连接设备"}
                         </span>
-                        <CaretRight className="w-4 h-4 text-black/25 stroke-[2] shrink-0" />
+                        <CaretRight className="w-3.5 h-3.5 text-black/25 stroke-[2] shrink-0" />
                       </button>
 
                       {!marketError && marketLoaded && marketTagOptions(marketFaces).length > 0 && (
                         <button
                           type="button"
                           onClick={() => setMarketTagMenu(v => !v)}
-                          className="shrink-0 min-w-[86px] h-11 px-3.5 rounded-full bg-white border border-black/5 flex items-center justify-center gap-1.5 text-[13px] font-bold text-black/70 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.98] transition-all cursor-pointer"
+                          className="shrink-0 min-w-[76px] h-11 px-2.5 rounded-full bg-white border border-black/5 flex items-center justify-center gap-1.5 text-[13px] font-bold text-black tracking-tight shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.98] transition-all cursor-pointer"
                         >
-                          <SlidersHorizontal className="w-3.5 h-3.5 text-black/35 stroke-[2] shrink-0" />
                           <span className="truncate">{marketTag ?? "全部"}</span>
                           <CaretDown
                             className={`w-3.5 h-3.5 text-black/30 stroke-[2] shrink-0 transition-transform duration-200 ${
@@ -6603,7 +7312,7 @@ export default function App() {
                             Math.max(0, Math.min(marketBanners.length - 1, Math.round(el.scrollLeft / step)))
                           );
                         }}
-                        className="flex gap-3 overflow-x-auto no-scrollbar snap-x snap-mandatory"
+                        data-rb="x" className="flex gap-3 overflow-x-auto no-scrollbar snap-x snap-mandatory"
                       >
                         {marketBanners.map(b => (
                           <button
@@ -6648,7 +7357,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => void loadMarket()}
-                        className="mt-3 h-[40px] px-5 rounded-full bg-black/5 text-black/75 font-bold text-[14px] active:scale-95 transition-all cursor-pointer"
+                        className="mt-3 h-[40px] px-5 rounded-full bg-black/5 text-black/75 font-bold text-[13px] active:scale-95 transition-all cursor-pointer"
                       >
                         重试
                       </button>
@@ -6657,12 +7366,12 @@ export default function App() {
 
                   {!marketError && marketLoaded && filterMarketFaces(marketFaces, marketTag, marketQuery).length === 0 && (
                     <div className="py-16 text-center">
-                      <p className="text-[15px] font-medium text-black/40">
+                      <p className="text-[16px] font-medium text-black/40">
                         {marketQuery.trim()
                           ? "没有找到相关表盘"
                           : marketTag
                             ? "这个标签下还没有表盘"
-                            : "这台设备还没有表盘"}
+                            : "还没有适配这台设备的表盘"}
                       </p>
                     </div>
                   )}
@@ -6708,10 +7417,10 @@ export default function App() {
                                 </span>
                               )}
                             </div>
-                            <div className="mt-2.5 w-full text-[15px] font-bold text-black leading-snug truncate">
+                            <div className="mt-1.5 w-full text-[14px] font-semibold text-black leading-snug truncate">
                               {face.name}
                             </div>
-                            <div className="mt-0.5 text-[13px] font-medium text-black/40">
+                            <div className="text-[13px] font-medium text-black/40">
                               {marketPriceLabel(face)}
                             </div>
                           </button>
@@ -6724,7 +7433,7 @@ export default function App() {
 
               {/* Tab 3: 管理 */}
               {activeTab === "manage" && (
-                <div key="tab-manage" onScroll={handleTabScroll} className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-manage" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   {/* 大标题在全局顶栏里（折叠动画）；这里留出同样的高度，标题到卡片仍是 28px */}
                   <div className="h-[60px] shrink-0" aria-hidden="true" />
 
@@ -6753,9 +7462,7 @@ export default function App() {
                             <span className="w-2 shrink-0 flex justify-center">
                               <Lightning className="w-3 h-3 text-[#D4973B] fill-[#D4973B]" />
                             </span>
-                            <span>电量 {isDeviceConnected ? fmtBattery(selectedDevice.battery) : "--"}%</span>
-                            <span className="text-black/25">，</span>
-                            <span>{isDeviceConnected ? "已连接" : linkRetrying ? "自动重连中" : "未连接"}</span>
+                            <span>电量 {isDeviceConnected ? `${fmtBattery(selectedDevice.battery)}%，已连接` : "--%"}</span>
                           </div>
                         </div>
                       </div>
@@ -6769,7 +7476,7 @@ export default function App() {
                   {!isDeviceConnected ? (
                     /* 未连接设备：不显示任何表盘卡片（也没有预设假数据）；提示放在屏幕正中 */
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                      <p className="text-[14px] font-medium text-black/40">
+                      <p className="text-[13px] font-medium text-black/40">
                         请连接设备后再查看表盘列表
                       </p>
                     </div>
@@ -6780,8 +7487,8 @@ export default function App() {
                     {dials.length === 0 ? (
                       /* C5. 空态样例 2：无表盘 */
                       <div className="col-span-2 bg-white rounded-3xl p-5 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.02)] my-8">
-                        <p className="text-[14px] font-medium text-black/40 mb-4">
-                          手环上还没有表盘
+                        <p className="text-[13px] font-medium text-black/40 mb-4">
+                          设备上还没有表盘
                         </p>
                         <button
                           type="button"
@@ -6792,7 +7499,7 @@ export default function App() {
                             }
                             showToast("已重新拉取手环表盘");
                           }}
-                          className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[14px] cursor-pointer active:scale-95 transition-all"
+                          className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] cursor-pointer active:scale-95 transition-all"
                         >
                           重新拉取表盘列表
                         </button>
@@ -6910,9 +7617,23 @@ export default function App() {
                                             }
                                             showToast(`已将「${dial.name}」设为当前手环表盘`);
                                           }}
-                                          className="w-full px-3 py-2 text-left text-[14px] font-bold text-black hover:bg-black/5 rounded-xl transition-colors cursor-pointer"
+                                          className="w-full px-3 py-2 text-left text-[13px] font-bold text-black hover:bg-black/5 rounded-xl transition-colors cursor-pointer"
                                         >
                                           设为当前
+                                        </button>
+                                      )}
+
+                                      {/* vivo 表盘没有可编辑的图层模型：这一项只给小米 */}
+                                      {selectedDevice.brand !== "vivo" && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setActiveActionSheetDial(null);
+                                            handleOpenDialEdit(dial);
+                                          }}
+                                          className="w-full px-3 py-2 text-left text-[13px] font-bold text-black hover:bg-black/5 rounded-xl transition-colors cursor-pointer"
+                                        >
+                                          编辑表盘
                                         </button>
                                       )}
 
@@ -6920,20 +7641,9 @@ export default function App() {
                                         type="button"
                                         onClick={() => {
                                           setActiveActionSheetDial(null);
-                                          handleOpenDialEdit(dial);
-                                        }}
-                                        className="w-full px-3 py-2 text-left text-[14px] font-bold text-black hover:bg-black/5 rounded-xl transition-colors cursor-pointer"
-                                      >
-                                        编辑表盘
-                                      </button>
-
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          setActiveActionSheetDial(null);
                                           setUninstallConfirmDial(dial);
                                         }}
-                                        className="w-full px-3 py-2 text-left text-[14px] font-bold text-[#FF3B30] hover:bg-[#FF3B30]/10 rounded-xl transition-colors cursor-pointer"
+                                        className="w-full px-3 py-2 text-left text-[13px] font-bold text-[#FF3B30] hover:bg-[#FF3B30]/10 rounded-xl transition-colors cursor-pointer"
                                       >
                                         卸载表盘
                                       </button>
@@ -6965,7 +7675,7 @@ export default function App() {
 
               {/* Tab 3: 设置（极简纯列表页） */}
               {activeTab === "settings" && (
-                <div key="tab-settings" onScroll={handleTabScroll} className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-settings" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   <div>
                     {/* 大标题在全局顶栏里（折叠动画）；这里只留高度 */}
                     <div className="h-[60px] shrink-0" aria-hidden="true" />
@@ -6986,7 +7696,7 @@ export default function App() {
                               使用指引
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              4 步把已购表盘装上手环
+                              4 步把已购表盘装上设备
                             </p>
                           </div>
                         </div>
@@ -7079,8 +7789,12 @@ export default function App() {
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5 truncate">
                               {paidBound
-                                ? "小米、爱发电已绑定"
-                                : "小米已绑定，爱发电未绑定"}
+                                ? userProfile.nickname
+                                  ? "爱发电、小米已绑定"
+                                  : "爱发电已绑定"
+                                : userProfile.nickname
+                                  ? "爱发电未绑定"
+                                  : "绑定爱发电，同步已购表盘"}
                             </p>
                           </div>
                         </div>
@@ -7108,7 +7822,7 @@ export default function App() {
                                 ? `已连接：${selectedDevice.name}`
                                 : linkRetrying
                                   ? `重连中：${selectedDevice.name}`
-                                  : "未连接，点此查看设备"}
+                                  : "未连接"}
                             </p>
                           </div>
                         </div>
@@ -7132,7 +7846,7 @@ export default function App() {
                               关于应用
                             </h4>
                             <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              盘坊 v{appVersion ?? "0.3.84"}，开源许可与开发者
+                              开源许可与开发者
                             </p>
                           </div>
                         </div>
@@ -7145,7 +7859,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.3.84"}
+                      盘坊 v{appVersion ?? "0.3.98"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -7168,7 +7882,7 @@ export default function App() {
 
           {/* 3.4 设置 › 账号（二级页）：爱发电账号 / 小米账号 / 退出登录 */}
           {currentStep === "settings_account" && (
-            <div className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
               <div>
                 <button
                   type="button"
@@ -7184,64 +7898,22 @@ export default function App() {
                   </h1>
                 </div>
 
-                {/* 小米账号：信息全在卡面上，动作也在这张卡里 —— 以前这行点一下是「退出登录」，
-                    买家根本想不到，也不该用一个整行按钮去表达一个危险动作。 */}
-                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
-                  {/* 图标与标签同一行，值单独占满整行：ID 这种长串才不会在中间折行 */}
-                  <div className="px-5 pt-5 pb-4">
-                    <div className="flex items-center gap-2.5">
-                      <div className="w-7 h-7 shrink-0 rounded-lg bg-black/5 flex items-center justify-center">
-                        <User className="w-4 h-4 text-black/45 stroke-[2]" />
-                      </div>
-                      <p className="text-[13px] font-bold text-black/40">小米账号</p>
-                    </div>
-                    <p className="text-[19px] font-bold text-black mt-2.5 truncate">
-                      {userProfile.nickname || "已登录"}
-                    </p>
-                    {/* 小米 ID：卖家在订单表里就是按这个（miUserId）认人的 */}
-                    {miUserId && (
-                      <p className="text-[12px] font-medium text-black/30 mt-1 break-all">
-                        小米 ID {miUserId}
-                      </p>
-                    )}
-                  </div>
-                  <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        resetStackTo("login"); // 重新登录：登录页成为根页面
-                        showToast("请登录您的小米账号", "error");
-                      }}
-                      className="py-3.5 text-[15px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
-                    >
-                      重新登录
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setShowLogoutConfirm(true)}
-                      className="py-3.5 text-[15px] font-bold text-[#FF3B30] active:bg-black/5 transition-colors cursor-pointer"
-                    >
-                      退出登录
-                    </button>
-                  </div>
-                </div>
-
-                {/* 爱发电账号：绑定态、昵称、ID 都摆在卡面上；动作按绑定态切换。
-                    买家报障时截这一张图，卖家同时拿得到爱发电身份和小米身份。 */}
-                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
-                  <div className="px-5 pt-5 pb-4">
+                {/* ① 爱发电账号：所有用户都要绑，放在最上面、做得最醒目（用户 2026-11-15 要求）。
+                    买家报障时截这一张图，卖家就能把人对上。 */}
+                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
+                  <div className="px-5 pt-6 pb-5">
                     <div className="flex items-center gap-2.5">
                       {/* 爱发电 brand 图标（Figma 里画的真商标：紫底 + 白色 logo） */}
                       <img
                         src={afdianIcon}
                         alt=""
-                        className="w-7 h-7 shrink-0 rounded-lg"
+                        className="w-8 h-8 shrink-0 rounded-xl"
                       />
                       <p className="text-[13px] font-bold text-black/40">爱发电账号</p>
                     </div>
                     {paidBound ? (
                       <>
-                        <p className="text-[19px] font-bold text-black mt-2.5 truncate">
+                        <p className="text-[22px] font-bold text-black mt-3 truncate">
                           {paidAfdianName || "已绑定"}
                         </p>
                         {/* 昵称可能重名、也可能是空的，唯一的这个才是卖家能查的 */}
@@ -7250,10 +7922,13 @@ export default function App() {
                             爱发电 ID {paidAfdianId || `…${paidDisplay}`}
                           </p>
                         )}
+                        <p className="text-[12px] font-medium text-black/30 mt-1">
+                          买过的表盘都会同步到这里
+                        </p>
                       </>
                     ) : (
                       <>
-                        <p className="text-[19px] font-bold text-black mt-2.5">未绑定</p>
+                        <p className="text-[22px] font-bold text-black mt-3">未绑定</p>
                         <p className="text-[12px] font-medium text-black/30 mt-1">
                           绑定后同步你在爱发电买过的表盘
                         </p>
@@ -7270,14 +7945,14 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => setPaidAccountConfirm("switch")}
-                          className="py-3.5 text-[15px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                          className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
                         >
                           重新绑定
                         </button>
                         <button
                           type="button"
                           onClick={() => setPaidAccountConfirm("logout")}
-                          className="py-3.5 text-[15px] font-bold text-[#FF3B30] active:bg-black/5 transition-colors cursor-pointer"
+                          className="py-3.5 text-[16px] font-bold text-[#FF3B30] active:bg-black/5 transition-colors cursor-pointer"
                         >
                           退出绑定
                         </button>
@@ -7286,20 +7961,107 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => goPaidBindPage()}
-                        className="w-full py-3.5 text-[15px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
+                        className="w-full py-3.5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
                       >
                         绑定爱发电账号
                       </button>
                     )}
                   </div>
                 </div>
+
+                {/* ② 小米账号（可选）：只为连接小米设备。放在爱发电下面、做成紧凑卡，
+                    vivo 用户不会误以为「必须登录小米账号」（用户 2026-11-15 反馈）。 */}
+                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
+                  <div className="px-5 pt-4 pb-3.5">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-7 h-7 shrink-0 rounded-lg bg-black/5 flex items-center justify-center">
+                        <User className="w-4 h-4 text-black/45 stroke-[2]" />
+                      </div>
+                      <p className="text-[13px] font-bold text-black/40">小米账号</p>
+                      <span className="ml-auto text-[12px] font-bold text-black/25">可选</span>
+                    </div>
+                    <p className="text-[16px] font-bold text-black mt-2 truncate">
+                      {userProfile.nickname || "未登录"}
+                    </p>
+                    {/* 小米 ID：卖家在订单表里就是按这个（miUserId）认人的 */}
+                    {miUserId && (
+                      <p className="text-[12px] font-medium text-black/30 mt-0.5 break-all">
+                        小米 ID {miUserId}
+                      </p>
+                    )}
+                    {!userProfile.nickname && (
+                      <p className="text-[12px] font-medium text-black/30 mt-0.5">
+                        仅连接小米手环 / 手表时需要
+                      </p>
+                    )}
+                  </div>
+                  {userProfile.nickname ? (
+                    <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+                      <button
+                        type="button"
+                        onClick={() => pushRoute("login")} // 登录页压在账号页上，返回能回账号页
+                        className="py-3 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                      >
+                        切换账号
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowLogoutConfirm(true)}
+                        className="py-3 text-[16px] font-bold text-[#FF3B30] active:bg-black/5 transition-colors cursor-pointer"
+                      >
+                        退出登录
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => pushRoute("login")}
+                      className="w-full py-3 text-[16px] font-bold text-[#4361EE] border-t border-black/5 active:bg-black/5 transition-colors cursor-pointer"
+                    >
+                      去登录小米账号
+                    </button>
+                  )}
+                </div>
+
+                {/* ③ VIVO 设备（无需账号）：只在本机记着设备、没有云端账号 —— 对应小米账号的「身份」位置。
+                    纯小米用户看不到这张卡，避免多一个选项。 */}
+                {(vivoDeviceList.length > 0 || deviceVendor() === "vivo" || readOnboarding() === "vivo") && (
+                  <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
+                    <div className="px-5 pt-4 pb-3.5">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-7 h-7 shrink-0 rounded-lg bg-[#4361EE]/10 flex items-center justify-center">
+                          <Watch className="w-4 h-4 text-[#4361EE] stroke-[2]" />
+                        </div>
+                        <p className="text-[13px] font-bold text-black/40">VIVO 设备</p>
+                        <span className="ml-auto text-[12px] font-bold text-black/25">无需账号</span>
+                      </div>
+                      <p className="text-[16px] font-bold text-black mt-2 truncate">
+                        {vivoDeviceList.length > 0
+                          ? vivoDeviceList.map(d => d.name).join("、")
+                          : "还没有连接过"}
+                      </p>
+                      <p className="text-[12px] font-medium text-black/30 mt-0.5">
+                        {vivoDeviceList.length > 0
+                          ? `已绑定 ${vivoDeviceList.length} 台，扫描即可连接新的手表`
+                          : "扫描附近的设备即可连接"}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => pushRoute("vivo-scan")}
+                      className="w-full py-3 text-[16px] font-bold text-[#4361EE] border-t border-black/5 active:bg-black/5 transition-colors cursor-pointer"
+                    >
+                      {vivoDeviceList.length > 0 ? "扫描新的手表" : "扫描附近的设备"}
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           )}
 
           {/* 3.45 设置 › 设备与连接（二级页）：当前设备 / 重新导入 / 后台保持连接 */}
           {currentStep === "settings_device" && (
-            <div className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
               <div>
                 <button
                   type="button"
@@ -7331,47 +8093,69 @@ export default function App() {
                           ? `已连接：${selectedDevice.name}`
                           : linkRetrying
                             ? `重连中：${selectedDevice.name}`
-                            : "未连接，点此打开设备列表"}
+                            : "未连接"}
                       </p>
                     </div>
                     <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
                   </button>
 
-                  {/* 重新导入设备：与设备抽屉里的「重新导入设备列表」同一口径 */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      clearHiddenDevices();
-                      if (invoke) {
-                        void (async () => {
-                          try {
-                            const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
-                            applyCloudDevices(devices);
-                            openDeviceDrawer();
-                            showToast("已重新导入手环设备");
-                          } catch (err) {
-                            console.error("[xiaomi_restore] 重新导入失败：", err);
-                            showToast("重新导入失败，请稍后重试", "error");
-                          }
-                        })();
-                        return;
-                      }
-                      setMockDevicesList(MOCK_DEVICES);
-                      openDeviceDrawer();
-                      showToast("已重新导入手环设备");
-                    }}
-                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
-                  >
-                    <div className="pr-3">
-                      <h4 className="text-[16px] font-bold text-black leading-tight">
-                        重新导入手环设备
-                      </h4>
-                      <p className="text-[13px] font-medium text-black/40 mt-1">
-                        从小米账号重新拉取设备列表
-                      </p>
-                    </div>
-                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
-                  </button>
+                  {/* 重新导入设备：与设备抽屉里的「重新导入小米设备」同一口径。
+                      小米账号专属 —— 没登录就不出现，vivo 用户不需要它。 */}
+                  {userProfile.nickname && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        clearHiddenDevices();
+                        if (invoke) {
+                          void (async () => {
+                            try {
+                              const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
+                              applyCloudDevices(devices);
+                              openDeviceDrawer();
+                              showToast("已重新导入小米设备");
+                            } catch (err) {
+                              console.error("[xiaomi_restore] 重新导入失败：", err);
+                              showToast("重新导入失败，请稍后重试", "error");
+                            }
+                          })();
+                          return;
+                        }
+                        setMockDevicesList(MOCK_DEVICES);
+                        openDeviceDrawer();
+                        showToast("已重新导入小米设备");
+                      }}
+                      className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                    >
+                      <div className="pr-3">
+                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                          重新导入小米设备
+                        </h4>
+                        <p className="text-[13px] font-medium text-black/40 mt-1">
+                          从小米账号重新拉取设备列表
+                        </p>
+                      </div>
+                      <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                    </button>
+                  )}
+
+                  {/* vivo 没有账号体系：这里给一个直接去扫描的入口（仅当前是 vivo / 没有小米账号时显示） */}
+                  {(userProfile.nickname === "" || deviceVendor() === "vivo") && (
+                    <button
+                      type="button"
+                      onClick={() => pushRoute("vivo-scan")}
+                      className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                    >
+                      <div className="pr-3">
+                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                          扫描附近的 vivo 手表
+                        </h4>
+                        <p className="text-[13px] font-medium text-black/40 mt-1">
+                          无需账号，手表进「连接新手机」即可连上
+                        </p>
+                      </div>
+                      <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                    </button>
+                  )}
 
                   {/* 后台保活：连接期间有前台服务（常驻一条静默通知）；被 ROM 省电策略冻死会断连 */}
                   <button
@@ -7467,7 +8251,7 @@ export default function App() {
               }
             ];
             return (
-              <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim overflow-y-auto no-scrollbar">
+              <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim overflow-y-auto no-scrollbar">
                 <div>
                   <button
                     type="button"
@@ -7481,7 +8265,7 @@ export default function App() {
                     <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
                       怎么连上手环
                     </h1>
-                    <p className="text-[14px] font-medium text-black/45 mt-2">
+                    <p className="text-[13px] font-medium text-black/45 mt-2">
                       连不上多半是因为{devWord}还没进入「连接新手机」模式
                     </p>
                   </div>
@@ -7571,8 +8355,11 @@ export default function App() {
               onAction: () => void;
             }[] = [
               {
-                title: "连接手环",
-                desc: "手环上打开「设置 → 系统（部分版本为系统操作）→ 连接新手机」，再回 App 点连接。",
+                title: "连接设备",
+                desc:
+                  readOnboarding() === "vivo" || deviceVendor() === "vivo"
+                    ? "先把 vivo 健康从后台退出，手表上打开「设置 → 系统管理 → 连接新手机」，再回 App 扫描连接。"
+                    : "手环上打开「设置 → 系统（部分版本为系统操作）→ 连接新手机」，再回 App 点连接。",
                 done: isDeviceConnected,
                 doneText: "已连接",
                 action: isDeviceConnected ? "查看设备" : "去连接",
@@ -7598,7 +8385,10 @@ export default function App() {
               },
               {
                 title: "装好之后",
-                desc: "管理页可以设为当前表盘、改样式和配色、给照片表盘换壁纸。",
+                desc:
+                  readOnboarding() === "vivo" || deviceVendor() === "vivo"
+                    ? "管理页可以切换当前表盘、卸载不需要的表盘。"
+                    : "管理页可以设为当前表盘、改样式和配色、给照片表盘换壁纸。",
                 done: false,
                 doneText: "",
                 action: "打开管理页",
@@ -7606,7 +8396,7 @@ export default function App() {
               }
             ];
             return (
-              <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim overflow-y-auto no-scrollbar">
+              <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim overflow-y-auto no-scrollbar">
                 <div>
                   <button
                     type="button"
@@ -7620,7 +8410,7 @@ export default function App() {
                     <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
                       4 步上手
                     </h1>
-                    <p className="text-[14px] font-medium text-black/45 mt-2">
+                    <p className="text-[13px] font-medium text-black/45 mt-2">
                       第一次用盘坊？按顺序做完这四步就能装好第一块表盘。
                     </p>
                   </div>
@@ -7643,7 +8433,7 @@ export default function App() {
                           {s.done ? (
                             <Check className="w-4.5 h-4.5 stroke-[2.5]" />
                           ) : (
-                            <span className="text-[15px] font-bold">{i + 1}</span>
+                            <span className="text-[16px] font-bold">{i + 1}</span>
                           )}
                         </span>
                         <span className="flex-1 min-w-0">
@@ -7652,7 +8442,7 @@ export default function App() {
                               {s.title}
                             </span>
                             {s.done && (
-                              <span className="text-[11px] font-bold text-[#34C759]">
+                              <span className="text-[12px] font-bold text-[#34C759]">
                                 {s.doneText}
                               </span>
                             )}
@@ -7726,7 +8516,7 @@ export default function App() {
                     <h2 className="text-[22px] font-bold text-black tracking-tight">
                       已绑定
                     </h2>
-                    <p className="text-[14px] font-medium text-black/45 mt-1.5">
+                    <p className="text-[13px] font-medium text-black/45 mt-1.5">
                       爱发电账号{paidAfdianName ? `（${paidAfdianName}）` : ""}
                     </p>
                     {paidAfdianId && (
@@ -7742,7 +8532,7 @@ export default function App() {
                     </h2>
                     {/* 等待授权期间这段就是状态说明：别把解释塞到按钮下面，
                         那里只留操作，底部才不至于两行灰字贴在一起。 */}
-                    <p className="text-[14px] font-medium text-black/45 mt-1.5 max-w-[260px]">
+                    <p className="text-[13px] font-medium text-black/45 mt-1.5 max-w-[260px]">
                       {paidOauthUrl
                         ? "页面没反应或跳转失败，就复制授权链接，手动粘到浏览器里打开"
                         : "绑定你在爱发电买过的表盘，之后每次购买也会自动到账"}
@@ -7825,7 +8615,7 @@ export default function App() {
 
           {/* 4.5 我的表盘（已购资源列表） */}
           {currentStep === "paid_dials" && (
-            <div className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-7 safe-top pb-12 page-enter-anim">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-7 safe-top pb-12 page-enter-anim">
               <div>
                 <button
                   type="button"
@@ -7848,7 +8638,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => void loadPaidList()}
-                    className="mt-3 h-[40px] px-4 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[14px] active:scale-95 transition-all"
+                    className="mt-3 h-[40px] px-4 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all"
                   >
                     重试
                   </button>
@@ -7880,7 +8670,7 @@ export default function App() {
                   <h2 className="text-[22px] font-bold text-black tracking-tight">
                     还没有可安装的表盘
                   </h2>
-                  <p className="text-[14px] font-medium text-black/45 mt-1.5">
+                  <p className="text-[13px] font-medium text-black/45 mt-1.5">
                     去爱发电看看有没有喜欢的
                   </p>
                   {paidShopUrl && (
@@ -7913,7 +8703,7 @@ export default function App() {
                             </h3>
                             {/* 有新版本：装过这行才可能标出来（没装过就是「安装」） */}
                             {v?.has_update && (
-                              <span className="shrink-0 text-[11px] font-bold text-[#D4973B] bg-[#D4973B]/15 rounded-full px-2 py-[3px] leading-none">
+                              <span className="shrink-0 text-[12px] font-bold text-[#D4973B] bg-[#D4973B]/15 rounded-full px-2 py-[3px] leading-none">
                                 可更新
                               </span>
                             )}
@@ -7927,14 +8717,14 @@ export default function App() {
                             ? `适配 ${v.name}${v.installed && v.installed_version ? `，已装 ${v.installed_version}` : ""}`
                             : m.screenKnown || isDeviceConnected
                               ? "暂不支持你的设备"
-                              : "连接手环后安装"}
+                              : "连接设备后安装"}
                         </p>
                         {v ? (
                           <button
                             type="button"
                             disabled={installPreparing === p.product_id}
                             onClick={() => runPaidInstall(p, v)}
-                            className={`mt-4 w-full h-[44px] rounded-full text-white font-bold text-[15px] active:scale-[0.98] transition-all cursor-pointer ${
+                            className={`mt-4 w-full h-[44px] rounded-full text-white font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer ${
                               installPreparing === p.product_id ? "bg-[#4361EE]/60" : "bg-[#4361EE]"
                             }`}
                           >
@@ -7945,8 +8735,8 @@ export default function App() {
                                 : "安装"}
                           </button>
                         ) : (
-                          <div className="mt-4 h-[44px] rounded-full bg-black/5 text-black/25 font-bold text-[15px] flex items-center justify-center">
-                            暂不可安装
+                          <div className="mt-4 h-[44px] rounded-full bg-black/5 text-black/25 font-bold text-[16px] flex items-center justify-center">
+                            {isDeviceConnected ? "暂不可安装" : "先连接设备"}
                           </div>
                         )}
                       </div>
@@ -7968,8 +8758,11 @@ export default function App() {
               : undefined;
             const ownedVariant = ownedPaid
               ? ownedPaid.variants.find(
-                  v => v.screen?.[0] === face.screen[0] && v.screen?.[1] === face.screen[1]
-                ) ?? ownedPaid.variants[0]
+                  v =>
+                    v.screen?.[0] === face.screen[0] &&
+                    v.screen?.[1] === face.screen[1] &&
+                    variantMatchesVendor(v, deviceVendor())
+                )
               : undefined;
             const canInstall = !!ownedPaid && !!ownedVariant;
             // 认不出本机屏幕（新型号不在型号表里）：连着设备时就按「不适配」拦下；
@@ -7999,7 +8792,7 @@ export default function App() {
                   <div className="w-11 h-11" />
                 </div>
 
-                <div className="flex-1 overflow-y-auto no-scrollbar px-6 pb-32">
+                <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto no-scrollbar px-6 pb-32">
                   <div className="flex justify-center pt-2 pb-6">
                     <img
                       src={face.coverUrl}
@@ -8045,7 +8838,7 @@ export default function App() {
                   )}
 
                   {face.description && (
-                    <p className="text-[15px] font-medium text-black/45 leading-relaxed mt-5 whitespace-pre-wrap">
+                    <p className="text-[16px] font-medium text-black/45 leading-relaxed mt-5 whitespace-pre-wrap">
                       {face.description}
                     </p>
                   )}
@@ -8100,11 +8893,11 @@ export default function App() {
 
           {currentStep === "market_detail" && !marketDetail && (
             <div className="flex-1 flex flex-col items-center justify-center px-6">
-              <p className="text-[15px] font-medium text-black/40">这个表盘已经不在集市里了</p>
+              <p className="text-[16px] font-medium text-black/40">这个表盘已经不在集市里了</p>
               <button
                 type="button"
                 onClick={() => resetStackTo("main/market")}
-                className="mt-4 h-[44px] px-5 rounded-full bg-[#4361EE] text-white font-bold text-[15px] active:scale-[0.98] transition-all cursor-pointer"
+                className="mt-4 h-[44px] px-5 rounded-full bg-[#4361EE] text-white font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer"
               >
                 返回集市
               </button>
@@ -8130,7 +8923,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => goBackOr("main/home")}
-                    className="h-9 px-4 rounded-full bg-black/5 hover:bg-black/10 active:scale-95 transition-all text-black/80 text-[14px] font-semibold cursor-pointer flex items-center justify-center"
+                    className="h-9 px-4 rounded-full bg-black/5 hover:bg-black/10 active:scale-95 transition-all text-black/80 text-[13px] font-semibold cursor-pointer flex items-center justify-center"
                   >
                     返回
                   </button>
@@ -8141,17 +8934,17 @@ export default function App() {
                 </div>
 
                 {/* 内容整体在中部偏上：min-h-full + 居中，展开复写框时仍可滚动 */}
-                <div className="flex-1 overflow-y-auto px-5">
+                <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto px-5">
                   <div className="min-h-full flex flex-col justify-center py-4 pb-32">
                     {/* 大卡：文件信息（主视觉）。表盘名做标题放最顶上 */}
-                    <div className="bg-white rounded-2xl p-5 shadow-[0_2px_10px_rgba(0,0,0,0.03)] border border-black/[0.02]">
+                    <div className="bg-white rounded-2xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/[0.02]">
                       <div className="flex items-start gap-3">
                         <div className="min-w-0 flex-1">
                           <p className="text-[24px] font-bold leading-[1.25] text-black break-words">
                             {p.name}
                           </p>
                           <div className="flex items-center gap-2 mt-2.5">
-                            <span className="inline-flex items-center h-[22px] px-2 rounded-md bg-[#4361EE]/[0.07] text-[12px] font-semibold text-[#4361EE]">
+                            <span className="inline-flex items-center h-[22px] px-2 rounded-lg bg-[#4361EE]/[0.07] text-[12px] font-semibold text-[#4361EE]">
                               {kindLabel}
                             </span>
                             <span className="text-[13px] font-medium text-black/45">
@@ -8168,7 +8961,7 @@ export default function App() {
                         <div className="mt-4 pt-4 border-t border-black/5">
                           <div className="flex items-center justify-between gap-3">
                             <span className="text-[13px] font-medium text-black/45">表盘 ID</span>
-                            <span className="text-[14px] font-mono font-semibold tracking-wider text-black/80 truncate">
+                            <span className="text-[13px] font-mono font-semibold tracking-wider text-black/80 truncate">
                               {p.originalId || "读不出来"}
                             </span>
                           </div>
@@ -8184,6 +8977,28 @@ export default function App() {
                         </div>
                       )}
 
+                      {/* vivo 快应用：没有表盘 ID，给包名与版本让用户确认装的是哪个应用 */}
+                      {p.kind === "quickapp" && (p.appPackage || p.appVersion) && (
+                        <div className="mt-4 pt-4 border-t border-black/5 space-y-2.5">
+                          {p.appPackage && (
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="text-[13px] font-medium text-black/45">包名</span>
+                              <span className="text-[13px] font-mono font-semibold text-black/80 truncate">
+                                {p.appPackage}
+                              </span>
+                            </div>
+                          )}
+                          {p.appVersion && (
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="text-[13px] font-medium text-black/45">版本</span>
+                              <span className="text-[13px] font-semibold text-black/80">
+                                {p.appVersion}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       {p.kind === "unknown" && (
                         <div className="flex items-start gap-2 rounded-xl bg-[#FFF7E8] px-3 py-2.5 mt-4">
                           <Info className="w-4 h-4 text-[#B7791F] shrink-0 mt-[1px]" weight="fill" />
@@ -8194,12 +9009,12 @@ export default function App() {
                       )}
                     </div>
 
-                    {/* 小卡：复写表盘 ID（只有表盘才有；快应用没有表盘 ID 语义） */}
-                    {isWatchface && (
+                    {/* 小卡：复写表盘 ID（只有小米 .bin 表盘才有；快应用与 vivo 表盘都没有这个语义） */}
+                    {isWatchface && selectedDevice.brand !== "vivo" && (
                       <div className="bg-white rounded-2xl p-4 mt-3 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/[0.02]">
                         <div className="flex items-start justify-between gap-4">
                           <div className="min-w-0">
-                            <p className="text-[15px] font-semibold text-black">复写表盘 ID</p>
+                            <p className="text-[16px] font-semibold text-black">复写表盘 ID</p>
                             <p className="text-[12px] font-medium text-black/45 mt-1 leading-relaxed">
                               换一个新 ID 安装，不会覆盖手环上已有的同名表盘
                             </p>
@@ -8243,7 +9058,7 @@ export default function App() {
                                 autoCapitalize="characters"
                                 spellCheck={false}
                                 placeholder="9 或 12 位字母数字"
-                                className="flex-1 min-w-0 h-11 rounded-xl bg-black/[0.04] px-3 text-[15px] font-mono tracking-wider text-black outline-none focus:ring-2 focus:ring-[#4361EE]/25"
+                                className="flex-1 min-w-0 h-11 rounded-xl bg-black/[0.04] px-3 text-[16px] font-mono tracking-wider text-black outline-none focus:ring-2 focus:ring-[#4361EE]/25"
                               />
                               <button
                                 type="button"
@@ -8351,7 +9166,7 @@ export default function App() {
                         }
                         setInstallError(null);
                       }}
-                      className="mt-3 h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[14px] active:scale-95 transition-all"
+                      className="mt-3 h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all"
                     >
                       重试安装
                     </button>
@@ -8390,6 +9205,30 @@ export default function App() {
             />
           )}
 
+          {/* 多包体安装的中断出口：放在锁屏层之上（z-130），只停「还没开始」的包 */}
+          {currentStep === "redeem_installing" && !installError && installStoppable && (
+            <div
+              className="fixed left-0 right-0 z-[130] px-7 flex flex-col items-center"
+              style={{ bottom: "calc(28px + env(safe-area-inset-bottom, 0px))" }}
+            >
+              <button
+                type="button"
+                disabled={installStopRequested}
+                onClick={requestStopPaidInstall}
+                className={`h-[44px] px-6 rounded-full font-bold text-[16px] transition-all flex items-center justify-center ${
+                  installStopRequested
+                    ? "bg-black/5 text-black/30"
+                    : "bg-black/[0.07] text-black/75 active:scale-95 cursor-pointer"
+                }`}
+              >
+                {installStopRequested ? "当前表盘装完即停" : "装完当前就停"}
+              </button>
+              <p className="text-[12px] font-medium text-black/35 mt-2 text-center">
+                {installStopRequested ? "已收到，装完这个就不再继续" : "已装的保留，没开始的不会安装"}
+              </p>
+            </div>
+          )}
+
           {/* 6. 成功页 */}
           {currentStep === "redeem_success" && (
             <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-10 page-enter-anim">
@@ -8403,7 +9242,11 @@ export default function App() {
                   {dialName}
                 </h2>
                 <p className="text-[17px] font-medium text-black/45 mt-2">
-                  {installKindRef.current === "quickapp" ? "已装到你的手环" : "已应用到你的手环"}
+                  {installPartial
+                    ? `已安装 ${installPartial.installed}/${installPartial.total} 个，其余已按你的选择停止`
+                    : installKindRef.current === "quickapp"
+                      ? "已装到你的手环"
+                      : "已应用到你的手环"}
                 </p>
               </div>
 
@@ -8456,14 +9299,14 @@ export default function App() {
                 <div className="w-full max-w-[420px] bg-white rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.02)] p-5">
                   {dialSessionState === "loading" || dialSessionState === "idle" ? (
                     <>
-                      <div className="text-[15px] font-bold text-black">正在载入表盘…</div>
+                      <div className="text-[16px] font-bold text-black">正在载入表盘…</div>
                       <div className="text-[13px] font-medium text-black/45 mt-1.5 leading-relaxed">
                         正在读取本机留档，请稍候。
                       </div>
                     </>
                   ) : (
                     <>
-                      <div className="text-[15px] font-bold text-black">这个表盘不能编辑</div>
+                      <div className="text-[16px] font-bold text-black">这个表盘不能编辑</div>
                       <div className="text-[13px] font-medium text-black/45 mt-1.5 leading-relaxed">
                         本地没有它的留档（不是通过本 App 安装的，或应用数据被清理过）。
                         到「管理」页用本 App 重新安装一次这个表盘，之后就能编辑了。
@@ -8471,7 +9314,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => goBackOr("main/manage")}
-                        className="w-full mt-4 h-[44px] rounded-full bg-[#4361EE] text-white font-bold text-[15px] active:scale-[0.98] transition-all cursor-pointer"
+                        className="w-full mt-4 h-[44px] rounded-full bg-[#4361EE] text-white font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer"
                       >
                         返回管理页
                       </button>
@@ -8503,7 +9346,7 @@ export default function App() {
                 {/* 预览差异提示：悬浮在标题下方（解包渲染的元素位置可能和手环实际显示不同）。
                     × = 本次关掉；「不再显示」= 永久收起（本地记住）。 */}
                 {!editPreviewHintHidden && !editPreviewHintClosed && (
-                  <div className="absolute left-6 right-6 top-full mt-1.5 z-30 rounded-2xl bg-white border border-black/5 shadow-[0_6px_20px_rgba(0,0,0,0.08)] px-4 py-3">
+                  <div className="absolute left-6 right-6 top-full mt-1.5 z-30 rounded-2xl bg-white border border-black/5 shadow-[0_10px_30px_rgba(0,0,0,0.16)] px-4 py-3">
                     <div className="flex items-start gap-2.5 pr-6">
                       <Info className="w-4 h-4 shrink-0 text-[#4361EE] mt-[2px]" />
                       <div className="flex-1 min-w-0">
@@ -8541,7 +9384,7 @@ export default function App() {
               {/* 顶部固定：画布 + 设备行 —— 在滚动容器外面，卡片怎么滚都不会叠到画布上 */}
               <div className="px-6 pt-1 pb-3 flex flex-col items-center shrink-0">
                   <div 
-                    className="relative rounded-[30px] overflow-hidden flex flex-col justify-between p-3.5 bg-black select-none shadow-[0_8px_24px_rgba(0,0,0,0.14)]"
+                    className="relative rounded-[30px] overflow-hidden flex flex-col justify-between p-3.5 bg-black select-none shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
                     style={{
                       width: `${canvasFrame.w}px`,
                       height: `${canvasFrame.h}px`,
@@ -8670,7 +9513,7 @@ export default function App() {
               </div>
 
               {/* 可滑动编辑主体区：只滚下面的配置卡片 */}
-              <div className="flex-1 overflow-y-auto no-scrollbar px-6 pb-32">
+              <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto no-scrollbar px-6 pb-32">
                 {/* 2. 手风琴式展开配置区（收紧版间距） */}
                 <div className="flex flex-col gap-2.5">
                   
@@ -8696,13 +9539,13 @@ export default function App() {
                       {/* 默认照片 + 自己做的壁纸一排；两边都没有时才显示空态 */}
                       {wallpapers.length === 0 && !dialDefaultPhoto && !dialDefaultLoading ? (
                         <div className="py-6 flex flex-col items-center justify-center text-center">
-                          <p className="text-[14px] font-medium text-black/40 mb-3">
+                          <p className="text-[13px] font-medium text-black/40 mb-3">
                             {genPlanError || "还没有壁纸，点下面去做一张"}
                           </p>
                           <button
                             type="button"
                             onClick={handleAddWallpaper}
-                            className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[14px] active:scale-95 transition-all cursor-pointer"
+                            className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all cursor-pointer"
                           >
                             去制作壁纸
                           </button>
@@ -8710,7 +9553,7 @@ export default function App() {
                       ) : (
                         // 留出 padding：滚动容器会裁掉子元素的 ring，不给内边距时
                         // 第一张的蓝框会被左边切掉一截（用户反馈过）
-                        <div className="flex items-center gap-2.5 overflow-x-auto no-scrollbar py-1 px-1 -mx-1">
+                        <div data-rb="x" className="flex items-center gap-2.5 overflow-x-auto no-scrollbar py-1 px-1 -mx-1">
                           {/* 表盘自带的默认照片：不可删除；选中后「应用」= 恢复默认 */}
                           {dialDefaultPhoto ? (
                             <button
@@ -8814,7 +9657,7 @@ export default function App() {
                         }`}>
                           表盘样式
                         </span>
-                        <h4 className="text-[15px] font-bold text-black mt-0.5">
+                        <h4 className="text-[16px] font-bold text-black mt-0.5">
                           {selectedStyle}
                         </h4>
                       </div>
@@ -8834,7 +9677,7 @@ export default function App() {
 
                     {openSection === "style" && (
                       <div className="px-4.5 pb-4 pt-1 border-t border-black/[0.05] animate-in fade-in slide-in-from-top-2 duration-200">
-                        <div className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
+                        <div data-rb="y" className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
                           {styleOptions.map((st) => {
                             const isSelected = selectedStyle === st;
                             return (
@@ -8858,7 +9701,7 @@ export default function App() {
                                     }
                                   }
                                 }}
-                                className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[14px] font-semibold transition-all cursor-pointer ${
+                                className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[13px] font-semibold transition-all cursor-pointer ${
                                   isSelected
                                     ? "bg-[#4361EE] text-white"
                                     : "bg-[#F5F6F9] hover:bg-[#EAEAEF] text-black/80"
@@ -8902,7 +9745,7 @@ export default function App() {
                         }`}>
                           主题配色
                         </span>
-                        <h4 className="text-[15px] font-bold text-black mt-0.5">
+                        <h4 className="text-[16px] font-bold text-black mt-0.5">
                           {selectedColorName}
                         </h4>
                       </div>
@@ -8922,7 +9765,7 @@ export default function App() {
 
                     {openSection === "color" && (
                       <div className="px-4.5 pb-4 pt-1 border-t border-black/[0.05] animate-in fade-in slide-in-from-top-2 duration-200">
-                        <div className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
+                        <div data-rb="y" className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
                           {visibleColors.map((col) => {
                             const isSelected = selectedColorName === col.name;
                             return (
@@ -8930,7 +9773,7 @@ export default function App() {
                                 key={col.name}
                                 type="button"
                                 onClick={() => setSelectedColorName(col.name)}
-                                className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[14px] font-semibold transition-all cursor-pointer ${
+                                className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[13px] font-semibold transition-all cursor-pointer ${
                                   isSelected
                                     ? "bg-[#4361EE] text-white"
                                     : "bg-[#F5F6F9] hover:bg-[#EAEAEF] text-black/80"
@@ -8980,7 +9823,7 @@ export default function App() {
                             }`}>
                               {`容器 ${idx + 1}｜${card.label}`}
                             </span>
-                            <h4 className="text-[15px] font-bold text-black mt-0.5">
+                            <h4 className="text-[16px] font-bold text-black mt-0.5">
                               {card.selected}
                             </h4>
                           </div>
@@ -9000,7 +9843,7 @@ export default function App() {
 
                         {isOpen && (
                           <div className="px-4.5 pb-4 pt-1 border-t border-black/[0.05] animate-in fade-in slide-in-from-top-2 duration-200">
-                            <div className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
+                            <div data-rb="y" className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
                               {card.options.map((con, oi) => {
                                 // 选中判定按**动作序号**：两个候选同名时也能各自独立高亮
                                 const isSelected =
@@ -9012,7 +9855,7 @@ export default function App() {
                                     key={card.slot != null ? `${card.slot}:${card.ids[oi] ?? oi}` : `${card.label}:${oi}`}
                                     type="button"
                                     onClick={() => selectContainerAt(card.slot, card.label, oi)}
-                                    className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[14px] font-semibold transition-all cursor-pointer ${
+                                    className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[13px] font-semibold transition-all cursor-pointer ${
                                       isSelected
                                         ? "bg-[#4361EE] text-white"
                                         : "bg-[#F5F6F9] hover:bg-[#EAEAEF] text-black/80"
@@ -9106,7 +9949,7 @@ export default function App() {
                     className="bg-white rounded-2xl p-4 flex flex-col gap-3"
                   >
                     <div className="flex items-center justify-between">
-                      <h3 className="text-[15px] font-bold text-black">
+                      <h3 className="text-[16px] font-bold text-black">
                         {genSlotLabel(photo, photos.length)}
                       </h3>
                       <span className="text-[12px] font-medium text-black/35">已固定</span>
@@ -9142,7 +9985,7 @@ export default function App() {
                   className="bg-white rounded-2xl p-4 flex flex-col gap-3"
                 >
                   <div className="flex items-center justify-between">
-                    <h3 className="text-[15px] font-bold text-black">
+                    <h3 className="text-[16px] font-bold text-black">
                       {genSlotLabel(photo, photos.length)}
                     </h3>
                     <span className="text-[12px] font-medium text-black/35">
@@ -9308,7 +10151,7 @@ export default function App() {
                       if (genDirty) setGenExitAsk(true);
                       else goBackOr("main/manage");
                     }}
-                    className="h-9 px-4 rounded-full bg-black/5 hover:bg-black/10 active:scale-95 transition-all text-black/80 text-[14px] font-semibold cursor-pointer flex items-center justify-center"
+                    className="h-9 px-4 rounded-full bg-black/5 hover:bg-black/10 active:scale-95 transition-all text-black/80 text-[13px] font-semibold cursor-pointer flex items-center justify-center"
                   >
                     返回
                   </button>
@@ -9319,7 +10162,7 @@ export default function App() {
                     type="button"
                     onClick={() => void saveGenWallpapers()}
                     disabled={genRendering}
-                    className="h-9 px-4 rounded-full bg-[#4361EE]/10 text-[#4361EE] hover:bg-[#4361EE]/15 disabled:text-[#4361EE]/50 active:scale-95 transition-all text-[14px] font-bold cursor-pointer flex items-center justify-center gap-1.5"
+                    className="h-9 px-4 rounded-full bg-[#4361EE]/10 text-[#4361EE] hover:bg-[#4361EE]/15 disabled:text-[#4361EE]/50 active:scale-95 transition-all text-[13px] font-bold cursor-pointer flex items-center justify-center gap-1.5"
                   >
                     {genRendering && genSaving ? <CircleNotch className="w-4 h-4 animate-spin" /> : null}
                     保存
@@ -9382,7 +10225,7 @@ export default function App() {
                 >
                   <canvas
                     ref={genCanvasRef}
-                    className="block pointer-events-none select-none max-h-full max-w-full drop-shadow-[0_6px_20px_rgba(0,0,0,0.10)]"
+                    className="block pointer-events-none select-none max-h-full max-w-full drop-shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
                     style={{ height: "100%", width: "auto" }}
                   />
                   {missingAssets && (
@@ -9395,14 +10238,14 @@ export default function App() {
                 </div>
 
                 {/* 编辑区：固定占据下半屏，内部可滚 */}
-                <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-4 pt-1 pb-3 flex flex-col gap-3">
+                <div data-rb="y" data-rb-always="1" className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-4 pt-1 pb-3 flex flex-col gap-3">
                   {photos.map((ph, i) => renderPhotoSection(ph, i))}
 
                   {/* 相框颜色：直接铺在列表底部，不再需要点开浮层 */}
                   {colors.length > 1 && (
                     <section className="bg-white rounded-2xl p-4 flex flex-col gap-3">
                       <div className="flex items-center justify-between">
-                        <h3 className="text-[15px] font-bold text-black">相框颜色</h3>
+                        <h3 className="text-[16px] font-bold text-black">相框颜色</h3>
                         <span className="text-[12px] font-medium text-black/35">
                           {colors.find(c => c.i === (genColor ?? colors[0]?.i))?.name || ""}
                         </span>
@@ -9484,7 +10327,7 @@ export default function App() {
 
           {/* 8. 关于应用主页（一级页面，简约清晰） */}
           {currentStep === "about_app" && (
-            <div className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top pb-8 page-enter-anim select-none">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top pb-8 page-enter-anim select-none">
               <div>
                 {/* 顶部返回导航 */}
                 <div className="flex items-center justify-between pb-4">
@@ -9505,18 +10348,15 @@ export default function App() {
                 <div className="flex flex-col items-center text-center pt-5 pb-6">
                   {/* 参考参考图风格重新设计的应用图标：清透蓝青双色微光背景 + 悬浮白透毛玻璃表盘 + 立体卷角折纸与核心刻度 */}
                   {/* 应用图标：与桌面图标同一套手绘设计稿（Figma 节点 21:77 导出，白底 + 内容 62%） */}
-                  <div className="w-24 h-24 rounded-[26px] overflow-hidden relative mb-4 select-none shadow-[0_14px_34px_rgba(0,0,0,0.12),0_2px_8px_rgba(0,0,0,0.04)]">
+                  <div className="w-24 h-24 rounded-[24px] overflow-hidden relative mb-4 select-none shadow-[0_8px_24px_rgba(0,0,0,0.10)]">
                     <img src={appIcon} alt="盘坊" className="w-full h-full object-cover" />
                   </div>
                   <h2 className="text-[24px] font-bold text-black tracking-tight">
                     盘坊
                   </h2>
-                  <span className="text-[13px] font-semibold text-black/40 mt-1">
-                    v{appVersion ?? "0.3.84"}
-                  </span>
                 </div>
 
-                {/* 开源声明行：「本应用以 AGPL-3.0 分发 · 查看源码」 */}
+                {/* 开源声明行：「本应用以 AGPL-3.0 分发，点击查看源码」 */}
                 <div className="text-center pb-6 px-4">
                   <a
                     href="https://github.com/Hobjl-lian/panfang"
@@ -9526,7 +10366,7 @@ export default function App() {
                       openLink(e, "https://github.com/Hobjl-lian/panfang");
                       showToast("正在前往 GitHub 源码仓库...");
                     }}
-                    className="inline-flex flex-col items-center gap-1.5 text-[13px] font-medium text-black/50 hover:text-[#4361EE] transition-colors group cursor-pointer"
+                    className="inline-flex items-center gap-1.5 text-[13px] font-medium text-black/50 hover:text-[#4361EE] transition-colors group cursor-pointer"
                   >
                     <span className="whitespace-nowrap">本应用以 AGPL-3.0 分发，点击查看源码</span>
                     <ArrowSquareOut className="w-3.5 h-3.5 stroke-[2] text-black/35 group-hover:text-[#4361EE]" />
@@ -9556,7 +10396,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.84"}`}
+                            : `当前版本 v${appVersion ?? "0.3.98"}`}
                         </p>
                       </div>
                     </div>
@@ -9718,12 +10558,12 @@ export default function App() {
                 </h2>
 
                 {/* 身份小标签 */}
-                <p className="text-[14px] font-bold text-[#4361EE] mt-1.5">
+                <p className="text-[13px] font-bold text-[#4361EE] mt-1.5">
                   开发者
                 </p>
 
                 {/* 简介文案：自然留白，纯净排版 */}
-                <p className="text-[14px] font-medium text-black/45 leading-relaxed mt-6 max-w-[270px]">
+                <p className="text-[13px] font-medium text-black/45 leading-relaxed mt-6 max-w-[270px]">
                   小米官方表盘设计师，米坛社区认证创作者。无论是否发电，希望你开心。
                 </p>
               </div>
@@ -9767,7 +10607,7 @@ export default function App() {
 
           {/* 10. 开源许可与致谢（二级页：长文本可滚动、严格规范排版） */}
           {currentStep === "open_source_licenses" && (
-            <div className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
               <div>
                 {/* 顶部返回导航 */}
                 <div className="flex items-center justify-between pb-3">
@@ -9865,15 +10705,50 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+
+                  {/* 内嵌字体：思源宋体子集（只用于首屏卡片标题） */}
+                  <div className="bg-white rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/5">
+                    <div className="flex items-center justify-between pb-3 border-b border-black/5">
+                      <div>
+                        <h3 className="text-[17px] font-bold text-black tracking-tight">
+                          Noto Serif SC
+                        </h3>
+                        <p className="text-[12px] font-bold text-black/40 mt-0.5">
+                          SIL Open Font License 1.1
+                        </p>
+                      </div>
+                      <div className="w-8 h-8 rounded-full bg-black/5 flex items-center justify-center text-black/40">
+                        <FileText className="w-4 h-4 stroke-[2]" />
+                      </div>
+                    </div>
+
+                    <div className="pt-3.5 text-[13px] text-black/45 leading-relaxed space-y-2.5">
+                      <p>
+                        首屏卡片标题内嵌的思源宋体子集仅包含标题用字，遵循 SIL Open Font License 1.1 分发，许可全文随源码仓库提供。
+                      </p>
+                      <div className="pt-1">
+                        <a
+                          href="https://openfontlicense.org/open-font-license-official-text/"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={(e) =>
+                            openLink(e, "https://openfontlicense.org/open-font-license-official-text/")
+                          }
+                          className="inline-flex items-center gap-1 text-[13px] font-bold text-[#4361EE] hover:underline"
+                        >
+                          <span>阅读 SIL OFL 1.1 完整条款</span>
+                          <ArrowSquareOut className="w-3.5 h-3.5 stroke-[2]" />
+                        </a>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
-
-              {/* 底部次级返回按钮：高度 44，全圆角，底 black/5，字 black/75，15/700 */}
               <div className="pt-6">
                 <button
                   type="button"
                   onClick={() => goBackOr("about")}
-                  className="w-full h-[44px] rounded-full bg-black/5 hover:bg-black/10 active:scale-[0.98] transition-all text-black/75 font-bold text-[15px] cursor-pointer flex items-center justify-center tracking-tight"
+                  className="w-full h-[44px] rounded-full bg-black/5 hover:bg-black/10 active:scale-[0.98] transition-all text-black/75 font-bold text-[16px] cursor-pointer flex items-center justify-center tracking-tight"
                 >
                   返回关于应用
                 </button>
@@ -9903,7 +10778,7 @@ export default function App() {
               }`}
             >
               <House className="w-6 h-6 stroke-[2.2]" />
-              <span className="text-[11px] font-semibold">首页</span>
+              <span className="text-[12px] font-semibold">首页</span>
             </button>
 
             <button
@@ -9919,7 +10794,7 @@ export default function App() {
                   <span className="absolute -top-0.5 -right-1 w-2 h-2 rounded-full bg-[#D4973B] ring-2 ring-white" />
                 )}
               </span>
-              <span className="text-[11px] font-semibold">集市</span>
+              <span className="text-[12px] font-semibold">集市</span>
             </button>
 
             <button
@@ -9930,7 +10805,7 @@ export default function App() {
               }`}
             >
               <SlidersHorizontal className="w-6 h-6 stroke-[2.2]" />
-              <span className="text-[11px] font-semibold">管理</span>
+              <span className="text-[12px] font-semibold">管理</span>
             </button>
 
             <button
@@ -9941,7 +10816,7 @@ export default function App() {
               }`}
             >
               <GearSix className="w-6 h-6 stroke-[2.2]" />
-              <span className="text-[11px] font-semibold">设置</span>
+              <span className="text-[12px] font-semibold">设置</span>
             </button>
           </div>
         )}
@@ -10000,32 +10875,21 @@ export default function App() {
                 </button>
               </div>
 
-              {/* 设备列表：当前设备排第一。
-                  外层滚动器在顶/底被拖时由下面的 transform 把整块内容跟手移出去（橡皮筋），
-                  内层 py-3 与位移上限等值，恰好给这段位移留出不被裁切的空间。 */}
+              {/* 设备列表：当前设备排第一。橡皮筋交给全局 useRubberBand。 */}
               <div
-                ref={deviceListRef}
+                data-rb="y"
+                data-rb-always="1"
                 className="px-4 pb-4 overflow-y-auto no-scrollbar overscroll-contain min-h-0"
-                onTouchStart={onDeviceListTouchStart}
-                onTouchMove={onDeviceListTouchMove}
-                onTouchEnd={onDeviceListTouchEnd}
-                onTouchCancel={onDeviceListTouchEnd}
               >
-                <div
-                  className="flex flex-col gap-2.5 py-5"
-                  style={{
-                    transform: `translateY(${deviceListOffset}px)`,
-                    transition: deviceListDragging
-                      ? "none"
-                      : "transform 300ms cubic-bezier(0.22, 1, 0.36, 1)"
-                  }}
-                >
+                <div className="flex flex-col gap-2.5 py-5">
                   {/* 连不上时的引导卡：放在列表**上方**，保证一眼能看到（列表会把下方内容挤出屏幕） */}
                   {connectGuideCard}
 
                   {mockDevicesList.length === 0 && (
                     <p className="text-[13px] font-medium text-black/40 text-center py-3 leading-relaxed">
-                      列表里没有设备了，点下方「重新导入设备列表」找回
+                      {userProfile.nickname
+                        ? "列表里没有设备了，点下方「重新导入小米设备」找回"
+                        : "还没有设备，点下方扫描附近的手表"}
                     </p>
                   )}
 
@@ -10055,38 +10919,55 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 底部：重新导入（托盘的收尾操作，固定不滚动） */}
-              <div className="px-4 pt-3 pb-[calc(16px+env(safe-area-inset-bottom,0px))] border-t border-black/5 shrink-0">
+              {/* 底部：扫描 / 重新导入（托盘的收尾操作，固定不滚动）
+                  两个按钮同一层级，靠品牌色区分：蓝色=vivo（无需账号），橙色=小米（要素材来自小米账号）。
+                  「重新导入」是小米账号专属，没登录就整个不出现 —— 否则 vivo 用户会以为它是个通用功能，
+                  点下去却被送去登录小米账号（用户 2026-11-15 反馈）。 */}
+              <div className="px-4 pt-3 pb-[calc(16px+env(safe-area-inset-bottom,0px))] border-t border-black/5 shrink-0 flex flex-col gap-2">
                 <button
                   type="button"
                   onClick={() => {
-                    // 重新导入 = 把账号下的设备**全拉回来**：先清掉「已移除」名单，再拉一次
-                    clearHiddenDevices();
-                    // App 内：重新拉一次账号设备 / 已连接设备则刷新表盘列表
-                    if (invoke) {
-                      const addr = connected.current.addr;
-                      void (async () => {
-                        try {
-                          if (addr) await refreshDials(addr);
-                          const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
-                          applyCloudDevices(devices);
-                          showToast("已重新拉取手环设备列表");
-                        } catch (err) {
-                          console.error("[xiaomi_restore] 重新导入失败：", err);
-                          showToast("重新导入失败，请稍后重试", "error");
-                        }
-                      })();
-                      return;
-                    }
-                    // 浏览器预览：把演示列表恢复原样（删除过的设备一并回来）
-                    setMockDevicesList(MOCK_DEVICES);
-                    showToast("已重新拉取手环设备列表");
+                    // 先收托盘再进连接引导页：两个底部面板不要叠着
+                    requestCloseDeviceDrawer();
+                    window.setTimeout(() => pushRoute("vivo-scan"), 260);
                   }}
-                  className="w-full h-[44px] rounded-full bg-black/5 hover:bg-black/10 text-black font-bold text-[15px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
+                  className="w-full h-[44px] rounded-full bg-[#4361EE]/10 hover:bg-[#4361EE]/15 text-[#4361EE] font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
                 >
-                  <ArrowsClockwise className="w-4 h-4 text-black/60 stroke-[2]" />
-                  <span>重新导入设备列表</span>
+                  <Watch className="w-4 h-4 stroke-[2]" />
+                  <span>扫描附近的 vivo 手表</span>
                 </button>
+                {userProfile.nickname && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // 重新导入 = 把小米账号下的设备**全拉回来**：先清掉「已移除」名单，再拉一次
+                      clearHiddenDevices();
+                      // App 内：重新拉一次账号设备 / 已连接设备则刷新表盘列表
+                      if (invoke) {
+                        const addr = connected.current.addr;
+                        void (async () => {
+                          try {
+                            if (addr) await refreshDials(addr);
+                            const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
+                            applyCloudDevices(devices);
+                            showToast("已重新拉取小米设备列表");
+                          } catch (err) {
+                            console.error("[xiaomi_restore] 重新导入失败：", err);
+                            showToast("重新导入失败，请稍后重试", "error");
+                          }
+                        })();
+                        return;
+                      }
+                      // 浏览器预览：把演示列表恢复原样（删除过的设备一并回来）
+                      setMockDevicesList(MOCK_DEVICES);
+                      showToast("已重新拉取小米设备列表");
+                    }}
+                    className="w-full h-[44px] rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
+                  >
+                    <ArrowsClockwise className="w-4 h-4 stroke-[2]" />
+                    <span>重新导入小米设备</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -10252,7 +11133,7 @@ export default function App() {
                   // 断开连接 = 断开且**不再自动重连**（与点已连接那台同一套语义）
                   handleDisconnectDevice(dev);
                 }}
-                className="w-full text-left px-4 py-3 text-[15px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer disabled:text-black/20 disabled:cursor-default disabled:active:bg-transparent"
+                className="w-full text-left px-4 py-3 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer disabled:text-black/20 disabled:cursor-default disabled:active:bg-transparent"
               >
                 断开连接
               </button>
@@ -10264,7 +11145,7 @@ export default function App() {
                   setDeviceMenu(null);
                   setDeviceRemoveConfirm(dev);
                 }}
-                className="w-full text-left px-4 py-3 text-[15px] font-bold text-[#FF3B30] border-t border-black/5 active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
+                className="w-full text-left px-4 py-3 text-[16px] font-bold text-[#FF3B30] border-t border-black/5 active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
               >
                 删除设备
               </button>
@@ -10286,7 +11167,9 @@ export default function App() {
                   从列表移除「{deviceRemoveConfirm.name}」？
                 </h3>
                 <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
-                  小米账号里的设备不受影响；点「重新导入设备列表」即可找回来
+                  {deviceRemoveConfirm.brand === "vivo"
+                    ? "移除后需要重新扫描才能连回来"
+                    : "小米账号里的设备不受影响；点「重新导入小米设备」即可找回来"}
                 </p>
               </div>
 
@@ -10484,11 +11367,11 @@ export default function App() {
                       setConnectedId(null);
                       setIsDeviceDrawerOpen(false);
                     }
-                    // 退出登录：账号资料一并清掉（别把上一个账号的名字留在界面上），登录页成为根页面
+                    // 退出登录：账号资料一并清掉（别把上一个账号的名字留在界面上），回「选手表」首屏
                     setUserProfile(profileFromAccount(""));
                     setEditingDial(null);
                     setIsDeviceConnected(false); // 断线：红点 + 未连接
-                    resetStackTo("login");
+                    resetStackTo("welcome");
                     showToast("已安全退出");
                   }}
                   className="py-3.5 text-[16px] font-bold text-[#FF3B30] active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
@@ -10503,6 +11386,12 @@ export default function App() {
         {/* 多包体安装：勾选要装哪些（表盘1..N = 安装顺序；默认全选，支持全选） */}
         {installPicker && (() => {
           const pickedCount = installPicker.picked.filter(Boolean).length;
+          // 已选包体合计大小（用户最关心「这一装要传多少」）
+          const pickedBytes = installPicker.files.reduce(
+            (sum, f, i) => sum + (installPicker.picked[i] ? (f.size ?? 0) : 0),
+            0
+          );
+          const pickedSize = fmtSize(pickedBytes);
           // 更新模式：没变的包不参与「全选」，默认也不勾（仍可手动勾选重装）
           const selectable = installPicker.files.map(
             (_, i) => !installPicker.updateMode || installPicker.status[i] !== "latest"
@@ -10533,14 +11422,14 @@ export default function App() {
                   </p>
                 </div>
 
-                <div className="max-h-[46vh] overflow-y-auto px-2 pb-1">
+                <div data-rb="y" className="max-h-[46vh] overflow-y-auto px-2 pb-1">
                   <button
                     type="button"
                     onClick={toggleInstallPickAll}
                     className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl active:bg-black/5 transition-colors cursor-pointer"
                   >
                     <span
-                      className={`w-[22px] h-[22px] rounded-[7px] flex items-center justify-center shrink-0 border-2 ${
+                      className={`w-[22px] h-[22px] rounded-lg flex items-center justify-center shrink-0 border-2 ${
                         allOn || someOn ? "bg-[#4361EE] border-[#4361EE]" : "bg-white border-black/20"
                       }`}
                     >
@@ -10550,7 +11439,7 @@ export default function App() {
                         <span className="w-2.5 h-[2px] bg-white rounded-full" />
                       ) : null}
                     </span>
-                    <span className="text-[15px] font-bold text-black">
+                    <span className="text-[16px] font-bold text-black">
                       {installPicker.updateMode ? "全选可更新" : "全选"}
                     </span>
                   </button>
@@ -10565,7 +11454,7 @@ export default function App() {
                         className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl active:bg-black/5 transition-colors cursor-pointer"
                       >
                         <span
-                          className={`w-[22px] h-[22px] rounded-[7px] flex items-center justify-center shrink-0 border-2 ${
+                          className={`w-[22px] h-[22px] rounded-lg flex items-center justify-center shrink-0 border-2 ${
                             installPicker.picked[i] ? "bg-[#4361EE] border-[#4361EE]" : "bg-white border-black/20"
                           }`}
                         >
@@ -10575,7 +11464,7 @@ export default function App() {
                         </span>
                         <span className="flex-1 min-w-0 text-left">
                           <span
-                            className={`block text-[15px] font-medium ${
+                            className={`block text-[16px] font-medium ${
                               st === "latest" ? "text-black/45" : "text-black"
                             }`}
                           >
@@ -10600,10 +11489,21 @@ export default function App() {
                             </span>
                           )}
                         </span>
+                        {/* 单个包体大小：多包体（比如 4 个配色近 40MB）装之前先有个数 */}
+                        <span className="shrink-0 text-[12px] font-medium text-black/35 tabular-nums">
+                          {fmtSize(f.size)}
+                        </span>
                       </button>
                     );
                   })}
                 </div>
+
+                {/* 已选合计：个数 + 大小（多包体一次装几十 MB，先让用户看清） */}
+                <p className="px-6 pb-3 text-center text-[12px] font-medium text-black/35">
+                  {pickedCount > 0
+                    ? `已选 ${pickedCount} 个${pickedSize ? `，共 ${pickedSize}` : ""}`
+                    : "至少选一个包"}
+                </p>
 
                 <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
                   <button

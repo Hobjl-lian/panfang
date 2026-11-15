@@ -12,6 +12,7 @@ pub mod watchface_edit;
 pub mod watchface_imgcodec;
 pub mod watchface_render;
 pub mod wallpaper_gen;
+pub mod vivo;
 
 use bridge::AppState;
 
@@ -140,6 +141,7 @@ pub fn run() {
             paid::paid_installs_get,
             paid::paid_latest_file,
             paid::paid_install,
+            paid::paid_install_stop_after_current,
             market::market_list,
             market::market_install,
             bridge::device_install_payload,

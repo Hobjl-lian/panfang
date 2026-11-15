@@ -28,6 +28,7 @@ pub async fn list(
     model: Option<&str>,
     device: Option<&str>,
     member: Option<&str>,
+    vendor: Option<&str>,
 ) -> Result<Value> {
     let mut url = format!("{}/v1/market/list", base.trim_end_matches('/'));
     let mut sep = '?';
@@ -41,6 +42,10 @@ pub async fn list(
     }
     if let Some(d) = device.map(str::trim).filter(|s| !s.is_empty()) {
         url.push_str(&format!("&device={}", urlencode(d)));
+    }
+    // 品牌：同屏跨品牌各看各的（vivo 432×514 与红米 5/6 撞屏）
+    if let Some(v) = vendor.map(str::trim).filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&vendor={}", urlencode(v)));
     }
     // 会员档位：top = 尊享/金主，basic = 轻悦。服务端只拿它算「显示价」
     if let Some(m) = member.map(str::trim).filter(|s| !s.is_empty()) {
@@ -212,6 +217,9 @@ pub async fn market_list(
     model: Option<String>,
     device: Option<String>,
     member: Option<String>,
+    // 设备品牌：xiaomi（缺省）/ vivo。同屏跨品牌（vivo 432 与红米 432×514）必须靠它区分，
+    // 不传就按小米看（与老版本行为一致）。
+    vendor: Option<String>,
 ) -> Result<Value, String> {
     let base = paid::service_base(&state)?;
     let version = app.package_info().version.to_string();
@@ -223,6 +231,7 @@ pub async fn market_list(
         model.as_deref(),
         device.as_deref(),
         member.as_deref(),
+        vendor.as_deref(),
     )
     .await
     .map_err(|e| e.to_string())?;

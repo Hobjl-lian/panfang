@@ -1,6 +1,6 @@
 [package]
 name = "wf_installer"
-version = "0.3.84"
+version = "0.3.98"
 description = "小米 Vela 设备表盘安装工具（个人/私域使用）"
 edition = "2024"
 default-run = "wf_installer"
@@ -47,6 +47,8 @@ corelib = { path = "../../repos/AstroBox-NG/src-tauri/modules/core", default-fea
 pb = { path = "../../repos/AstroBox-NG/src-tauri/modules/pb" }
 account = { path = "../../repos/AstroBox-NG/src-tauri/modules/account" }
 bluetooth = { path = "../../repos/AstroBox-NG/src-tauri/modules/bluetooth" }
+# vivo 绑定域的 MsgPack 消息定义（BindAuth / BindInit 等，来自 corelib 同源的 vivo 栈）
+vivo-msgpack = { path = "../../repos/AstroBox-NG/src-tauri/modules/vivo_msgpack" }
 inappbrowser = { path = "../../repos/AstroBox-NG/src-tauri/plugins/inappbrowser" }
 # App 自更新用：检查未知来源授权 + 调系统安装器（我们自己的插件，源码在本仓 plugins/apkinstaller）
 apkinstaller = { path = "plugins/apkinstaller" }
@@ -60,8 +62,11 @@ android_logger = "0.14"
 
 [profile.release]
 strip = true
-# 瘦身：跨 crate 内联 + 全局死代码消除 + 单 codegen unit（不降 opt-level，壁纸生成逐像素运算不能慢）
+# 跨 crate 内联 + 全局死代码消除（不降 opt-level，壁纸生成逐像素运算不能慢）。
+# ★ codegen-units=16（2026-11-15 实测 A/B，同为 gradle 热缓存）：
+#   出包 37s vs cgu=1 的 80s，快一倍；代价是包体 8.11MB → 8.66MB（+0.55MB）。
+#   （gradle/vite 缓存也是冷的那次，16 用了 116s。）
 lto = "fat"
-codegen-units = 1
+codegen-units = 16
 # 掉 unwind 表；移动端进程崩溃本来也是整进程退出，没有可捕获的恢复路径
 panic = "abort"

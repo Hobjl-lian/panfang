@@ -145,6 +145,10 @@ export interface LocalPayloadProbe {
   kind: "watchface" | "quickapp" | "unknown";
   watchfaceId?: string | null;
   size: number;
+  /** vivo 快应用才有的展示信息（从 rpk 的 manifest.json 读） */
+  appName?: string | null;
+  appPackage?: string | null;
+  appVersion?: string | null;
 }
 
 /**

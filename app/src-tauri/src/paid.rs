@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use tauri::Emitter;
 
@@ -668,10 +669,38 @@ pub fn open_archive(paid_dir: &Path, blob: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[tauri::command]
-pub async fn paid_device_screen(model: Option<String>) -> Result<Value, String> {
-    let scr = model
+pub async fn paid_device_screen(
+    model: Option<String>,
+    addr: Option<String>,
+    device: Option<String>,
+) -> Result<Value, String> {
+    let mut scr = model
         .as_deref()
         .and_then(crate::watchface_edit::device_screen);
+    // 小米型号表认不出时，vivo 设备的**名字**里通常带型号（vivo WATCH GT2 BF5），
+    // 先按名字认；还认不出再向手表要 device_info.model。
+    if scr.is_none() {
+        if let Some(d) = device.as_deref() {
+            scr = crate::watchface_edit::vivo_device_screen(d);
+            if scr.is_some() {
+                log::info!("[paid] 按设备名认出 vivo 屏幕 {d:?} → {scr:?}");
+            }
+        }
+    }
+    if scr.is_none() {
+        if let Some(a) = addr.as_deref() {
+            if crate::vivo::is_vivo(a).await {
+                match crate::vivo::device_info(a).await {
+                    Ok(info) => {
+                        let m = info.get("model").and_then(Value::as_str).unwrap_or("");
+                        log::info!("[paid] vivo 设备型号 model={m}");
+                        scr = crate::watchface_edit::vivo_device_screen(m);
+                    }
+                    Err(e) => log::warn!("[paid] 读 vivo 设备信息失败：{e:#}"),
+                }
+            }
+        }
+    }
     Ok(json!({ "screen": scr.map(|(w, h)| vec![w, h]) }))
 }
 
@@ -682,7 +711,10 @@ pub async fn paid_status(state: tauri::State<'_, AppState>) -> Result<Value, Str
     let mi_uid_live = current_mi_uid(&state);
     with_ctx(&state, |c| {
         let mi_uid = if mi_uid_live.is_empty() {
-            c.session.as_ref().map(|s| s.mi_user_id.clone())
+            c.session
+                .as_ref()
+                .map(|s| s.mi_user_id.clone())
+                .filter(|s| !s.starts_with("device:"))
         } else {
             Some(mi_uid_live.clone())
         };
@@ -725,20 +757,12 @@ pub async fn paid_bind(
     mi_user_id: String,
     device_name: Option<String>,
 ) -> Result<Value, String> {
-    // 没显式给 UID 就用当前登录的小米账号（绑定主体 = 小米账号，复用现有登录）
+    // 没显式给 UID 就用当前登录的小米账号；vivo 用户没有小米账号时用本机稳定主体键
     let mi_user_id = if mi_user_id.trim().is_empty() {
-        state
-            .mi_token
-            .lock()
-            .as_ref()
-            .map(|t| t.user_id.clone())
-            .unwrap_or_default()
+        current_subject_id(&state)?
     } else {
         mi_user_id.trim().to_string()
     };
-    if mi_user_id.is_empty() {
-        return Err("请先用小米账号登录".into());
-    }
     let (base, pub_b64) = with_ctx(&state, |c| Ok((c.base.clone(), c.pub_b64.clone())))
         .map_err(|e| e.to_string())?;
     let s = bind_dev(
@@ -762,6 +786,34 @@ fn current_mi_uid(state: &tauri::State<'_, AppState>) -> String {
         .as_ref()
         .map(|t| t.user_id.clone())
         .unwrap_or_default()
+}
+
+/// 付费主体键：有小米登录就用小米 UID；vivo 用户没有小米账号时用本机稳定指纹。
+///
+/// 服务端只把它当字符串主键。`device:` 前缀让后台与账号页能区分「这不是小米 ID」，
+/// 不会冒充小米账号；同一台手机重装后指纹稳定（Android ID 派生），权益还能找回。
+fn current_subject_id(state: &tauri::State<'_, AppState>) -> Result<String, String> {
+    // 已有会话主体优先：买过一次之后不因为「后来登录小米账号」而换主体，
+    // 否则旧授权还挂在原主体上，新主体看不到已购（vivo 先买、后加小米手环就会踩到）。
+    let existing = with_ctx(state, |c| {
+        Ok(c.session
+            .as_ref()
+            .map(|s| s.mi_user_id.trim().to_string())
+            .filter(|v| !v.is_empty()))
+    })
+    .unwrap_or(None);
+    if let Some(v) = existing {
+        return Ok(v);
+    }
+    let mi = current_mi_uid(state);
+    if !mi.is_empty() {
+        return Ok(mi);
+    }
+    with_ctx(state, |c| {
+        let tail: String = c.fp.chars().take(16).collect();
+        Ok(format!("device:{tail}"))
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// POST /v1/afdian/oauth/start —— 发起爱发电授权：拿到让用户去点的授权页地址 + 会话号
@@ -820,10 +872,7 @@ pub async fn paid_bind_oauth_start(
     state: tauri::State<'_, AppState>,
     device_name: Option<String>,
 ) -> Result<Value, String> {
-    let mi_uid = current_mi_uid(&state);
-    if mi_uid.is_empty() {
-        return Err("请先用小米账号登录".into());
-    }
+    let mi_uid = current_subject_id(&state)?;
     let (base, fp, pub_b64) =
         with_ctx(&state, |c| Ok((c.base.clone(), c.fp.clone(), c.pub_b64.clone())))
             .map_err(|e| e.to_string())?;
@@ -1112,13 +1161,26 @@ pub async fn paid_latest_file(
     }))
 }
 
+/// 「装完当前就停」的中断标记：付费安装一次只允许一个（前端有 busy 锁），
+/// 用全局标记就够。进入 `paid_install` 时清零，循环里**每个包开始前**检查 ——
+/// 点了停止也不会打断正在传输的那个包（用户要求：当前这个装完再停）。
+static PAID_STOP_AFTER_CURRENT: AtomicBool = AtomicBool::new(false);
+
+/// 请求「装完当前这个表盘就停」（多包体安装时的中断出口）。
+#[tauri::command]
+pub async fn paid_install_stop_after_current() -> Result<(), String> {
+    PAID_STOP_AFTER_CURRENT.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
 /// 下载 → 解密（内存）→ 直装到设备；全程发 `wf-paid-progress`，安装阶段另有 `wf-install-progress`。
-/// **一批多个包时按顺序依次安装，返回最后一个包的表盘 id**（前端拿它设为当前表盘）；
+/// **一批多个包时按顺序依次安装**；用户点「装完当前就停」时，在包与包之间停下。
+/// 返回 `{ lastId, installed, total, doneIds, cancelled }`：前端据此设当前表盘与显示「装了 N/M 个」。
 /// 表盘 id 是设备往返解析出来的，个别情况下解析不出来 —— 那种情况**安装本身已经成功**，
-/// 返回 `None` 让界面照常走成功页（不能反过来报「安装失败」骗用户重装）。
+/// `lastId` 给 None 让界面照常走成功页（不能反过来报「安装失败」骗用户重装）。
 /// `file_ids` = 只装选中的这些包（多包体「勾选安装」）；None = 全装。
 /// 记账：整行 `sha` 仍按全量包体算（老逻辑兼容）；逐包快照只更新这次**真正装了的**包，
-/// 这次没勾的包保留上次指纹（下次仍会提示它有更新）。
+/// 这次没勾（或中断没装）的包保留上次指纹（下次仍会提示它有更新）。
 #[tauri::command]
 pub async fn paid_install(
     app: tauri::AppHandle,
@@ -1128,7 +1190,9 @@ pub async fn paid_install(
     variant_id: String,
     device_name: Option<String>,
     file_ids: Option<Vec<String>>,
-) -> Result<Option<String>, String> {
+) -> Result<Value, String> {
+    // 新一轮安装开始：清掉上一轮可能残留的中断请求
+    PAID_STOP_AFTER_CURRENT.store(false, Ordering::SeqCst);
     let (base, token) = with_ctx(&state, |c| Ok((c.base.clone(), c.token().map(|t| t.to_string()))))
         .map_err(|e| e.to_string())?;
     let token = token.ok_or_else(|| "NOT_BOUND".to_string())?;
@@ -1178,7 +1242,16 @@ pub async fn paid_install(
     let mut last_id: Option<String> = None;
     // 这一批装上去的表盘 id（记账用：管理页据此标「可更新」）
     let mut dial_ids: Vec<String> = Vec::new();
+    // 这次**真正装完**的包（中断时用来记账与回报「装了 N/M 个」）
+    let mut completed: Vec<String> = Vec::new();
+    let mut cancelled = false;
     for (idx, file) in install_files.iter().enumerate() {
+        // 用户点了「装完当前就停」：上一个包已经完整装完，这里不再开始下一个。
+        // 放在取包之前检查，保证不会出现「下到一半掐断」的半成品。
+        if idx > 0 && PAID_STOP_AFTER_CURRENT.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
         let file_id = file["file_id"].as_str().unwrap_or_default().to_string();
         let tag = if total > 1 {
             let n = files
@@ -1242,8 +1315,13 @@ pub async fn paid_install(
 
         // 交给现有安装通道（它会发 wf-install-progress，并按表盘 id 各自留档 → 两个包可分别编辑）
         emit_progress(&app, "transfer", &phase("正在传输到手环…"), None, None);
-        // 付费资源不允许复写 ID（最后一个参数恒为 None）
-        let id = crate::bridge::install_file_bytes_id(&app, &addr, plain, "bin".to_string(), None)
+        // 付费资源不允许复写 ID（最后一个参数恒为 None）。
+        // 扩展名从包体文件名推导：vivo 的 .rpk 与小米 .bin 走同一个安装入口，按内容分派。
+        let ext = file["file_name"]
+            .as_str()
+            .and_then(|n| n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()))
+            .unwrap_or_else(|| "bin".to_string());
+        let id = crate::bridge::install_file_bytes_id(&app, &addr, plain, ext, None)
             .await
             .map_err(|e| {
                 let msg = phase(&format!("安装失败：{e}"));
@@ -1254,6 +1332,8 @@ pub async fn paid_install(
             dial_ids.push(id.clone());
             last_id = Some(id);
         }
+        // 走到这里 = 这个包完整装完了（下载/解密/传输都成功），记账与「装了 N/M 个」只算它
+        completed.push(file_id.clone());
     }
 
     // 记账：这个设备行现在装着的是哪个版本（更新提醒靠它）。
@@ -1269,10 +1349,8 @@ pub async fn paid_install(
             all.into_iter()
                 .find(|r| r.product_id == product_id && r.variant_id == variant_id)
         });
-    let installed_ids: Vec<&str> = install_files
-        .iter()
-        .filter_map(|f| f["file_id"].as_str())
-        .collect();
+    // 只把**真正装完**的包记成最新（中断时没开始的包要保留旧指纹，下次仍提示更新）
+    let installed_ids: Vec<&str> = completed.iter().map(|s| s.as_str()).collect();
     let mut packages: Vec<InstalledPackage> = Vec::with_capacity(files.len());
     for f in files.iter() {
         let wid = f["watchface_id"].as_str().unwrap_or("");
@@ -1326,13 +1404,25 @@ pub async fn paid_install(
         Ok(())
     });
 
-    let done = if total > 1 {
-        format!("已安装 {} 个表盘（{version}）", install_files.len())
+    let done = if cancelled {
+        // 用户主动中断：说清「已经装了几个」，别让他以为全装完了
+        format!(
+            "已安装 {} 个表盘，其余已按你的选择停止",
+            completed.len()
+        )
+    } else if total > 1 {
+        format!("已安装 {} 个表盘（{version}）", completed.len())
     } else {
         format!("已安装 {version}")
     };
     emit_progress(&app, "done", &done, None, None);
-    Ok(last_id)
+    Ok(json!({
+        "lastId": last_id,
+        "installed": completed.len(),
+        "total": install_files.len(),
+        "doneIds": completed,
+        "cancelled": cancelled,
+    }))
 }
 
 #[cfg(test)]

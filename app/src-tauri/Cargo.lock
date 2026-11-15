@@ -6574,7 +6574,7 @@ dependencies = [
 
 [[package]]
 name = "wf_installer"
-version = "0.3.84"
+version = "0.3.98"
 dependencies = [
  "account",
  "aes-gcm",
@@ -6610,6 +6610,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tokio",
  "url",
+ "vivo-msgpack",
  "x25519-dalek",
  "zip",
 ]

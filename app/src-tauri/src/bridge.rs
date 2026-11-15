@@ -40,7 +40,7 @@ fn map_send_error(err: btinterface::SendError) -> CoreSend {
 
 // ---------- ECS 访问辅助（复刻 app_wasm，适配原生多线程） ----------
 
-async fn with_device_system<S, F, R>(addr: &str, f: F) -> anyhow::Result<R>
+pub(crate) async fn with_device_system<S, F, R>(addr: &str, f: F) -> anyhow::Result<R>
 where
     S: Component,
     F: FnOnce(&mut S) -> R + Send + 'static,
@@ -60,7 +60,7 @@ where
     result.map_err(|e| anyhow::anyhow!(e))
 }
 
-async fn await_oneshot<T, E: std::fmt::Display>(
+pub(crate) async fn await_oneshot<T, E: std::fmt::Display>(
     rx: tokio::sync::oneshot::Receiver<Result<T, E>>,
     missing: &'static str,
 ) -> anyhow::Result<T> {
@@ -101,11 +101,23 @@ pub async fn stop_scan() -> Result<Vec<btinterface::BluetoothDevice>, String> {
 
 #[tauri::command]
 pub async fn device_connect(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     name: String,
     addr: String,
     authkey: String,
+    // "xiaomi"（缺省）| "vivo"。旧前端不带这个参数时按小米处理。
+    brand: Option<String>,
 ) -> Result<DeviceConnectionInfo, String> {
+    if brand.as_deref() == Some("vivo") {
+        // vivo 没有 authkey：openId 由本地记录 / 只读探测拿，走 corelib 的 vivo 栈。
+        let info = crate::vivo::connect(&app, &state.core_handle, &name, &addr, None).await?;
+        if let Some(sup) = crate::conn::get() {
+            sup.arm_vivo(&addr, &name);
+        }
+        return Ok(info);
+    }
+
     // 刚出现过「连上又秒断」的话，手环多半正被小米运动健康/另一台手机抢着。
     // 这时手动连接也直接先解除系统配对再连，把占用方顶掉（买家已确认这个代价可以接受）。
     let bond = if crate::conn::get().is_some_and(|sup| sup.in_flap_episode()) {
@@ -448,9 +460,16 @@ pub async fn device_get_data(
     data_type: String,
 ) -> Result<serde_json::Value, String> {
     use corelib::device::xiaomi::components::info::InfoSystem;
+    // vivo 的信息/状态走它自己的组件（结构体与小米同源，JSON 形状一致）
+    let vivo = crate::vivo::is_vivo(&addr).await;
     // 三个请求的返回类型不同，分支间独立收发（与 app_wasm 一致）
     match data_type.as_str() {
         "info" => {
+            if vivo {
+                return crate::vivo::device_info(&addr)
+                    .await
+                    .map_err(|e| e.to_string());
+            }
             let rx = with_device_system::<InfoSystem, _, _>(&addr, |sys| sys.request_device_info())
                 .await
                 .map_err(|e| e.to_string())?;
@@ -458,6 +477,12 @@ pub async fn device_get_data(
             serde_json::to_value(&v).map_err(|e| e.to_string())
         }
         "status" => {
+            if vivo {
+                let v = crate::vivo::device_status(&addr)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return serde_json::to_value(&v).map_err(|e| e.to_string());
+            }
             let rx = with_device_system::<InfoSystem, _, _>(&addr, |sys| sys.request_device_status())
                 .await
                 .map_err(|e| e.to_string())?;
@@ -465,6 +490,12 @@ pub async fn device_get_data(
             serde_json::to_value(&v).map_err(|e| e.to_string())
         }
         "storage" => {
+            if vivo {
+                let v = crate::vivo::device_storage(&addr)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return serde_json::to_value(&v).map_err(|e| e.to_string());
+            }
             let rx = with_device_system::<InfoSystem, _, _>(&addr, |sys| sys.request_device_storage())
                 .await
                 .map_err(|e| e.to_string())?;
@@ -479,6 +510,12 @@ pub async fn device_get_data(
 /// 连接总管的心跳用它；`device_get_data("status")` 与它同一条链路。
 pub(crate) async fn probe_device_status(addr: &str) -> Result<u32, String> {
     use corelib::device::xiaomi::components::info::InfoSystem;
+    if crate::vivo::is_vivo(addr).await {
+        let status = crate::vivo::device_status(addr)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(status.battery.capacity.max(0) as u32);
+    }
     let rx = with_device_system::<InfoSystem, _, _>(addr, |sys| sys.request_device_status())
         .await
         .map_err(|e| e.to_string())?;
@@ -657,6 +694,112 @@ fn valid_watchface_id(s: &str) -> bool {
     matches!(b.len(), 9 | 12) && b.iter().all(u8::is_ascii_alphanumeric)
 }
 
+/// vivo 安装入口：按**内容**分流。
+///  - `manifest.json` 里有 `router.watchfaces` → 表盘（DialInstall）；
+///  - 其余 `.rpk` → 快应用（file_v2 + BleAppInstallReq）。
+/// 扩展名不可靠，两者同为 rpk，必须先看内容。
+async fn install_vivo_payload(
+    app: &tauri::AppHandle,
+    addr: &str,
+    file_data: Vec<u8>,
+    ext: &str,
+    rewrite_watchface_id: Option<String>,
+) -> Result<Option<String>, String> {
+    if crate::vivo::is_dial_rpk(&file_data) {
+        return install_vivo_dial(app, addr, file_data, ext, rewrite_watchface_id).await;
+    }
+    if ext.eq_ignore_ascii_case("rpk") {
+        // 小米快应用也是 rpk + manifest.json：包里有 `<包名>.vru` 才算 vivo 的，否则别发出去
+        if !crate::vivo::is_quick_app_rpk(&file_data) {
+            return Err("这个 rpk 不是 vivo 的快应用（包里缺少应用本体），请确认文件来源".to_string());
+        }
+        return install_vivo_quick_app(app, addr, file_data, rewrite_watchface_id).await;
+    }
+    Err("当前连接的是 vivo 手表，只能安装 vivo 表盘或快应用（.rpk）".to_string())
+}
+
+/// vivo 安装进度事件（与小米同一条 `wf-install-progress`）。
+/// 节流：每 1% 或最后一条才发（vivo 分片多，不节流会把 WebView 淹掉）。
+fn vivo_progress_sink(app: &tauri::AppHandle) -> Option<Arc<dyn Fn(u64, u64) + Send + Sync>> {
+    use tauri::Emitter;
+
+    let app_handle = app.clone();
+    let last_emit = std::sync::atomic::AtomicU64::new(0);
+    Some(Arc::new(move |sent, total| {
+        let pct = if total > 0 {
+            (sent as f64 / total as f64) as f32
+        } else {
+            0.0
+        };
+        let bucket = (pct * 100.0) as u64;
+        let prev = last_emit.load(std::sync::atomic::Ordering::Relaxed);
+        if bucket > prev || sent >= total {
+            last_emit.store(bucket, std::sync::atomic::Ordering::Relaxed);
+            let _ = app_handle.emit(
+                "wf-install-progress",
+                serde_json::json!({ "progress": pct, "sent": sent, "total": total }),
+            );
+        }
+    }))
+}
+
+/// vivo 表盘安装：只吃 rpk（manifest 里有 router.watchfaces），走 file_v2 + DialInstall。
+async fn install_vivo_dial(
+    app: &tauri::AppHandle,
+    addr: &str,
+    file_data: Vec<u8>,
+    _ext: &str,
+    rewrite_watchface_id: Option<String>,
+) -> Result<Option<String>, String> {
+    if rewrite_watchface_id.is_some() {
+        return Err("vivo 表盘不支持复写表盘 ID".to_string());
+    }
+    let (dial_id, package, version_name, version_code) =
+        crate::vivo::inspect_dial(&file_data).map_err(|e| format!("表盘文件解析失败：{e:#}"))?;
+    if dial_id == 0 {
+        return Err("表盘文件缺少有效的表盘 ID".to_string());
+    }
+    log::info!(
+        "[vivo/install] addr={addr} dial_id={dial_id} package={package} version={version_name}({version_code}) len={}",
+        file_data.len()
+    );
+
+    let progress = vivo_progress_sink(app);
+
+    crate::vivo::install_dial(addr, file_data, progress)
+        .await
+        .map_err(|e| format!("安装失败：{e:#}"))?;
+    Ok(Some(dial_id.to_string()))
+}
+
+/// vivo 快应用安装：file_v2 把 rpk 推到手表 `/sdcard/apps/apparch/<包名>.rpk`，
+/// 再发 BleAppInstallReq 让手表就地安装。装完不在手表上「设为当前」（快应用没有这个概念）。
+async fn install_vivo_quick_app(
+    app: &tauri::AppHandle,
+    addr: &str,
+    file_data: Vec<u8>,
+    rewrite_watchface_id: Option<String>,
+) -> Result<Option<String>, String> {
+    if rewrite_watchface_id.is_some() {
+        return Err("vivo 快应用不支持复写表盘 ID".to_string());
+    }
+    let manifest = crate::vivo::inspect_quick_app(&file_data)
+        .map_err(|e| format!("不是有效的 vivo 快应用包：{e:#}"))?;
+    log::info!(
+        "[vivo/quickapp] addr={addr} package={} name={} version={}({}) len={}",
+        manifest.package,
+        manifest.name,
+        manifest.version_name,
+        manifest.version_code,
+        file_data.len()
+    );
+
+    crate::vivo::install_quick_app(addr, file_data, vivo_progress_sink(app))
+        .await
+        .map_err(|e| format!("安装失败：{e:#}"))?;
+    Ok(None)
+}
+
 /// 安装并返回**装上去的表盘 id**（非表盘类型返回 None）。
 /// 付费安装用它：一批多个包时，把**最后一个包**的表盘设为当前。
 ///
@@ -683,6 +826,22 @@ pub(crate) async fn install_file_bytes_id(
     );
     // 长任务开始：心跳让路（把「忙」当掉线会误报），自动重连也等它收尾
     let _busy = crate::conn::busy_guard();
+
+    // vivo 走完全不同的一条安装链：rpk（manifest 里有 router.watchfaces）→ file_v2 + DialInstall。
+    // 必须在下面「.rpk 一律当快应用」的判定之前拦掉，否则会被当小米快应用装。
+    let vivo_dev = crate::vivo::is_vivo(addr).await;
+    if vivo_dev {
+        return install_vivo_payload(app, addr, file_data, &ext, rewrite_watchface_id).await;
+    }
+    // 反过来也要拦：连着小米却收到 vivo 表盘（付费/集市匹配错品牌时会出现），
+    // 不能让它落进下面的快应用判定、按 MASS 发出去。
+    if crate::vivo::is_dial_rpk(&file_data) {
+        return Err("这是 vivo 手表表盘，请连接 vivo 手表后再安装".to_string());
+    }
+    // vivo 快应用（包里有 `<包名>.vru`）在小米链路上同样发不进去，提前给一句说明。
+    if crate::vivo::is_quick_app_rpk(&file_data) {
+        return Err("这是 vivo 手表的快应用，请连接 vivo 手表后再安装".to_string());
+    }
 
     // 内容级文件类型识别（zip 容器按扩展名/内容细分，与 app_wasm 一致）
     // .rpk = 快应用：内容特征（toolkit / manifest-watch.json）不总命中，按扩展名兜底，
@@ -1122,6 +1281,10 @@ pub struct LocalPayloadProbe {
     pub kind: String,
     pub watchface_id: Option<String>,
     pub size: usize,
+    /// 快应用才有的展示信息（vivo 取 manifest；小米 rpk 不填）
+    pub app_name: Option<String>,
+    pub app_package: Option<String>,
+    pub app_version: Option<String>,
 }
 
 #[tauri::command]
@@ -1131,6 +1294,32 @@ pub fn local_payload_probe(data_b64: String, ext: String) -> Result<LocalPayload
         .decode(data_b64.as_bytes())
         .map_err(|e| format!("文件数据解码失败: {e}"))?;
     let file_type = get_file_type(&bytes);
+    // vivo 表盘也是 .rpk：先按内容认（manifest 里有 router.watchfaces），再走小米那套判型
+    if ext.eq_ignore_ascii_case("rpk") && crate::vivo::is_dial_rpk(&bytes) {
+        let watchface_id = crate::vivo::inspect_dial(&bytes)
+            .ok()
+            .map(|(id, _, _, _)| id.to_string());
+        return Ok(LocalPayloadProbe {
+            kind: "watchface".to_string(),
+            watchface_id,
+            size: bytes.len(),
+            app_name: None,
+            app_package: None,
+            app_version: None,
+        });
+    }
+    // vivo 快应用：同样是 rpk，靠包里的 `<包名>.vru` 认出来，再读 manifest 给确认页看
+    if ext.eq_ignore_ascii_case("rpk") && crate::vivo::is_quick_app_rpk(&bytes) {
+        let manifest = crate::vivo::inspect_quick_app(&bytes).ok();
+        return Ok(LocalPayloadProbe {
+            kind: "quickapp".to_string(),
+            watchface_id: None,
+            size: bytes.len(),
+            app_name: manifest.as_ref().map(|m| m.name.clone()),
+            app_package: manifest.as_ref().map(|m| m.package.clone()),
+            app_version: manifest.as_ref().map(|m| m.version_name.clone()),
+        });
+    }
     let is_quickapp = ext.eq_ignore_ascii_case("rpk") || file_type == FileType::ThirdPartyApp;
     let is_watchface = if is_quickapp {
         false
@@ -1158,6 +1347,9 @@ pub fn local_payload_probe(data_b64: String, ext: String) -> Result<LocalPayload
         .to_string(),
         watchface_id,
         size: bytes.len(),
+        app_name: None,
+        app_package: None,
+        app_version: None,
     })
 }
 
@@ -1166,6 +1358,11 @@ pub fn local_payload_probe(data_b64: String, ext: String) -> Result<LocalPayload
 #[tauri::command]
 pub async fn watchface_get_list(addr: String) -> Result<serde_json::Value, String> {
     use corelib::device::xiaomi::components::resource::ResourceSystem;
+    if crate::vivo::is_vivo(&addr).await {
+        return crate::vivo::dial_list(&addr)
+            .await
+            .map_err(|e| e.to_string());
+    }
     let rx = with_device_system::<ResourceSystem, _, _>(&addr, |sys| {
         sys.request_watchface_list()
     })
@@ -1183,6 +1380,11 @@ pub async fn watchface_set_current(
     watchface_id: String,
 ) -> Result<(), String> {
     use corelib::device::xiaomi::components::watchface::WatchfaceSystem;
+    if crate::vivo::is_vivo(&addr).await {
+        return crate::vivo::set_current(&addr, &watchface_id)
+            .await
+            .map_err(|e| e.to_string());
+    }
     let wid = watchface_id.clone();
     let rx = with_device_system::<WatchfaceSystem, _, _>(&addr, move |sys| {
         sys.request_set_watchface(&wid)
@@ -1200,6 +1402,11 @@ pub async fn watchface_uninstall(
     watchface_id: String,
 ) -> Result<(), String> {
     use corelib::device::xiaomi::components::watchface::WatchfaceSystem;
+    if crate::vivo::is_vivo(&addr).await {
+        return crate::vivo::uninstall(&addr, &watchface_id)
+            .await
+            .map_err(|e| e.to_string());
+    }
     let wid = watchface_id.clone();
     let rx = with_device_system::<WatchfaceSystem, _, _>(&addr, move |sys| {
         sys.request_uninstall_watchface(&wid)

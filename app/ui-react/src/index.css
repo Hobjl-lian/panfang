@@ -1,6 +1,25 @@
 /* 离线：不加载 Google Fonts（App 不联网），字体走系统字体栈 */
 @import 'tailwindcss';
 
+/* 首屏两张大卡的标题：思源宋体（Noto Serif SC）子集，只含标题用字，SIL OFL 1.1 */
+@font-face {
+  font-family: 'Panfang Serif';
+  src: url('./assets/fonts/panfang-serif.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/*
+ * 宋体只给「首屏选择卡」的主标题用（design.md §4 #24）。
+ * 副标题仍用系统无衬线，字号 14px，保证主标题是主视觉。
+ */
+.font-brand-serif {
+  font-family: 'Panfang Serif', 'Noto Serif SC', 'Songti SC', serif;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
 @theme {
   --font-sans: 'Plus Jakarta Sans', 'Noto Sans SC', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }

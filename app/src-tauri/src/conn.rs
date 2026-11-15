@@ -46,12 +46,20 @@ const FLAP_LIMIT: u32 = 3;
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
 
+/// 设备品牌：决定重连走哪条握手路径
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevBrand {
+    Xiaomi,
+    Vivo,
+}
+
 /// 期望保持的连接（连接成功后登记；用户主动断开/切换设备时清掉）
 #[derive(Clone, Debug)]
 pub struct DesiredConn {
     pub addr: String,
     pub name: String,
     pub authkey: String,
+    pub brand: DevBrand,
 }
 
 /// 连接总管对外暴露的状态快照（`device_link_state` 命令 / 前端重挂载用）
@@ -222,10 +230,20 @@ impl Supervisor {
 
     /// 连接成功：登记期望连接、开始保活（前端手动连接成功后调）
     pub fn arm(&self, addr: &str, name: &str, authkey: &str) {
+        self.arm_with(addr, name, authkey, DevBrand::Xiaomi);
+    }
+
+    /// vivo 连接成功后登记（没有 authkey；重连时按地址重新读 openId）
+    pub fn arm_vivo(&self, addr: &str, name: &str) {
+        self.arm_with(addr, name, "", DevBrand::Vivo);
+    }
+
+    fn arm_with(&self, addr: &str, name: &str, authkey: &str, brand: DevBrand) {
         *self.desired.lock() = Some(DesiredConn {
             addr: addr.to_string(),
             name: name.to_string(),
             authkey: authkey.to_string(),
+            brand,
         });
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.connected.store(true, Ordering::SeqCst);
@@ -447,19 +465,28 @@ impl Supervisor {
                 return;
             }
 
-            let bond = if unpair_first {
-                bridge::BondPolicy::UnpairFirst
-            } else {
-                bridge::BondPolicy::Keep
+            let attempt_result = match d.brand {
+                DevBrand::Vivo => {
+                    // vivo 没有 authkey：openId 由 vivo.rs 按地址读本地记录（必要时只读探测）
+                    crate::vivo::connect(&self.app, &self.core, &d.name, &d.addr, None).await
+                }
+                DevBrand::Xiaomi => {
+                    let bond = if unpair_first {
+                        bridge::BondPolicy::UnpairFirst
+                    } else {
+                        bridge::BondPolicy::Keep
+                    };
+                    bridge::connect_inner(
+                        self.core.clone(),
+                        d.name.clone(),
+                        d.addr.clone(),
+                        d.authkey.clone(),
+                        bond,
+                    )
+                    .await
+                }
             };
-            match bridge::connect_inner(
-                self.core.clone(),
-                d.name.clone(),
-                d.addr.clone(),
-                d.authkey.clone(),
-                bond,
-            )
-            .await
+            match attempt_result
             {
                 Ok(_) => {
                     if self.generation.load(Ordering::SeqCst) != gen_id {
