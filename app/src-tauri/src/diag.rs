@@ -9,10 +9,12 @@
 //!   · 不采集与排障无关的东西（没有账号密码、没有表盘内容、没有照片）。
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use serde_json::{json, Value};
 
 /// 「反馈」页要复制给开发者的最近几条
@@ -263,4 +265,274 @@ fn transport() -> Option<(String, Option<String>)> {
     let c = g.as_ref()?;
     let token = c.token().map(|s| s.to_string());
     Some((c.base.clone(), token))
+}
+
+// ---------- 诊断导出（本地 zip，手动分享） ----------
+
+/// 进程级“现场上下文”：连接/安装阶段由各模块写入，导出时进 report.json。
+static CONTEXT: OnceLock<Mutex<serde_json::Map<String, Value>>> = OnceLock::new();
+
+fn context_buf() -> &'static Mutex<serde_json::Map<String, Value>> {
+    CONTEXT.get_or_init(|| Mutex::new(serde_json::Map::new()))
+}
+
+/// 覆盖式写入一个上下文键（watch / connection / install）。
+pub fn set_context(key: &str, value: Value) {
+    if let Ok(mut m) = context_buf().lock() {
+        m.insert(key.to_string(), value);
+    }
+}
+
+pub fn clear_context(key: &str) {
+    if let Ok(mut m) = context_buf().lock() {
+        m.remove(key);
+    }
+}
+
+#[derive(Serialize)]
+pub struct ExportResult {
+    pub path: String,
+    pub file_name: String,
+    pub bytes: u64,
+}
+
+const EXPORT_LOG_LINES: usize = 2000;
+
+/// 导出诊断包：现场上下文 + 最近事件 + 日志尾部。只写本地，不上传。
+#[tauri::command]
+pub fn diag_export(app: tauri::AppHandle, extra: Option<Value>) -> Result<ExportResult, String> {
+    let dir = DIR.get().ok_or_else(|| "诊断目录未初始化".to_string())?;
+    let ctx = context_buf().lock().map(|m| m.clone()).unwrap_or_default();
+
+    let report = json!({
+        "meta": {
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "version_code": version_code(&app),
+            "package": "com.wristry.app",
+            "platform": std::env::consts::OS,
+            "exported_at": unix_now(),
+            "device_fp": DEVICE_FP.get().map(|s| s.as_str()),
+        },
+        "phone": PHONE
+            .get()
+            .map(|(m, o)| json!({ "model": m, "os": o }))
+            .unwrap_or(Value::Null),
+        "watch": ctx.get("watch").cloned().unwrap_or(Value::Null),
+        "connection": ctx.get("connection").cloned().unwrap_or(Value::Null),
+        "install": ctx.get("install").cloned().unwrap_or(Value::Null),
+        // vivo 空间快照：剩余空间 / 本包大小 / 需要多少 / 表盘数量。
+        // 买家报「装不上」时，先看这一组数就知道是不是空间问题。
+        "vivo": ctx.get("vivo").cloned().unwrap_or(Value::Null),
+        "ui": extra.unwrap_or(Value::Null),
+        "session": { "recent_events": recent().len() },
+    });
+
+    let report_text =
+        redact_text(&serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    let events_text =
+        redact_text(&serde_json::to_string_pretty(&recent()).map_err(|e| e.to_string())?);
+    let log_text = redact_text(&collect_log_tail(&app));
+
+    let out_dir = dir.join("diag");
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("创建导出目录失败：{e}"))?;
+    let file_name = format!("panfang-diag-{}.zip", unix_now());
+    let zip_path = out_dir.join(&file_name);
+    {
+        let file = std::fs::File::create(&zip_path).map_err(|e| format!("创建诊断包失败：{e}"))?;
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, text) in [
+            ("report.json", report_text.as_str()),
+            ("events.json", events_text.as_str()),
+            ("app.log", log_text.as_str()),
+        ] {
+            zw.start_file(name, opts)
+                .map_err(|e| format!("写入诊断包失败：{e}"))?;
+            zw.write_all(text.as_bytes())
+                .map_err(|e| format!("写入诊断包失败：{e}"))?;
+        }
+        zw.finish().map_err(|e| format!("完成诊断包失败：{e}"))?;
+    }
+    let bytes = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
+    info("diag", "export", &format!("bytes={bytes}"), None);
+    Ok(ExportResult {
+        path: zip_path.to_string_lossy().to_string(),
+        file_name,
+        bytes,
+    })
+}
+
+/// 分享诊断包：安卓走系统分享面板；桌面弹另存为。返回 false 表示用户取消。
+#[tauri::command]
+pub fn diag_share(app: tauri::AppHandle, path: String) -> Result<bool, String> {
+    let dir = DIR.get().ok_or_else(|| "诊断目录未初始化".to_string())?;
+    let allowed = dir
+        .join("diag")
+        .canonicalize()
+        .map_err(|e| format!("诊断目录不可用：{e}"))?;
+    let src = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|e| format!("诊断包不存在：{e}"))?;
+    if !src.starts_with(&allowed) {
+        return Err("诊断包路径不合法".to_string());
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        use apkinstaller::ApkInstallerExt;
+        app.apk_installer()
+            .share_file(&src.to_string_lossy(), "application/zip")?;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        use tauri_plugin_dialog::DialogExt;
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("panfang-diag.zip");
+        let Some(picked) = app.dialog().file().set_file_name(name).blocking_save_file() else {
+            return Ok(false);
+        };
+        let dest = picked.into_path().map_err(|e| e.to_string())?;
+        std::fs::copy(&src, &dest).map_err(|e| format!("保存失败：{e}"))?;
+        Ok(true)
+    }
+}
+
+fn version_code(app: &tauri::AppHandle) -> i64 {
+    #[cfg(target_os = "android")]
+    {
+        use apkinstaller::ApkInstallerExt;
+        app.apk_installer()
+            .status()
+            .map(|s| s.version_code)
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        0
+    }
+}
+
+fn collect_log_tail(app: &tauri::AppHandle) -> String {
+    #[cfg(target_os = "android")]
+    {
+        use apkinstaller::ApkInstallerExt;
+        if let Ok(text) = app.apk_installer().read_logcat(EXPORT_LOG_LINES) {
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+        String::new()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        DIR.get()
+            .map(|d| read_tail(&d.join("app.log"), EXPORT_LOG_LINES))
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn read_tail(path: &std::path::Path, max_lines: usize) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+/// 导出前统一脱敏：长密钥、MAC、手机号、本应用数据目录。
+pub fn redact_text(input: &str) -> String {
+    let mut s = scrub_secretish(input);
+    s = redact_macs(&s);
+    s = redact_phones(&s);
+    if let Some(dir) = DIR.get() {
+        let p = dir.to_string_lossy();
+        if !p.is_empty() {
+            s = s.replace(p.as_ref(), "<app_data>");
+        }
+    }
+    s
+}
+
+fn redact_macs(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            if let Some(len) = mac_len_at(&bytes[i..]) {
+                let mac = &s[i..i + len];
+                out.push_str(&mac[0..2]);
+                out.push(':');
+                out.push_str(&mac[3..5]);
+                out.push_str(":**:**:**:");
+                out.push_str(&mac[15..17]);
+                i += len;
+                continue;
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn mac_len_at(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 17 {
+        return None;
+    }
+    for g in 0..6 {
+        let i = g * 3;
+        if !bytes[i].is_ascii_hexdigit() || !bytes[i + 1].is_ascii_hexdigit() {
+            return None;
+        }
+        if g < 5 {
+            let sep = bytes[i + 2];
+            if sep != b':' && sep != b'-' && sep != b'.' {
+                return None;
+            }
+        }
+    }
+    if bytes.len() > 17 && bytes[17].is_ascii_hexdigit() {
+        return None;
+    }
+    Some(17)
+}
+
+fn redact_phones(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_digit()) {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let len = j - i;
+            let tail_ok = j == bytes.len() || !bytes[j].is_ascii_digit();
+            if len == 11 && tail_ok && bytes[i] == b'1' && matches!(bytes[i + 1], b'3'..=b'9') {
+                out.push_str(&s[i..i + 3]);
+                out.push_str("****");
+                out.push_str(&s[i + 7..i + 11]);
+                i = j;
+                continue;
+            }
+            out.push_str(&s[i..j]);
+            i = j;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }

@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bluetooth::btinterface::{self, ConnectType};
 use corelib::device::Device;
@@ -22,11 +22,14 @@ use corelib::device::vivo::packet as vivo_packet;
 use corelib::device::vivo::transport::vscp::{VscpMessage, VscpV2Pdu};
 use corelib::device::vivo::{
     SendError as VivoSend, VivoConnectType, VivoDevice, VivoDeviceConfig,
+    components::auth::auth_snapshot,
     components::info::InfoSystem as VivoInfoSystem,
     components::resource::ResourceSystem as VivoResourceSystem,
 };
 use corelib::device::{DeviceConnectionInfo, DeviceKind, create_vivo_device};
 use corelib::ecs::{self, runtime::Runtime};
+
+use crate::diag;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tokio::runtime::Handle;
@@ -51,12 +54,44 @@ fn map_send_error(err: btinterface::SendError) -> VivoSend {
     }
 }
 
-// ---------- openId 本地存储（按 MAC） ----------
+// ---------- 设备记录（openId / 绑定状态 / 上次通道，按 MAC） ----------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DeviceRecord {
+    #[serde(default)]
+    open_id: String,
+    #[serde(default)]
+    state: Option<i32>,
+    #[serde(default)]
+    last_channel: Option<String>,
+    #[serde(default)]
+    updated_at: Option<i64>,
+}
+
+/// 旧文件是 `{ "MAC": "openId" }`，新文件是 `{ "MAC": { ... } }`；两种都要能读。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RecordCompat {
+    Legacy(String),
+    Full(DeviceRecord),
+}
+
+impl RecordCompat {
+    fn into_record(self) -> DeviceRecord {
+        match self {
+            Self::Legacy(open_id) => DeviceRecord {
+                open_id,
+                ..Default::default()
+            },
+            Self::Full(rec) => rec,
+        }
+    }
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct OpenIdStore {
     #[serde(default)]
-    map: HashMap<String, String>,
+    map: HashMap<String, RecordCompat>,
 }
 
 fn store_path(app: &AppHandle) -> Option<std::path::PathBuf> {
@@ -70,6 +105,13 @@ fn norm_addr(addr: &str) -> String {
     addr.trim().to_ascii_uppercase()
 }
 
+fn now_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn load_store(app: &AppHandle) -> OpenIdStore {
     store_path(app)
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -77,28 +119,73 @@ fn load_store(app: &AppHandle) -> OpenIdStore {
         .unwrap_or_default()
 }
 
-/// 已记录的 openId（没有就是空串）
-pub fn stored_open_id(app: &AppHandle, addr: &str) -> String {
+fn record_of(app: &AppHandle, addr: &str) -> DeviceRecord {
     load_store(app)
         .map
         .get(&norm_addr(addr))
         .cloned()
+        .map(RecordCompat::into_record)
         .unwrap_or_default()
 }
 
-fn save_open_id(app: &AppHandle, addr: &str, open_id: &str) {
+/// 已记录的 openId（没有就是空串）
+pub fn stored_open_id(app: &AppHandle, addr: &str) -> String {
+    record_of(app, addr).open_id
+}
+
+fn save_record(app: &AppHandle, addr: &str, rec: DeviceRecord) {
     let Some(path) = store_path(app) else { return };
     let mut store = load_store(app);
-    let key = norm_addr(addr);
-    if store.map.get(&key).map(String::as_str) == Some(open_id) {
-        return;
-    }
-    store.map.insert(key, open_id.to_string());
+    store
+        .map
+        .insert(norm_addr(addr), RecordCompat::Full(rec));
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_json::to_string_pretty(&store) {
         let _ = std::fs::write(path, text);
+    }
+}
+
+fn save_open_id(app: &AppHandle, addr: &str, open_id: &str) {
+    let mut rec = record_of(app, addr);
+    if rec.open_id == open_id {
+        return;
+    }
+    rec.open_id = open_id.to_string();
+    rec.updated_at = Some(now_ts());
+    save_record(app, addr, rec);
+}
+
+fn save_device_meta(app: &AppHandle, addr: &str, state: Option<i32>, channel: Option<&str>) {
+    let mut rec = record_of(app, addr);
+    let mut changed = false;
+    if let Some(state) = state {
+        if rec.state != Some(state) {
+            rec.state = Some(state);
+            changed = true;
+        }
+    }
+    if let Some(channel) = channel {
+        if rec.last_channel.as_deref() != Some(channel) {
+            rec.last_channel = Some(channel.to_string());
+            changed = true;
+        }
+    }
+    if changed {
+        rec.updated_at = Some(now_ts());
+        save_record(app, addr, rec);
+    }
+}
+
+fn stored_channel(app: &AppHandle, addr: &str) -> Option<String> {
+    record_of(app, addr).last_channel
+}
+
+fn attempts_for_device(app: &AppHandle, addr: &str) -> Vec<&'static str> {
+    match stored_channel(app, addr).as_deref() {
+        Some("ble") => vec!["ble", "spp"],
+        _ => vec!["spp", "ble"],
     }
 }
 
@@ -474,7 +561,10 @@ pub async fn connect(
 
     if open_id.is_empty() {
         log::info!("[vivo] 本地没有 openId，先做只读探测 addr={addr}");
-        let info = probe_bind_info(name, addr, "auto").await?;
+        let info = probe_bind_info(name, addr, "auto")
+            .await
+            .map_err(|e| humanize_connect_error(&e))?;
+        save_device_meta(app, addr, Some(info.state), None);
         if info.open_id.is_empty() {
             if info.state == 0 {
                 return Err(
@@ -490,8 +580,9 @@ pub async fn connect(
     }
 
     let mut last_err = String::new();
+    let attempts = attempts_for_device(app, addr);
     for pass in 0..2 {
-        for (idx, attempt) in attempts_for("auto").into_iter().enumerate() {
+        for (idx, attempt) in attempts.iter().copied().enumerate() {
             if idx > 0 {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -499,6 +590,25 @@ pub async fn connect(
             match connect_once(handle, name, addr, &open_id, attempt).await {
                 Ok(info) => {
                     save_open_id(app, addr, &open_id);
+                    save_device_meta(app, addr, None, Some(attempt));
+                    if let Some(snap) = auth_snapshot(addr.to_string()).await {
+                        save_device_meta(app, addr, snap.watch_state, None);
+                        diag::set_context(
+                            "watch",
+                            serde_json::json!({
+                                "name": name,
+                                "addr_masked": diag::redact_text(addr),
+                                "channel": attempt,
+                                "state": snap.watch_state,
+                                "openid_present": snap.has_open_id,
+                                "pack_size": snap.pack_size,
+                            }),
+                        );
+                    }
+                    diag::set_context(
+                        "connection",
+                        serde_json::json!({ "stage": "done", "transport": attempt }),
+                    );
                     log::info!("[vivo] 连接成功 addr={addr} mode={attempt}");
                     return Ok(info);
                 }
@@ -519,8 +629,15 @@ pub async fn connect(
                 }
             }
         }
+        // openId 没有变化就不再重跑第二轮：通道回退已经在上面这一轮里试过了。
+        break;
     }
-    Err(humanize_connect_error(&last_err))
+    let humanized = humanize_connect_error(&last_err);
+    diag::set_context(
+        "connection",
+        serde_json::json!({ "stage": "failed", "last_error": humanized.clone() }),
+    );
+    Err(humanized)
 }
 
 fn humanize_connect_error(err: &str) -> String {
@@ -586,6 +703,15 @@ pub async fn dial_list(addr: &str) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::to_value(&list)?)
 }
 
+/// 表盘分区剩余空间（BID 1 / CID 21）。老固件可能不支持；调用方按 best-effort 处理。
+/// 返回值的单位由手表决定（官方 App 里 `freesize` 是 long，按字节用），
+/// 这里原样返回，由 paid.rs 统一做单位兜底。
+pub async fn dial_free_storage(addr: &str) -> anyhow::Result<u64> {
+    let v = corelib::device::resource::request_dial_free_storage_json(addr.to_string()).await?;
+    v.as_u64()
+        .ok_or_else(|| anyhow::anyhow!("手表返回的表盘剩余空间不是整数：{v}"))
+}
+
 // ---------- 表盘安装 / 切换 / 卸载 ----------
 
 /// 是不是 vivo 表盘包：manifest.json 里有 `router.watchfaces`。
@@ -620,9 +746,16 @@ pub async fn install_dial(
     addr: &str,
     data: Vec<u8>,
     progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
-) -> anyhow::Result<()> {
-    corelib::device::watchface::install_local_zip_vivo(addr.to_string(), data, None, progress)
-        .await
+    stage: Option<corelib::device::watchface::VivoStageCb>,
+) -> anyhow::Result<corelib::device::watchface::DialInstallResult> {
+    corelib::device::watchface::install_local_zip_vivo_with_events(
+        addr.to_string(),
+        data,
+        None,
+        progress,
+        stage,
+    )
+    .await
 }
 
 // ---------- 快应用 ----------
@@ -683,4 +816,52 @@ pub async fn set_current(addr: &str, dial_id: &str) -> anyhow::Result<()> {
 
 pub async fn uninstall(addr: &str, dial_id: &str) -> anyhow::Result<()> {
     corelib::device::watchface::uninstall(addr.to_string(), dial_id.to_string()).await
+}
+
+/// 当前握手是否完成（安装前的闸门；设备不存在/未认证都算 false）。
+pub async fn is_handshake_ok(addr: &str) -> bool {
+    auth_snapshot(addr.to_string())
+        .await
+        .map(|snap| snap.is_authed)
+        .unwrap_or(false)
+}
+
+/// 设置页展示用：绑定状态 + 上次通道。只返回状态，不返回 openId 原文。
+#[tauri::command]
+pub async fn vivo_binding_state(
+    app: AppHandle,
+    addr: String,
+) -> Result<serde_json::Value, String> {
+    let live = auth_snapshot(addr.clone()).await;
+    let rec = record_of(&app, &addr);
+    let state = live.as_ref().and_then(|s| s.watch_state).or(rec.state);
+    let matches = live.as_ref().and_then(|s| s.openid_matches_local);
+    let label = match state {
+        Some(0) => "未绑定（出厂态）",
+        Some(1) if matches == Some(true) => "已绑定本机",
+        Some(1) if matches == Some(false) => "已绑定其他手机",
+        Some(1) => "已绑定",
+        Some(2) | Some(3) | Some(4) => "绑定中间态（建议重新配对）",
+        Some(_) => "未知状态",
+        None => "未知（连接后可查看）",
+    };
+    let source = if live.is_some() {
+        "live"
+    } else if rec.state.is_some() {
+        "cached"
+    } else {
+        "none"
+    };
+    Ok(serde_json::json!({
+        "label": label,
+        "source": source,
+        "state": state,
+        "openidPresent": live
+            .as_ref()
+            .map(|s| s.has_open_id)
+            .unwrap_or(!rec.open_id.is_empty()),
+        "channel": rec.last_channel,
+        "packSize": live.as_ref().and_then(|s| s.pack_size),
+        "isAuthed": live.as_ref().map(|s| s.is_authed),
+    }))
 }

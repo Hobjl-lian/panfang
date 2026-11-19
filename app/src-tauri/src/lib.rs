@@ -7,6 +7,7 @@ pub mod diag;
 pub mod generator_cmd;
 pub mod market;
 pub mod paid;
+pub mod video;
 pub mod watchface_bin;
 pub mod watchface_edit;
 pub mod watchface_imgcodec;
@@ -127,8 +128,10 @@ pub fn run() {
             bridge::device_get_data,
             bridge::device_link_state,
             bridge::device_relink,
+            vivo::vivo_binding_state,
             bridge::device_open_battery_settings,
             bridge::device_install,
+            bridge::transport_profile_last,
             paid::paid_device_screen,
             paid::paid_status,
             paid::paid_bind_mode,
@@ -175,6 +178,8 @@ pub fn run() {
             bridge::watchface_photos_save,
             diag_recent,
             diag_report,
+            diag::diag_export,
+            diag::diag_share,
             system_bars_light,
             install_back_lock,
             keep_screen_on,
@@ -187,6 +192,19 @@ pub fn run() {
             app_update::app_update_check,
             app_update::app_update_download,
             app_update::app_update_install,
+            video::video_templates,
+            video::video_project_create,
+            video::video_project_list,
+            video::video_project_get,
+            video::video_project_clear,
+            video::video_project_delete,
+            video::video_project_update_meta,
+            video::video_frame_reset,
+            video::video_frame_put,
+            video::video_job_create,
+            video::video_job_status,
+            video::video_job_fetch,
+            video::video_job_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

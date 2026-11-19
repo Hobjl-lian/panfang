@@ -406,6 +406,11 @@ pub fn service_base(state: &AppState) -> Result<String, String> {
     with_ctx(state, |c| Ok(c.base.clone())).map_err(|e| e.to_string())
 }
 
+/// 视频表盘任务用：拿当前登录态（没绑定时返回 None，调用方给「先绑定爱发电」的提示）。
+pub(crate) fn license_token(state: &AppState) -> Result<Option<String>> {
+    with_ctx(state, |c| Ok(c.token().map(|t| t.to_string())))
+}
+
 // ---------------------------------------------------------------- 服务端交互
 
 /// 服务端错误体是 `{ error, message }`：`message` 是给买家的中文说明，`error` 是稳定的机器码
@@ -1173,6 +1178,186 @@ pub async fn paid_install_stop_after_current() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct VivoDialInfo {
+    id: String,
+    version: Option<u64>,
+    is_current: bool,
+}
+
+/// vivo 表盘列表快照。查询失败返回 None，不阻断安装。
+async fn vivo_dial_snapshot(addr: &str) -> Option<Vec<VivoDialInfo>> {
+    // 列表查询也走蓝牙；给它 8 秒上限，别让一次卡住的查询把整轮安装拖到看门狗超时。
+    let value = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        crate::vivo::dial_list(addr),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let items = value.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| {
+                let id = item.get("id")?.as_str()?.to_string();
+                let version = item.get("versionCode").and_then(|v| v.as_u64());
+                let is_current = item.get("isCurrent").and_then(|v| v.as_bool()).unwrap_or(false);
+                Some(VivoDialInfo {
+                    id,
+                    version,
+                    is_current,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// 表盘剩余空间原始值的单位兜底：手表通常回字节；个别固件回 KB。
+/// 小于 1MB 的值按 KB 估算（避免把 150000 当成 146KB）。
+fn vivo_free_bytes_estimate(raw: u64) -> u64 {
+    if raw >= 1_048_576 {
+        raw
+    } else {
+        raw.saturating_mul(1024)
+    }
+}
+
+/// 把 bridge 已经带上的「安装失败：」前缀剥掉，避免界面出现「安装失败：安装失败：…」。
+fn strip_install_prefix(msg: &str) -> &str {
+    msg.strip_prefix("安装失败：").unwrap_or(msg)
+}
+
+/// 查一次表盘分区剩余空间（8 秒上限）。查不到返回 None（老固件不支持/链路忙），
+/// 调用方按「未知」处理 —— 不能因为查不到就不让装。
+async fn vivo_dial_free_bytes(addr: &str) -> Option<u64> {
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        crate::vivo::dial_free_storage(addr),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())?;
+    // raw 太小说明不是字节单位（或者手表真的只剩几百字节），按未知处理，不做硬判断。
+    if raw < 10_000 {
+        log::info!("[paid] vivo dial free raw={raw} 单位不确定，按未知处理");
+        return None;
+    }
+    Some(vivo_free_bytes_estimate(raw))
+}
+
+/// 单包安装需要的空间：手表要先落一份 rpk、再解包出一份表盘，按 2.5 倍算，另留 8MB 余量。
+///
+/// 为什么不是整批求和：买家经常只勾一个包，而且每装完一个空间都会掉；
+/// 按单包算才跟「这一包能不能装上」对得上。
+fn vivo_install_need_bytes(package_size: u64) -> u64 {
+    package_size
+        .saturating_mul(5)
+        .saturating_div(2)
+        .saturating_add(8 * 1_048_576)
+}
+
+/// 把空间快照写进诊断：买家报「装不上」时，先看这一组数就知道是不是空间问题。
+fn diag_vivo_space(
+    free: Option<u64>,
+    need: u64,
+    package_size: u64,
+    dial_count: Option<usize>,
+) {
+    crate::diag::set_context(
+        "vivo",
+        serde_json::json!({
+            "free_bytes": free,
+            "free_mb": free.map(|v| v / 1_048_576),
+            "package_bytes": package_size,
+            "package_mb": package_size / 1_048_576,
+            "need_mb": need / 1_048_576,
+            "space_known": free.is_some(),
+            "dial_count": dial_count,
+        }),
+    );
+}
+
+/// 同 ID 旧表盘先删后装（小米那边就是这条规矩）。
+/// vivo 不允许删除当前表盘：如果目标正是当前表盘，先切到列表里另一张，再删。
+async fn vivo_remove_existing_dial<F>(
+    app: &tauri::AppHandle,
+    addr: &str,
+    phase: &F,
+    target_id: &str,
+    dials: &[VivoDialInfo],
+) -> Result<Vec<VivoDialInfo>, String>
+where
+    F: Fn(&str) -> String,
+{
+    let Some(target) = dials.iter().find(|d| d.id == target_id) else {
+        return Ok(dials.to_vec());
+    };
+    log::info!(
+        "[paid] vivo dial {} 已在手表上（version {:?}，current={}），先卸载再重装",
+        target.id,
+        target.version,
+        target.is_current
+    );
+
+    let mut dials_now = dials.to_vec();
+    if target.is_current {
+        let Some(other) = dials
+            .iter()
+            .find(|d| d.id != target_id && d.id.parse::<i64>().is_ok())
+        else {
+            return Err(
+                "手表上只有这张表盘，无法删除当前表盘；请先在手表上切到别的表盘再回来重试"
+                    .to_string(),
+            );
+        };
+        emit_progress(app, "install", &phase("正在切换到另一张表盘…"), None, None);
+        crate::vivo::set_current(addr, &other.id)
+            .await
+            .map_err(|e| format!("切换手表当前表盘失败：{e}"))?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        emit_progress(app, "install", &phase("正在刷新表盘列表…"), None, None);
+        let Some(fresh) = vivo_dial_snapshot(addr).await else {
+            return Err("切换表盘后没能刷新手表表盘列表，请重试".to_string());
+        };
+        dials_now = fresh;
+    }
+
+    emit_progress(app, "install", &phase("正在删除手表上的旧表盘…"), None, None);
+    crate::vivo::uninstall(addr, target_id)
+        .await
+        .map_err(|e| format!("删除手表上的旧表盘失败：{e}"))?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    emit_progress(app, "install", &phase("正在刷新表盘列表…"), None, None);
+    if let Some(fresh) = vivo_dial_snapshot(addr).await {
+        dials_now = fresh;
+    }
+    Ok(dials_now)
+}
+
+/// 安装超时后回头查表盘列表：如果这张表盘已经在手表上，
+/// 说明手表只是没回包（大包、忙、BLE 掉线），不能骗用户再装一遍。
+async fn vivo_recover_installed_dial(
+    addr: &str,
+    expected: &Option<(String, Option<u64>)>,
+) -> Option<(String, Vec<VivoDialInfo>)> {
+    let (dial_id, expected_version) = expected.as_ref()?;
+    let dials = vivo_dial_snapshot(addr).await?;
+    let found = dials.iter().find(|d| d.id == *dial_id)?;
+    // 版本对不上说明手表上还是旧表盘（很可能卸载没生效），不能按成功糊弄过去。
+    if let (Some(expected), Some(installed)) =
+        (expected_version.as_ref(), found.version.as_ref())
+    {
+        if expected != installed {
+            log::warn!(
+                "[paid] vivo dial {dial_id} 超时后仍在手表上，但版本 {installed} != 期望 {expected}，不按成功处理"
+            );
+            return None;
+        }
+    }
+    Some((dial_id.clone(), dials))
+}
+
 /// 下载 → 解密（内存）→ 直装到设备；全程发 `wf-paid-progress`，安装阶段另有 `wf-install-progress`。
 /// **一批多个包时按顺序依次安装**；用户点「装完当前就停」时，在包与包之间停下。
 /// 返回 `{ lastId, installed, total, doneIds, cancelled }`：前端据此设当前表盘与显示「装了 N/M 个」。
@@ -1191,8 +1376,9 @@ pub async fn paid_install(
     device_name: Option<String>,
     file_ids: Option<Vec<String>>,
 ) -> Result<Value, String> {
-    // 新一轮安装开始：清掉上一轮可能残留的中断请求
+    // 新一轮安装开始：清掉上一轮可能残留的中断请求与空间快照
     PAID_STOP_AFTER_CURRENT.store(false, Ordering::SeqCst);
+    crate::diag::clear_context("vivo");
     let (base, token) = with_ctx(&state, |c| Ok((c.base.clone(), c.token().map(|t| t.to_string()))))
         .map_err(|e| e.to_string())?;
     let token = token.ok_or_else(|| "NOT_BOUND".to_string())?;
@@ -1234,6 +1420,21 @@ pub async fn paid_install(
     if install_files.is_empty() {
         return Err("选中的表盘已不存在，请重新安装".to_string());
     }
+
+    // vivo：先看一眼当前表盘列表（同 ID 先删后装要用）。
+    // 剩余空间不在这里按整批算：买家经常一次只勾一个，而且每装完一个空间都会掉，
+    // 整批预检算不准 —— 改成进循环后逐包检查（见下面的「逐包空间预检」）。
+    let is_vivo = crate::vivo::is_vivo(&addr).await;
+    if is_vivo {
+        // 这些查询也是蓝牙往返，先喂一口进度，别让前端 35 秒停滞看门狗先开枪。
+        emit_progress(&app, "auth", "检查手表表盘列表…", None, None);
+    }
+    let mut vivo_dials = if is_vivo {
+        vivo_dial_snapshot(&addr).await
+    } else {
+        None
+    };
+
     let (secret, fp, pub_b64) = with_ctx(&state, |c| {
         Ok((c.secret.clone(), c.fp.clone(), c.pub_b64.clone()))
     })
@@ -1270,6 +1471,44 @@ pub async fn paid_install(
                 format!("{tag} {base}")
             }
         };
+
+        // vivo 逐包空间预检：每装一个都会再吃掉一份 rpk + 一份表盘，整批只查一次算不准。
+        // 查不到（老固件/链路忙）就照常装，但要把「未知」写进诊断，别再静默跳过。
+        if is_vivo {
+            // 进批前那次列表查询可能失败（链路忙）：没有列表就没法做「同 ID 先删后装」，
+            // 半成品表盘会留在手表上。装第一个包之前再补一次。
+            if vivo_dials.is_none() {
+                emit_progress(&app, "auth", &phase("正在读取手表表盘列表…"), None, None);
+                vivo_dials = vivo_dial_snapshot(&addr).await;
+            }
+            let package_size = file["size"].as_u64().unwrap_or(0);
+            let need = vivo_install_need_bytes(package_size);
+            emit_progress(&app, "auth", &phase("检查手表剩余空间…"), None, None);
+            let free = vivo_dial_free_bytes(&addr).await;
+            diag_vivo_space(
+                free,
+                need,
+                package_size,
+                vivo_dials.as_ref().map(|d| d.len()),
+            );
+            if let Some(free) = free {
+                log::info!(
+                    "[paid] vivo space precheck free={}MB need={}MB package={}MB",
+                    free / 1_048_576,
+                    need / 1_048_576,
+                    package_size / 1_048_576
+                );
+                if package_size > 0 && free < need {
+                    let msg = phase(&format!(
+                        "安装失败：手表剩余空间不足（约 {} MB，这个表盘需要约 {} MB）。请先在手表上删掉几个不用的表盘，重启手表后再试",
+                        (free / 1_048_576).max(1),
+                        (need / 1_048_576).max(1),
+                    ));
+                    emit_progress(&app, "error", &msg, None, None);
+                    return Err(msg);
+                }
+            }
+        }
 
         emit_progress(
             &app,
@@ -1311,6 +1550,37 @@ pub async fn paid_install(
                 }
             }
         };
+        // vivo：先看这张包的 dial_id/version，用于「同 ID 先删后装」和「超时后核实」。
+        let mut vivo_expected: Option<(String, Option<u64>)> = None;
+        if is_vivo {
+            if let Ok((dial_id, _package, _version_name, version_code)) =
+                crate::vivo::inspect_dial(&plain)
+            {
+                let version = u64::try_from(version_code).ok().filter(|v| *v > 0);
+                vivo_expected = Some((dial_id.to_string(), version));
+            }
+        }
+
+        // 手表上已经有同 ID 的表盘：先删掉再装（与小米一致），不再跳过。
+        // 版本不同也删：买家要的是「干净重装」，旧版本留着只会让手表继续拒绝。
+        if let Some((dial_id, _)) = &vivo_expected {
+            let has_existing = vivo_dials
+                .as_ref()
+                .map(|d| d.iter().any(|x| x.id == *dial_id))
+                .unwrap_or(false);
+            if has_existing {
+                let dials = vivo_dials.clone().unwrap_or_default();
+                match vivo_remove_existing_dial(&app, &addr, &phase, dial_id, &dials).await {
+                    Ok(fresh) => vivo_dials = Some(fresh),
+                    Err(e) => {
+                        let msg = phase(&format!("安装失败：{e}"));
+                        emit_progress(&app, "error", &msg, None, None);
+                        return Err(msg);
+                    }
+                }
+            }
+        }
+
         emit_progress(&app, "decrypt", &phase("解密完成，校验通过"), None, None);
 
         // 交给现有安装通道（它会发 wf-install-progress，并按表盘 id 各自留档 → 两个包可分别编辑）
@@ -1321,19 +1591,85 @@ pub async fn paid_install(
             .as_str()
             .and_then(|n| n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()))
             .unwrap_or_else(|| "bin".to_string());
-        let id = crate::bridge::install_file_bytes_id(&app, &addr, plain, ext, None)
-            .await
-            .map_err(|e| {
-                let msg = phase(&format!("安装失败：{e}"));
+        let install_result =
+            crate::bridge::install_file_bytes_id(&app, &addr, plain, ext, None).await;
+        let installed_id: Option<String> = match install_result {
+            Ok(id) => id,
+            Err(e) => {
+                // vivo 的 DialInstall 回包在「大包/手表忙/BLE 掉线」时可能丢；
+                // 超时后先查一次列表，看手表上到底有没有这张表盘。
+                let raw_msg = e.to_string();
+                // 只对「等不到回包」做核实；code=5 是手表明确拒绝，不去猜。
+                // 这里必须用 bridge 的分类函数：错误在返回前已经被翻成中文，
+                // 按 `vivo_install:result_timeout` 原始前缀匹配永远匹配不到。
+                let kind = crate::bridge::vivo_install_error_kind(&raw_msg);
+                // 只核实 result_timeout：文件已经推完、DialInstall 也发了，手表可能只是回包丢了。
+                // ack_timeout 是传输没完成、根本没走到安装，查列表没有意义，还白等 30 秒。
+                let may_have_installed =
+                    is_vivo && matches!(kind, Some("result_timeout"));
+                let mut found_unconfirmed = None;
+                if may_have_installed {
+                    emit_progress(&app, "install", &phase("正在确认手表状态…"), None, None);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // 手表装 10MB 大包时可能只是暂时忙，列表要过一会儿才更新。
+                    // 单次查询容易误判「没装上」，最多查 3 次；每次查询前都喂一口进度，
+                    // 别让前端 35 秒停滞看门狗把「未确认」盖成「安装停滞」。
+                    for attempt in 0..3u8 {
+                        if attempt > 0 {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                        emit_progress(
+                            &app,
+                            "install",
+                            &phase(if attempt == 0 {
+                                "正在读取手表表盘列表…"
+                            } else {
+                                "正在再次确认手表表盘列表…"
+                            }),
+                            None,
+                            None,
+                        );
+                        if let Some(found) =
+                            vivo_recover_installed_dial(&addr, &vivo_expected).await
+                        {
+                            found_unconfirmed = Some(found);
+                            break;
+                        }
+                    }
+                }
+                if let Some((dial_id, _dials)) = found_unconfirmed {
+                    // 列表里有，但没收到安装结果：不能当成功（它可能是半成品），
+                    // 也不能让买家去点它 —— 半成品表盘会让手表在切换时直接崩掉。
+                    log::warn!(
+                        "[paid] vivo 安装没回结果，但手表上已有表盘 {dial_id}，按未确认处理：{raw_msg}"
+                    );
+                    let msg = phase(
+                        "安装未确认：手表上已出现这张表盘，但没收到安装完成的结果。请先重启手表，暂时不要切换表盘；重新安装会先删除它再装",
+                    );
+                    emit_progress(&app, "error", &msg, None, None);
+                    return Err(msg);
+                }
+                let msg = phase(&format!("安装失败：{}", strip_install_prefix(&e)));
                 emit_progress(&app, "error", &msg, None, None);
-                msg
-            })?;
-        if let Some(id) = id {
+                return Err(msg);
+            }
+        };
+        if let Some(id) = installed_id {
             dial_ids.push(id.clone());
             last_id = Some(id);
         }
         // 走到这里 = 这个包完整装完了（下载/解密/传输都成功），记账与「装了 N/M 个」只算它
         completed.push(file_id.clone());
+
+        // vivo：给手表一点落盘时间，再刷新列表给下一个包用。
+        if is_vivo {
+            emit_progress(&app, "install", &phase("手表正在保存表盘…"), None, None);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            emit_progress(&app, "install", &phase("正在刷新手表表盘列表…"), None, None);
+            if let Some(dials) = vivo_dial_snapshot(&addr).await {
+                vivo_dials = Some(dials);
+            }
+        }
     }
 
     // 记账：这个设备行现在装着的是哪个版本（更新提醒靠它）。
@@ -1451,6 +1787,23 @@ mod tests {
     fn url_encode_basic() {
         // RFC3986：'.' 属非保留字符，不转义；'@' 要转义
         assert_eq!(urlencode("a@b.c"), "a%40b.c");
+    }
+
+    #[test]
+    fn vivo_free_bytes_handles_bytes_and_kb() {
+        // 字节单位原样用；KB 单位放大 1024；0 仍是 0。
+        assert_eq!(vivo_free_bytes_estimate(150_000_000), 150_000_000);
+        assert_eq!(vivo_free_bytes_estimate(150_000), 150_000 * 1024);
+        assert_eq!(vivo_free_bytes_estimate(0), 0);
+    }
+
+    #[test]
+    fn vivo_install_need_is_2_5x_plus_8mb() {
+        // 空包也要留 8MB 底；10MB 的包按 2.5 倍 + 8MB = 33MB。
+        assert_eq!(vivo_install_need_bytes(0), 8 * 1_048_576);
+        assert_eq!(vivo_install_need_bytes(10 * 1_048_576), 33 * 1_048_576);
+        // 超大值走饱和运算，不 panic、不溢出成小数。
+        assert!(vivo_install_need_bytes(u64::MAX) > 1_000_000_000_000);
     }
 
     #[test]

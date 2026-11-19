@@ -38,6 +38,135 @@ fn map_send_error(err: btinterface::SendError) -> CoreSend {
     }
 }
 
+// ---------- 推送诊断：corelib 自带的传输层 profiler ----------
+//
+// 我们只管「开 / 关 / 汇总」，记录本身在 corelib 的 SAR、MASS、sender 里已经埋好
+// （nak_received / data_retransmit / flow_wait / send_batch_spp …）。
+// 每次安装自动跑一遍，结束后落一行日志，完整报告存起来给 `transport_profile_last` 取。
+
+static LAST_TRANSPORT_PROFILE: std::sync::OnceLock<parking_lot::Mutex<Option<serde_json::Value>>> =
+    std::sync::OnceLock::new();
+
+fn last_transport_profile_slot() -> &'static parking_lot::Mutex<Option<serde_json::Value>> {
+    LAST_TRANSPORT_PROFILE.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+async fn xiaomi_transport_profiler(
+    addr: &str,
+) -> Option<corelib::device::xiaomi::transport_profiler::TransportProfilerHandle> {
+    let owner = addr.to_string();
+    ecs::with_rt_mut(move |rt: &mut Runtime| {
+        rt.with_device_mut(&owner, |world, entity| {
+            world
+                .get::<corelib::device::xiaomi::XiaomiDevice>(entity)
+                .map(|dev| dev.transport_profiler.clone())
+        })
+        .flatten()
+    })
+    .await
+}
+
+#[derive(Default)]
+struct ProfileAgg {
+    count: u64,
+    packets: u64,
+    bytes: u64,
+    duration_ms: u64,
+}
+
+fn summarize_transport_profile(
+    report: &corelib::device::xiaomi::transport_profiler::TransportProfilerReport,
+) -> serde_json::Value {
+    use std::collections::BTreeMap;
+
+    let mut by_label: BTreeMap<String, ProfileAgg> = BTreeMap::new();
+    let mut mass_setup = None;
+    for event in &report.events {
+        let agg = by_label
+            .entry(format!("{}/{}", event.phase, event.label))
+            .or_default();
+        agg.count += 1;
+        agg.packets += u64::from(event.packets.unwrap_or(0));
+        agg.bytes += event.bytes.unwrap_or(0);
+        agg.duration_ms += event.duration_ms.unwrap_or(0);
+        if mass_setup.is_none() && event.phase == "mass" && event.label == "send_setup" {
+            mass_setup = event.detail.clone();
+        }
+    }
+
+    let sent_bytes = by_label
+        .get("transport/send_batch_spp")
+        .map(|agg| agg.bytes)
+        .unwrap_or(0);
+    let sent_kb_per_s = if report.duration_ms == 0 {
+        0
+    } else {
+        sent_bytes * 1000 / report.duration_ms / 1024
+    };
+    let labels: serde_json::Map<String, serde_json::Value> = by_label
+        .into_iter()
+        .map(|(key, agg)| {
+            (
+                key,
+                serde_json::json!({
+                    "count": agg.count,
+                    "packets": agg.packets,
+                    "bytes": agg.bytes,
+                    "duration_ms": agg.duration_ms,
+                }),
+            )
+        })
+        .collect();
+
+    serde_json::json!({
+        "duration_ms": report.duration_ms,
+        "event_count": report.event_count,
+        "dropped_event_count": report.dropped_event_count,
+        "sent_bytes": sent_bytes,
+        "sent_kb_per_s": sent_kb_per_s,
+        "mass_setup": mass_setup,
+        "labels": labels,
+    })
+}
+
+fn record_transport_profile(
+    report: &corelib::device::xiaomi::transport_profiler::TransportProfilerReport,
+    file_len: usize,
+    ok: bool,
+) {
+    let summary = summarize_transport_profile(report);
+    let label = |key: &str| summary["labels"].get(key).cloned().unwrap_or(serde_json::Value::Null);
+    let count = |key: &str| label(key)["count"].as_u64().unwrap_or(0);
+    let duration = |key: &str| label(key)["duration_ms"].as_u64().unwrap_or(0);
+
+    log::info!(
+        "[transport-profile] ok={ok} file={}KB {}ms sent={}KB {}KB/s \
+         nak={} retransmit={} flow_wait={}({}ms) ack={} batches={} setup={}",
+        file_len / 1024,
+        summary["duration_ms"],
+        summary["sent_bytes"].as_u64().unwrap_or(0) / 1024,
+        summary["sent_kb_per_s"],
+        count("sar/nak_received"),
+        count("sar/data_retransmit"),
+        count("mass/flow_wait"),
+        duration("mass/flow_wait"),
+        count("sar/ack_received"),
+        count("mass/flush_batch"),
+        summary["mass_setup"].as_str().unwrap_or("-"),
+    );
+    log::debug!("[transport-profile] summary={summary}");
+    *last_transport_profile_slot().lock() = Some(summary);
+}
+
+/// 上一次安装的传输层报告（没跑过安装时返回 null）。
+#[tauri::command]
+pub async fn transport_profile_last() -> Result<serde_json::Value, String> {
+    Ok(last_transport_profile_slot()
+        .lock()
+        .clone()
+        .unwrap_or(serde_json::Value::Null))
+}
+
 // ---------- ECS 访问辅助（复刻 app_wasm，适配原生多线程） ----------
 
 pub(crate) async fn with_device_system<S, F, R>(addr: &str, f: F) -> anyhow::Result<R>
@@ -440,16 +569,20 @@ pub(crate) async fn teardown_device(addr: &str) {
     .await;
     let owned = addr.to_string();
     let kind = corelib::ecs::with_rt_mut(move |rt: &mut Runtime| {
-        let kind = rt
-            .component_ref::<corelib::device::Device>(&owned)
-            .map(|d| d.kind());
-        rt.remove_device(&owned);
-        kind
+        rt.component_ref::<corelib::device::Device>(&owned)
+            .map(|d| d.kind())
     })
     .await;
+    // 先清等待槽再 remove_device：组件一起被删的话，调用方只能拿到「receiver dropped」，
+    // 拿不到「设备已断开」这条更有用的话。
     if let Some(kind) = kind {
         corelib::device::cleanup_device_state(kind, addr);
     }
+    let remove_addr = addr.to_string();
+    let _ = corelib::ecs::with_rt_mut(move |rt: &mut Runtime| {
+        rt.remove_device(&remove_addr);
+    })
+    .await;
 }
 
 // ---------- 命令：设备数据 ----------
@@ -743,6 +876,110 @@ fn vivo_progress_sink(app: &tauri::AppHandle) -> Option<Arc<dyn Fn(u64, u64) + S
     }))
 }
 
+/// vivo 安装阶段 → UI 事件（百分比仍走 wf-install-progress，这里只报阶段）。
+///
+/// `last_stage` 是给诊断用的：失败时 `phase` 会被改写成 `failed`，
+/// 不带这一份就看不到到底卡在 push / trigger / wait 哪一步。
+fn vivo_stage_sink(
+    app: &tauri::AppHandle,
+    base: serde_json::Value,
+    last_stage: Arc<std::sync::Mutex<Option<&'static str>>>,
+) -> corelib::device::watchface::VivoStageCb {
+    use corelib::device::watchface::VivoInstallStage;
+    use tauri::Emitter;
+    let app = app.clone();
+    Arc::new(move |stage| {
+        let name = match stage {
+            VivoInstallStage::PushStarted => "push",
+            VivoInstallStage::PushFinished => "push_done",
+            VivoInstallStage::TriggerSent => "trigger",
+            VivoInstallStage::WaitStarted => "wait",
+            VivoInstallStage::Done => "done",
+        };
+        if let Ok(mut slot) = last_stage.lock() {
+            *slot = Some(name);
+        }
+        let mut ctx = base.clone();
+        if let Some(obj) = ctx.as_object_mut() {
+            obj.insert("phase".to_string(), serde_json::json!(name));
+        }
+        crate::diag::set_context("install", ctx);
+        let _ = app.emit(
+            "wf-install-stage",
+            serde_json::json!({ "stage": name }),
+        );
+    })
+}
+
+/// 把 core 的稳定错误前缀翻成买家能照着做的一句话。
+fn humanize_vivo_install_error(err: &str) -> String {
+    if let Some(rest) = err.split("vivo_install:watch_rejected code=").nth(1) {
+        let code: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let code = if code.is_empty() { "?" } else { code.as_str() };
+        return if code == "5" {
+            "手表拒绝安装：可能空间不足或签名不一致。请先卸载同 ID 表盘或清理空间后重试"
+                .to_string()
+        } else {
+            format!("手表拒绝安装（code={code}）")
+        };
+    }
+    if err.contains("vivo_install:ack_timeout") {
+        let stage = if err.contains("stage=setup") {
+            "准备阶段"
+        } else if err.contains("stage=end") {
+            "收尾阶段"
+        } else {
+            "传输阶段"
+        };
+        return format!("传输中断：手表没有确认数据（{stage}）。请重连后重试");
+    }
+    if err.contains("vivo_install:result_timeout") {
+        return "安装未确认：手表没有在 30 秒内回结果。请先重启手表，暂时不要切换表盘，确认表盘列表稳定后再重试"
+            .to_string();
+    }
+    if err.contains("response not received")
+        || err.contains("receiver dropped")
+        || err.contains("Disconnected")
+        || err.contains("disconnected")
+    {
+        return "连接断开，安装没有完成。请重连后重试".to_string();
+    }
+    let short: String = err.chars().take(160).collect();
+    if err.chars().count() > 160 {
+        format!("{short}…")
+    } else {
+        err.to_string()
+    }
+}
+
+/// 安装失败的机器可读分类。
+///
+/// 为什么单独抽出来：`install_vivo_dial` 在返回前已经把错误翻成中文，
+/// `paid.rs` 再按 `vivo_install:result_timeout` 这种原始前缀去匹配永远匹配不到，
+/// 导致「超时后核实」形同虚设。这里同时认原始前缀和最终文案，两边改文案都不容易漏。
+pub(crate) fn vivo_install_error_kind(raw: &str) -> Option<&'static str> {
+    if raw.contains("vivo_install:result_timeout")
+        || raw.contains("手表 30 秒没有返回安装结果")
+        || raw.contains("安装未确认")
+    {
+        return Some("result_timeout");
+    }
+    if raw.contains("vivo_install:ack_timeout") || raw.contains("传输中断") {
+        return Some("ack_timeout");
+    }
+    if raw.contains("vivo_install:watch_rejected") || raw.contains("手表拒绝安装") {
+        return Some("watch_rejected");
+    }
+    if raw.contains("Disconnected")
+        || raw.contains("disconnected")
+        || raw.contains("连接断开")
+        || raw.contains("安装没有完成")
+    {
+        return Some("disconnected");
+    }
+    None
+}
+
 /// vivo 表盘安装：只吃 rpk（manifest 里有 router.watchfaces），走 file_v2 + DialInstall。
 async fn install_vivo_dial(
     app: &tauri::AppHandle,
@@ -764,11 +1001,40 @@ async fn install_vivo_dial(
         file_data.len()
     );
 
-    let progress = vivo_progress_sink(app);
+    let base = serde_json::json!({
+        "target": "dial",
+        "dial_id": dial_id,
+        "package": package,
+        "version_name": version_name,
+        "version_code": version_code,
+        "bytes": file_data.len(),
+        "phase": "push",
+    });
+    crate::diag::set_context("install", base.clone());
 
-    crate::vivo::install_dial(addr, file_data, progress)
+    let progress = vivo_progress_sink(app);
+    let last_stage: Arc<std::sync::Mutex<Option<&'static str>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let stage = Some(vivo_stage_sink(
+        app,
+        base.clone(),
+        Arc::clone(&last_stage),
+    ));
+    crate::vivo::install_dial(addr, file_data, progress, stage)
         .await
-        .map_err(|e| format!("安装失败：{e:#}"))?;
+        .map_err(|e| {
+            let mapped = humanize_vivo_install_error(&format!("{e:#}"));
+            let mut ctx = base.clone();
+            if let Some(obj) = ctx.as_object_mut() {
+                obj.insert("phase".to_string(), serde_json::json!("failed"));
+                obj.insert("error_code".to_string(), serde_json::json!(mapped));
+                if let Some(stage) = last_stage.lock().ok().and_then(|g| *g) {
+                    obj.insert("last_stage".to_string(), serde_json::json!(stage));
+                }
+            }
+            crate::diag::set_context("install", ctx);
+            format!("安装失败：{mapped}")
+        })?;
     Ok(Some(dial_id.to_string()))
 }
 
@@ -794,9 +1060,34 @@ async fn install_vivo_quick_app(
         file_data.len()
     );
 
+    let base = serde_json::json!({
+        "target": "quickapp",
+        "package": manifest.package,
+        "name": manifest.name,
+        "version_name": manifest.version_name,
+        "version_code": manifest.version_code,
+        "bytes": file_data.len(),
+        "phase": "push",
+    });
+    crate::diag::set_context("install", base.clone());
+
     crate::vivo::install_quick_app(addr, file_data, vivo_progress_sink(app))
         .await
-        .map_err(|e| format!("安装失败：{e:#}"))?;
+        .map_err(|e| {
+            let mapped = humanize_vivo_install_error(&format!("{e:#}"));
+            let mut ctx = base.clone();
+            if let Some(obj) = ctx.as_object_mut() {
+                obj.insert("phase".to_string(), serde_json::json!("failed"));
+                obj.insert("error_code".to_string(), serde_json::json!(mapped));
+            }
+            crate::diag::set_context("install", ctx);
+            format!("安装失败：{mapped}")
+        })?;
+    let mut done = base;
+    if let Some(obj) = done.as_object_mut() {
+        obj.insert("phase".to_string(), serde_json::json!("done"));
+    }
+    crate::diag::set_context("install", done);
     Ok(None)
 }
 
@@ -831,6 +1122,10 @@ pub(crate) async fn install_file_bytes_id(
     // 必须在下面「.rpk 一律当快应用」的判定之前拦掉，否则会被当小米快应用装。
     let vivo_dev = crate::vivo::is_vivo(addr).await;
     if vivo_dev {
+        // 握手闸门：ECS 实体可能残留在「连过但没认证」的状态，不能直接发安装请求。
+        if !crate::vivo::is_handshake_ok(addr).await {
+            return Err("连接尚未准备好（握手未完成），请重新连接后再安装".to_string());
+        }
         return install_vivo_payload(app, addr, file_data, &ext, rewrite_watchface_id).await;
     }
     // 反过来也要拦：连着小米却收到 vivo 表盘（付费/集市匹配错品牌时会出现），
@@ -950,6 +1245,14 @@ pub(crate) async fn install_file_bytes_id(
         }
     }
 
+    // 传输层诊断：从 Prepare 开始记，直到安装结果回来。结束后自动汇总一行日志；
+    // 完整报告可用 `transport_profile_last` 取（判断「是不是 NAK/重传把大文件拖慢」靠它）。
+    let profile_file_len = file_data.len();
+    let transport_profiler = xiaomi_transport_profiler(addr).await;
+    if let Some(profiler) = transport_profiler.as_ref() {
+        profiler.start();
+    }
+
     let (progress_tx, mut progress_rx) =
         tokio::sync::mpsc::unbounded_channel::<SendMassCallbackData>();
     let progress_cb: Arc<dyn Fn(SendMassCallbackData) + Send + Sync> = {
@@ -962,7 +1265,7 @@ pub(crate) async fn install_file_bytes_id(
     let addr_owned = addr.to_string();
     let wf_id_for_install = watchface_id.clone();
     let pkg_for_install = package_name.clone();
-    let install_future = with_device_system::<InstallSystem, _, _>(&addr_owned, move |sys| {
+    let request = with_device_system::<InstallSystem, _, _>(&addr_owned, move |sys| {
         sys.send_install_request_with_progress(
             data_type,
             file_data,
@@ -973,7 +1276,22 @@ pub(crate) async fn install_file_bytes_id(
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string());
+    let install_future = match request {
+        Ok(Ok(future)) => future,
+        Ok(Err(e)) => {
+            if let Some(profiler) = transport_profiler.as_ref() {
+                record_transport_profile(&profiler.stop(), profile_file_len, false);
+            }
+            return Err(e);
+        }
+        Err(e) => {
+            if let Some(profiler) = transport_profiler.as_ref() {
+                record_transport_profile(&profiler.stop(), profile_file_len, false);
+            }
+            return Err(e);
+        }
+    };
 
     // 进度通过全局事件上报（二进制 raw body 命令无法携带 Channel 参数）
     let app_handle = app.clone();
@@ -985,6 +1303,10 @@ pub(crate) async fn install_file_bytes_id(
     });
 
     let result = install_future.await;
+    if let Some(profiler) = transport_profiler.as_ref() {
+        let report = profiler.stop();
+        record_transport_profile(&report, profile_file_len, result.is_ok());
+    }
     drop(progress_tx);
     let _ = forward.await;
     let mut resolved_id = watchface_id;

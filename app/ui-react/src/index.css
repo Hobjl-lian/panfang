@@ -26,8 +26,9 @@
 
 body {
   font-family: var(--font-sans);
-  background-color: #121316;
-  color: #16181D;
+  /* 键盘弹起 / WebView 缩高时露出来的是页面底色，不能是黑的 */
+  background-color: #f5f6f9;
+  color: #16181d;
   margin: 0;
   padding: 0;
   -webkit-font-smoothing: antialiased;
@@ -95,6 +96,34 @@ body {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* 视频表盘「制作中」的不确定进度条（服务端不返回百分比，用滑动条表示还在动） */
+@keyframes wfIndeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(330%);
+  }
+}
+
+.wf-indeterminate {
+  animation: wfIndeterminate 1.35s ease-in-out infinite;
+}
+
+/* 抽帧进度条上的流动高光：进度填满后仍在动，避免「卡住」的错觉 */
+@keyframes wfShimmer {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(420%);
+  }
+}
+
+.wf-shimmer {
+  animation: wfShimmer 1.15s linear infinite;
 }
 
 .card-in {

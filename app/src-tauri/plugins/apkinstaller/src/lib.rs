@@ -33,6 +33,25 @@ struct InstallArg<'a> {
     path: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+struct ShareArg<'a> {
+    path: &'a str,
+    mime: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+struct LogcatArg {
+    lines: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LogcatResult {
+    text: String,
+}
+
 /// 插件句柄（主 crate 通过 `app.apk_installer()` 拿到它）。
 pub struct ApkInstaller<R: Runtime> {
     handle: PluginHandle<R>,
@@ -80,6 +99,21 @@ impl<R: Runtime> ApkInstaller<R> {
             .run_mobile_plugin::<()>("install", InstallArg { path })
             .map_err(|e| e.to_string())
     }
+
+    /// 抓本应用 tag 的 logcat 尾部（诊断导出用；部分 ROM 可能只给空串）。
+    pub fn read_logcat(&self, lines: usize) -> Result<String, String> {
+        self.handle
+            .run_mobile_plugin::<LogcatResult>("readLogcat", LogcatArg { lines })
+            .map(|r| r.text)
+            .map_err(|e| e.to_string())
+    }
+
+    /// 用系统分享面板分享任意文件（文件先复制进内部 cache，FileProvider 才认）。
+    pub fn share_file(&self, path: &str, mime: &str) -> Result<(), String> {
+        self.handle
+            .run_mobile_plugin::<()>("shareFile", ShareArg { path, mime })
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// 桌面：编译通过、调用即报错（系统安装器只在安卓上有意义）。
@@ -96,6 +130,12 @@ impl<R: Runtime> ApkInstaller<R> {
     }
     pub fn install(&self, _path: &str) -> Result<(), String> {
         Err("应用内安装仅安卓可用".into())
+    }
+    pub fn read_logcat(&self, _lines: usize) -> Result<String, String> {
+        Ok(String::new())
+    }
+    pub fn share_file(&self, _path: &str, _mime: &str) -> Result<(), String> {
+        Err("系统分享仅安卓可用".into())
     }
 }
 

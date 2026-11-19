@@ -65,13 +65,15 @@ import {
   type MarketBanner,
   type MarketList
 } from "./tauri";
+import { DragSlider, GenSlider } from "./Slider";
+import VideoWatchface from "./VideoWatchface";
 import {
   Lightning, CaretRight, FolderOpen, Check, House, SlidersHorizontal, Watch,
   CircleNotch, CaretLeft, X, ArrowsClockwise, Flame, Heart,
   Footprints, CaretDown, Plus, GearSix, ArrowsDownUp, ArrowSquareOut,
   Info, ShieldCheck, FileText, Scroll, Code, DotsThree, ArrowClockwise,
   ArrowCounterClockwise, MagnifyingGlassPlus, MagnifyingGlass, SunDim, Drop, IconContext,
-  LockSimple,
+  LockSimple, VideoCamera, Ticket,
   User, Storefront, Copy
 } from "@phosphor-icons/react";
 
@@ -125,133 +127,6 @@ function roundRectPath(
   ctx.lineTo(x, y + rr);
   ctx.arcTo(x, y, x + rr, y, rr);
   ctx.closePath();
-}
-
-/**
- * 自绘滑杆的「轨道 + 白点」。
- *
- * **只有白点周围 44px 的圆形热区能起拖，轨道本身完全不响应触摸**（用户 2026-11-13）：
- * 原来用原生 `<input type=range>`，手指按在轨道任意位置都会立刻跳值并开始拖，
- * 一页里两层照片各有四根滑杆，上下滑动列表时几乎每次都误触。
- * 现在轨道只是画出来的，不接事件；改动参数必须按住白点。
- *
- * 白点热区用 `touch-action:none` 吃掉垂直手势，避免拖动时连带滚动整页。
- */
-function DragSlider(props: {
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  onChange: (v: number) => void;
-  /** 轨道外观（纯色色板用渐变），默认灰底 */
-  trackStyle?: React.CSSProperties;
-  className?: string;
-}) {
-  const { value, min, max, step, onChange, trackStyle, className } = props;
-  const trackRef = useRef<HTMLDivElement | null>(null);
-  const dragging = useRef(false);
-  const [active, setActive] = useState(false);
-
-  const lo = Math.min(min, max);
-  const hi = Math.max(min, max);
-  const st = step > 0 ? step : 0.01;
-  const cur = Math.min(hi, Math.max(lo, value));
-  const pct = hi > lo ? (cur - lo) / (hi - lo) : 0;
-
-  const setFromClientX = (clientX: number) => {
-    const el = trackRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    if (r.width <= 0) return;
-    const k = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
-    const snapped = Math.round((lo + (hi - lo) * k) / st) * st;
-    onChange(Math.min(hi, Math.max(lo, Number(snapped.toFixed(6)))));
-  };
-
-  return (
-    <div className="flex-1 min-w-0 h-10 flex items-center">
-      <div
-        ref={trackRef}
-        className={`relative w-full h-1.5 rounded-full ${className || "bg-black/10"}`}
-        style={trackStyle}
-      >
-        <div
-          role="slider"
-          aria-valuemin={lo}
-          aria-valuemax={hi}
-          aria-valuenow={cur}
-          className="absolute top-1/2 w-11 h-11 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center cursor-grab active:cursor-grabbing"
-          style={{ left: `${pct * 100}%`, touchAction: "none" }}
-          onPointerDown={e => {
-            dragging.current = true;
-            setActive(true);
-            try {
-              e.currentTarget.setPointerCapture(e.pointerId);
-            } catch {
-              /* 老内核拿不到 capture 也能靠后续 move 事件 */
-            }
-          }}
-          onPointerMove={e => {
-            if (dragging.current) setFromClientX(e.clientX);
-          }}
-          onPointerUp={e => {
-            if (!dragging.current) return;
-            dragging.current = false;
-            setActive(false);
-            try {
-              e.currentTarget.releasePointerCapture(e.pointerId);
-            } catch {
-              /* 已经释放 */
-            }
-          }}
-          onPointerCancel={() => {
-            dragging.current = false;
-            setActive(false);
-          }}
-        >
-          <div
-            className={`w-5 h-5 rounded-full bg-white border-2 shadow-[0_1px_4px_rgba(0,0,0,0.2)] transition-colors ${
-              active ? "border-[#4361EE]" : "border-black/15"
-            }`}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
- * 生成器里的一行滑杆（图标 + 标签 + 轨道 + 数值）。
- * 三列宽度固定（标签 52 / 轨道自适应 / 数值 44），行与行上下对齐；
- * 标签列 `whitespace-nowrap`，否则「缩放」会被拆成两行、行高跟着跳。
- */
-function GenSlider(props: {
-  icon: React.ReactNode;
-  label: string;
-  value: number;
-  ctl: GenNumCtl;
-  text: string;
-  onChange: (v: number) => void;
-}) {
-  const { icon, label, value, ctl, text, onChange } = props;
-  return (
-    <div className="flex items-center gap-2.5 h-10">
-      <div className="flex items-center gap-1 w-[52px] shrink-0 text-black/45 whitespace-nowrap">
-        {icon}
-        <span className="text-[12px] font-medium">{label}</span>
-      </div>
-      <DragSlider
-        value={value}
-        min={ctl.min}
-        max={ctl.max}
-        step={ctl.step}
-        onChange={onChange}
-      />
-      <span className="text-[12px] font-mono font-medium text-black/55 w-[44px] text-right shrink-0">
-        {text}
-      </span>
-    </div>
-  );
 }
 
 /** 生成器里的一个开关（翻转这类只有两态的项） */
@@ -459,7 +334,23 @@ const LEGAL_BASE = "https://api.hobjl-shop.top";
 const APP_BEIAN_NO = "粤ICP备2026135374号-2A";
 const BEIAN_URL = "https://beian.miit.gov.cn/";
 
-type FlowStep = "welcome" | "vivo_scan" | "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "install_confirm" | "photo_generator" | "settings_account" | "settings_device" | "market_detail";
+/**
+ * 页面状态：停在那里画哪一屏。和下面的路由表分工不同 ——
+ * 路由表说「用户能停在哪」（几条路、落在哪个 Tab、要不要恢复），这里说「停在那儿渲染什么」。
+ * 路由表里每一行的 step 必须是这里的值（ROUTES 用 satisfies 卡着），写错名字编译就报错。
+ * redeem_success 是 install 那一页里的瞬时阶段（进度 → 成功），没有自己的路由。
+ */
+/** 剩余时间口语化：45 秒 / 2 分 30 秒 / 超过 1 小时。按 5 秒取整，免得数字一直跳。 */
+function formatEta(seconds: number): string {
+  const rounded = Math.max(5, Math.ceil(seconds / 5) * 5);
+  if (rounded < 60) return `${rounded} 秒`;
+  if (rounded >= 3600) return "超过 1 小时";
+  const minutes = Math.floor(rounded / 60);
+  const rest = rounded % 60;
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`;
+}
+
+type FlowStep = "welcome" | "vivo_scan" | "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "install_confirm" | "photo_generator" | "settings_account" | "settings_device" | "market_detail" | "video_watchface";
 
 /** 逐包更新状态（服务端 packages + App 安装快照逐包比较后补上 needs_update/new） */
 interface PaidPackageStatus {
@@ -553,6 +444,17 @@ const MOCK_DEVICES: DeviceItem[] = [
   { id: "3C:AF:B7:F4:C6:75", name: "Xiaomi 手环 9 Pro", model: "备用", battery: 45 },
   { id: "E8:E6:09:10:46:FD", name: "Redmi Watch 5", model: "家庭", battery: 92 }
 ];
+
+/** 管理页的「视频表盘 ID → 本地作品」映射（一个作品可能对应多个历史成品 ID） */
+type VideoDialProject = {
+  id: string;
+  title?: string;
+  style_name?: string;
+  canvas_w?: number;
+  canvas_h?: number;
+  preview_b64?: string;
+  preview_url?: string;
+};
 
 const LARGE_STYLES = [
   "亮屏-玻璃拟物", "亮屏-极简线条", "亮屏-像素怀旧", "亮屏-数字排版",
@@ -834,72 +736,53 @@ function storeVivoDevices(list: DeviceItem[]) {
 }
 
 /**
- * 页面路由口径（唯一一套字符串）：login / devices / main/<tab> / redeem / install / dial-edit /
- * crop / about / about/developer / about/licenses。兑换流程三个阶段算同一页（"redeem"）、
- * 本地安装进度的全过程算同一页（"install"）：返回一次即回到进来之前，进度页/成功页不再单独入栈。
+ * 路由表 —— 「App 有哪些页面」的唯一真相。
+ *
+ * 加一个页面 = 在这里加一行；下面三样都从这张表长出来，不用再各记一遍：
+ *   step     渲染哪一屏（必须是 FlowStep 里的值，写错名字编译就报错）
+ *   tab      停在哪一栏（底部 Tab 高亮、顶栏大标题都看它）
+ *   persist  退到后台 / 重启后允不允许恢复到这一页；false = 瞬时过程，回来退回进来之前那一页
  */
+const ROUTES = {
+  welcome: { step: "welcome", tab: "home", persist: true },
+  "vivo-scan": { step: "vivo_scan", tab: "home", persist: false },
+  login: { step: "login", tab: "home", persist: true },
+  devices: { step: "device_select", tab: "home", persist: true },
+  paid: { step: "paid_bind", tab: "home", persist: true },
+  "paid/dials": { step: "paid_dials", tab: "home", persist: true },
+  "settings/account": { step: "settings_account", tab: "settings", persist: true },
+  "settings/device": { step: "settings_device", tab: "settings", persist: true },
+  "connect-help": { step: "connect_help", tab: "home", persist: true },
+  guide: { step: "onboarding_guide", tab: "home", persist: true },
+  // 安装是瞬时过程：重启后回到进来之前那一页才是对的
+  install: { step: "redeem_installing", tab: "home", persist: false },
+  "install-confirm": { step: "install_confirm", tab: "home", persist: false },
+  "dial-edit": { step: "dial_edit", tab: "manage", persist: true },
+  generator: { step: "photo_generator", tab: "manage", persist: true },
+  video: { step: "video_watchface", tab: "home", persist: true },
+  about: { step: "about_app", tab: "settings", persist: true },
+  "about/developer": { step: "about_developer", tab: "settings", persist: true },
+  "about/licenses": { step: "open_source_licenses", tab: "settings", persist: true },
+  // 集市表盘详情：从集市列表进来，重启后回集市列表
+  "market/item": { step: "market_detail", tab: "market", persist: false },
+  "main/home": { step: "main", tab: "home", persist: true },
+  "main/market": { step: "main", tab: "market", persist: true },
+  "main/manage": { step: "main", tab: "manage", persist: true },
+  "main/settings": { step: "main", tab: "settings", persist: true }
+} as const satisfies Record<string, { step: FlowStep; tab: TabKey; persist: boolean }>;
 
-/** 路由字符串 → 页面状态（恢复与返回时用） */
+const ROUTE_LOOKUP: Partial<Record<string, { step: FlowStep; tab: TabKey }>> = ROUTES;
+
+/** 路由字符串 → 页面状态（恢复与返回时用）；认不出的路由一律回首页 */
 function parseRoute(route: string): { step: FlowStep; tab: TabKey } {
-  // 首屏「选手表」：只有一台设备都没接过的首次启动才停在这里
-  if (route === "welcome") return { step: "welcome", tab: "home" };
-  // vivo 连接引导（两步说明 → 搜索）：瞬时过程，不进持久化恢复白名单
-  if (route === "vivo-scan") return { step: "vivo_scan", tab: "home" };
-  if (route === "login") return { step: "login", tab: "home" };
-  if (route === "devices") return { step: "device_select", tab: "home" };
-  if (route === "paid") return { step: "paid_bind", tab: "home" };
-  if (route === "paid/dials") return { step: "paid_dials", tab: "home" };
-  // 爱发电账号管理：二级页面，从设置进来（账号的日常管理只在这里，不在绑定流程里）
-  // 设置下的两个二级页（账号 / 设备与连接），都从设置页进来、返回设置页
-  if (route === "settings/account") return { step: "settings_account", tab: "settings" };
-  if (route === "settings/device") return { step: "settings_device", tab: "settings" };
-  // 连接失败帮助页：三级页面（从设备抽屉进来），返回按层级回抽屉
-  if (route === "connect-help") return { step: "connect_help", tab: "home" };
-  // 4 步上手：新手引导页（首页卡片与设置里的「使用指引」都进这里）
-  if (route === "guide") return { step: "onboarding_guide", tab: "home" };
-  // 本地 .bin 安装：进度/成功页与兑换流程共用同一套页面（"install" 不参与持久化恢复，
-  // 见 KNOWN_ROUTES：安装是瞬时过程，重启后回到进来之前那一页才是对的）
-  if (route === "install") return { step: "redeem_installing", tab: "home" };
-  if (route === "dial-edit") return { step: "dial_edit", tab: "manage" };
-  // 本地安装确认页：选完文件先停在确认（复写 ID 也在这里选），确认后才进安装
-  if (route === "install-confirm") return { step: "install_confirm", tab: "home" };
-  if (route === "generator") return { step: "photo_generator", tab: "manage" };
-  if (route === "about") return { step: "about_app", tab: "settings" };
-  if (route === "about/developer") return { step: "about_developer", tab: "settings" };
-  if (route === "about/licenses") return { step: "open_source_licenses", tab: "settings" };
-  // 集市表盘详情：从集市列表进来；返回回列表（这条不进 KNOWN_ROUTES，重启后回集市）
-  if (route === "market/item") return { step: "market_detail", tab: "market" };
-  if (route.startsWith("main/")) {
-    const t = route.slice(5);
-    return {
-      step: "main",
-      tab: t === "manage" || t === "settings" || t === "market" ? t : "home"
-    };
-  }
-  return { step: "main", tab: "home" };
+  const hit = ROUTE_LOOKUP[route];
+  return hit ? { step: hit.step, tab: hit.tab } : { step: "main", tab: "home" };
 }
 
-/** 已知路由集合（持久化恢复时的白名单） */
-const KNOWN_ROUTES = [
-  "welcome",
-  "login",
-  "devices",
-  "paid",
-  "paid/dials",
-  "settings/account",
-  "settings/device",
-  "connect-help",
-  "guide",
-  "dial-edit",
-  "generator",
-  "about",
-  "about/developer",
-  "about/licenses",
-  "main/home",
-  "main/market",
-  "main/manage",
-  "main/settings"
-];
+/** 已知路由集合（持久化恢复白名单）：从表里推，不再手抄一份 */
+const KNOWN_ROUTES: string[] = Object.entries(ROUTES)
+  .filter(([, r]) => r.persist)
+  .map(([name]) => name);
 
 /**
  * 退出 App 时持久化的界面态 —— **只允许页面级状态**，列表就是全部白名单：
@@ -1462,7 +1345,7 @@ function useRubberBand() {
 function WebViewGateScreen({ major, onContinue }: { major: number; onContinue: () => void }) {
   return (
     <IconContext.Provider value={{ weight: "bold" }}>
-      <div className="min-h-screen bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
+      <div className="min-h-screen bg-[#F5F6F9] md:bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
         <div className="w-full md:max-w-[400px] h-[100dvh] md:h-[844px] bg-[#F5F6F9] md:rounded-[44px] relative flex flex-col overflow-hidden">
           <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12">
             <div />
@@ -1580,6 +1463,44 @@ export default function App() {
   const STATUS_PROBE_TIMEOUT_MS = 8000;
   /** 掉线后正在自动重连（Rust 接管）：设备行显示「重连中…」而不是「未连接设备」 */
   const [linkRetrying, setLinkRetrying] = useState(false);
+  /** vivo 设置页展示：绑定状态 / 上次通道 / 固件（只在 settings_device 打开时刷新） */
+  const [vivoBindState, setVivoBindState] = useState<{
+    label?: string;
+    channel?: string | null;
+    isAuthed?: boolean | null;
+  } | null>(null);
+  const [vivoDeviceInfo, setVivoDeviceInfo] = useState<{
+    model?: string;
+    firmwareVersion?: string;
+    osVersion?: string;
+  } | null>(null);
+
+  // 设置 › 设备与连接：vivo 用户打开页面时拉一次绑定状态与固件信息（失败静默）
+  useEffect(() => {
+    if (currentStep !== "settings_device" || deviceVendor() !== "vivo" || !isDeviceConnected) {
+      setVivoBindState(null);
+      setVivoDeviceInfo(null);
+      return;
+    }
+    const addr = selectedDevice.id;
+    let alive = true;
+    void (async () => {
+      try {
+        const [bind, info] = await Promise.all([
+          invoke?.("vivo_binding_state", { addr }),
+          invoke?.("device_get_data", { addr, dataType: "info" }),
+        ]);
+        if (!alive) return;
+        setVivoBindState((bind as { label?: string; channel?: string | null } | null) ?? null);
+        setVivoDeviceInfo((info as typeof vivoDeviceInfo) ?? null);
+      } catch (err) {
+        if (alive) console.error("[settings_device] 读取 vivo 信息失败：", err);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [currentStep, isDeviceConnected, selectedDevice.id]);
   /** 连接状态的镜像（事件回调里读它，不用可能陈旧的 state —— 铁律③：用真实状态判断） */
   const connectedStateRef = useRef(false);
   /** 掉线信号：安装/应用期间掉线 → 立刻失败，不等停滞看门狗（25 秒） */
@@ -1614,6 +1535,15 @@ export default function App() {
    * 技术细节（MAC、后端原文、堆栈）仍然只进 console 与后台打点。
    */
   const connectHintFor = (raw: string): string => {
+    // vivo 的绑定信息问题要原样告诉用户：这不是「没进连接模式」，而是手表绑在别的手机上
+    if (
+      raw.includes("绑定信息") ||
+      raw.includes("openId") ||
+      raw.includes("openid") ||
+      raw.includes("握手")
+    ) {
+      return "手表的绑定信息和本机对不上。请先用「vivo 健康」正常绑定这台手表，退出 vivo 健康后再回来连接";
+    }
     if (raw.includes("认证") || raw.includes("创建设备") || raw.includes("session-not-ready")) {
       return "已连上蓝牙但手环认证没通过，请重启手环后重新进入「连接新手机」再试";
     }
@@ -1646,7 +1576,9 @@ export default function App() {
         step,
         code,
         message: String(message).slice(0, 400),
-        deviceModel: model ?? connected.current.model ?? null,
+        // vivo 设备通常没有独立 model，只有用户可见的设备名（如「iQOO WATCH GT2 276」）；
+        // 打点时退到 name，否则安装失败事件里 device_model 永远是空，排障只能靠猜。
+        deviceModel: model ?? connected.current.model ?? connected.current.name ?? null,
       })?.catch(() => {});
     } catch {
       /* 上报绝不能影响主流程 */
@@ -1748,6 +1680,41 @@ export default function App() {
     } else if (raw.includes("LowBattery")) {
       code = "low_battery";
       msg = "手环电量过低，请先充电再安装";
+    } else if (raw.includes("手表剩余空间不足")) {
+      // 后端预检已经算好「约 X MB / 需要约 Y MB」，直接把这句给用户，别再套一层「操作失败」
+      code = "low_storage";
+      msg = raw.split("\n")[0].trim();
+    } else if (
+      raw.includes("删除手表上的旧表盘失败") ||
+      raw.includes("手表上只有这张表盘") ||
+      raw.includes("切换手表当前表盘失败") ||
+      raw.includes("切换表盘后没能刷新")
+    ) {
+      // 同 ID 先删后装失败：按后端原因给一句能照做的提示
+      code = "vivo_uninstall_failed";
+      msg = raw.includes("手表上只有这张表盘")
+        ? "手表上只有这张表盘，无法删除当前表盘；请先在手表上切到别的表盘再回来重试"
+        : raw.includes("切换手表当前表盘失败")
+          ? "切换手表当前表盘失败，请先在手表上切到别的表盘再回来重试"
+          : raw.includes("切换表盘后没能刷新")
+            ? "切换表盘后没能刷新手表列表，请重试"
+            : "删除手表上的旧表盘失败，请先在手表上手动删除它再重新安装";
+    } else if (raw.includes("vivo dial install rejected by watch: code=5")) {
+      // App 已经先删同 ID 再装，仍被拒就多半是空间不足或旧表盘没删干净
+      code = "vivo_dial_rejected";
+      msg = "手表拒绝了这张表盘（可能空间不足或旧表盘没删干净），请先在手表上删除这张表盘再试";
+    } else if (raw.includes("安装未确认")) {
+      // vivo 大包超时：后端已经查过手表列表，但没收到安装结果。
+      // 半成品表盘会让手表在切换时崩掉，所以先让用户重启，别去点它。
+      code = "vivo_dial_unconfirmed";
+      msg = "安装未确认：请先重启手表，暂时不要切换表盘，确认表盘列表稳定后再试";
+    } else if (
+      raw.includes("Vivo dial install response not received") ||
+      raw.includes("Vivo set-current dial response not received")
+    ) {
+      // 大包 + 手表忙/BLE 掉线时回包会丢；后端会先核实是否其实已经装上
+      code = "vivo_dial_timeout";
+      msg = "手表没有及时响应（可能空间不足或正在安装），请重启手表、删掉不用的表盘后再试";
     } else if (raw.includes("Downgrade")) {
       code = "downgrade";
       msg = "手环拒绝了旧版本安装，请先在管理页卸载旧表盘再装";
@@ -2013,6 +1980,35 @@ export default function App() {
   /** 这次本地安装装的是什么：表盘有「设为当前」那一步，快应用没有 → 进度文案要分开 */
   const installKindRef = useRef<"watchface" | "quickapp">("watchface");
   const [installProgress, setInstallProgress] = useState(0);
+  /** 安装剩余时间（秒）：按最近十几秒的进度增量估；还没攒够样本时是 null */
+  const [installEtaSec, setInstallEtaSec] = useState<number | null>(null);
+  /** 进度采样：只留最近 ~12 秒，进度回退 = 新的一轮（付费下载 → 传输会回到 0） */
+  const etaSamples = useRef<{ t: number; p: number }[]>([]);
+  const resetInstallEta = () => {
+    etaSamples.current = [];
+    setInstallEtaSec(null);
+  };
+  /** 喂一次进度（0~1）。传输/编辑传图的进度都按分片计，和字节数线性对应，可直接外推剩余时间。 */
+  const noteInstallEta = (ratio: number) => {
+    if (!Number.isFinite(ratio)) return;
+    if (ratio <= 0) {
+      resetInstallEta();
+      return;
+    }
+    const now = Date.now();
+    const samples = etaSamples.current;
+    const last = samples[samples.length - 1];
+    if (last && ratio + 1e-6 < last.p) samples.length = 0;
+    samples.push({ t: now, p: ratio });
+    while (samples.length > 2 && now - samples[0].t > 12_000) samples.shift();
+    const first = samples[0];
+    const spanSec = (now - first.t) / 1000;
+    // 至少 3 秒的样本才给数字：第一批是满窗口突发，太早外推会低估（显示 20 秒、实际 3 分钟）
+    if (spanSec >= 3 && ratio > first.p) {
+      const rate = (ratio - first.p) / spanSec;
+      if (rate > 0) setInstallEtaSec((1 - ratio) / rate);
+    }
+  };
   const [progressPhase, setProgressPhase] = useState("正在验证兑换凭证...");
   const [dialName, setDialName] = useState("雾屿蓝");
   /** 这次安装来自哪里：兑换流程（演示）/ 本地 .bin 文件 / 集市 → 决定失败后「重试安装」怎么重试 */
@@ -2099,6 +2095,12 @@ export default function App() {
   const [deviceIdFailed, setDeviceIdFailed] = useState(false);
 
   const [dials, setDials] = useState<InstalledDial[]>(() => boot.dials);
+  /** 本地视频表盘作品：按成品表盘 ID 索引，管理页据此标「视频」并接回制作页 */
+  const [videoDialProjects, setVideoDialProjects] = useState<
+    Record<string, VideoDialProject>
+  >({});
+  /** 从管理页点开某个已装视频表盘时，交给视频表盘页直接打开的作品 ID */
+  const [videoOpenId, setVideoOpenId] = useState("");
   const [editingDial, setEditingDial] = useState<InstalledDial | null>(boot.editingDial);
 
   // 动作表（Action Sheet）状态
@@ -2145,6 +2147,17 @@ export default function App() {
         localStorage.setItem("panfang.updateCheckedAt", String(Date.now()));
       } catch {
         /* 存不下就算了，只是节流无效 */
+      }
+      // 灰度版：启动检查不弹窗、不落“有新版本”角标；只有手动检查才提示。
+      if (r.available && r.silent && silent) {
+        setAppUpdate(null);
+        setAppUpdateKnown(null);
+        try {
+          localStorage.removeItem("panfang.updateKnown");
+        } catch {
+          /* 同上 */
+        }
+        return;
       }
       if (!r.available) {
         setAppUpdateKnown(null);
@@ -2668,6 +2681,8 @@ export default function App() {
   // —— 画布尺寸参数化（docs/设计稿v2-对照与UI实施要点.md §5.2）——
   // 屏幕来源：优先当前连接设备，其次表盘自身画布，最后演示默认（212×520 跑道屏）。
   const canvasScreen: ScreenInfo = dialScreens.device ?? dialScreens.dial ?? DEMO_SCREEN;
+  /** 当前编辑的是不是本机某个视频作品：图片区换成「视频表盘编辑」，隐藏普通图层编辑项 */
+  const editingVideoProject = editingDial ? videoDialProjects[editingDial.id] : undefined;
   /** 编辑页画布框：等比最大 200×260 的 2/3（收紧版，给下方操作区留更多空间）+ 圆角同比例 */
   const canvasFrame = frameSizeFor(canvasScreen, 134, 174);
   /** 表盘与当前设备规格不一致时给出告警 */
@@ -2741,7 +2756,6 @@ export default function App() {
       reportedLoss.current = false;
       setDials([]);
     }
-    showToast(`已移除「${device.name}」`);
   };
 
   /** 重新导入：先清掉「已移除」名单，再把账号下的设备全拉回来（用户要求的找回方式） */
@@ -3111,6 +3125,32 @@ export default function App() {
     }
   };
 
+  /** 导出诊断包：Rust 侧生成脱敏 zip，安卓走系统分享、桌面弹另存为；失败退回复制。 */
+  const [diagBusy, setDiagBusy] = useState(false);
+  const exportDiag = async () => {
+    if (diagBusy) return;
+    setDiagBusy(true);
+    try {
+      const extra = {
+        device_name: connected.current.name || null,
+        device_model: connected.current.model || null,
+        connected: isDeviceConnected,
+      };
+      const r = (await invoke?.("diag_export", { extra })) as { path?: string } | null;
+      if (!r?.path) throw new Error("诊断包生成失败");
+      const shared = await invoke?.("diag_share", { path: r.path });
+      if (shared !== false) {
+        showToast("诊断包已生成，请发送给开发者", "success");
+      }
+    } catch (err) {
+      console.error("[diag_export]", err);
+      showToast("导出失败，已改为复制诊断信息", "error");
+      await copyDiag();
+    } finally {
+      setDiagBusy(false);
+    }
+  };
+
   /**
    * 连接失败引导卡（**设备抽屉与「选择设备」整页共用**）。
    * 放抽屉里时必须位于列表上方：列表长，卡片在列表下方会被挤出可视区（2026-10-07 踩过）。
@@ -3136,7 +3176,7 @@ export default function App() {
             没连上{failedDevice?.name ? `「${failedDevice.name}」` : ""}
           </p>
           <p className="text-[13px] font-medium text-black/45 mt-1 leading-snug">
-            先让手环进入「连接新手机」模式，再重新连接
+            {failedDevice?.model ? `${failedDevice.model}，` : ""}先让手环进入「连接新手机」模式，再重新连接
           </p>
         </div>
       </div>
@@ -3157,6 +3197,16 @@ export default function App() {
           className="flex-1 h-[40px] rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all cursor-pointer"
         >
           重试
+        </button>
+      </div>
+      <div className="flex justify-center mt-2">
+        <button
+          type="button"
+          disabled={diagBusy}
+          onClick={() => void exportDiag()}
+          className="text-[12px] font-bold text-black/40 hover:text-black/60 transition-colors cursor-pointer disabled:opacity-50"
+        >
+          {diagBusy ? "正在导出…" : "导出诊断包"}
         </button>
       </div>
     </div>
@@ -3326,7 +3376,7 @@ export default function App() {
 
   /** 编辑页入口：留档 .bin → 图层模型 → 选项数组 / 相册 / 预览图
    *  （**真机上不许拿设计稿的演示数据充数**：没连设备/拿不到留档时留成 failed，界面会明确提示） */
-  const loadDialSession = async (dial: InstalledDial) => {
+  const loadDialSession = async (dial: InstalledDial, videoProject?: VideoDialProject) => {
     const addr = connected.current.addr;
     if (!invoke) return; // 浏览器预览：保持演示数据（设计稿那套）
     if (!addr) {
@@ -3339,15 +3389,27 @@ export default function App() {
     const stale = () => mySeq !== dialSessionSeq.current;
     const deviceModel = connected.current.model;
     try {
-      const a = (await invoke("watchface_archive_get", { addr, faceId: dial.id })) as ArchiveData | null;
+      // 视频表盘没有普通留档：直接读这个作品的成品 bin（预览会只用序列帧首帧，静态）
+      let dataB64: string;
+      if (videoProject) {
+        const v = (await invoke("video_project_get", {
+          projectId: videoProject.id,
+          kind: "bin"
+        })) as { data_b64?: string } | null;
+        if (!v?.data_b64) throw new Error("作品还没有成品");
+        dataB64 = v.data_b64;
+      } else {
+        const a = (await invoke("watchface_archive_get", { addr, faceId: dial.id })) as ArchiveData | null;
+        if (!a?.dataB64) throw new Error("留档为空");
+        dataB64 = a.dataB64;
+      }
       if (stale()) return; // 期间又点了别的表盘 → 这次结果作废
-      if (!a?.dataB64) throw new Error("留档为空");
       const model = (await invoke("watchface_layer_model", {
-        dataB64: a.dataB64,
+        dataB64,
         deviceModel: deviceModel || null
       })) as LayerModelDoc | null;
       if (stale()) return;
-      binSession.current = { faceId: dial.id, dataB64: a.dataB64, model };
+      binSession.current = { faceId: dial.id, dataB64, model };
       // 壁纸方案：照片表盘一律进生成器（有方案套模板，没方案用本地通用方案）
       setGenPlan(null);
       setGenPlanError(null);
@@ -3469,6 +3531,8 @@ export default function App() {
   const installLockRef = useRef(false);
   /** 制作壁纸页有东西没保存时：系统返回/侧滑先弹「是否保存」，别直接退走（返回 true = 已拦下） */
   const genBackGuardRef = useRef<(() => boolean) | null>(null);
+  /** 视频表盘页的内部层级（模板/编辑/进度/详情）：返回 true = 已在页内退了一级 */
+  const videoBackGuardRef = useRef<(() => boolean) | null>(null);
   useEffect(() => {
     const locked = currentStep === "redeem_installing" && !installError;
     installLockRef.current = locked;
@@ -3499,6 +3563,43 @@ export default function App() {
       if (addr) void refreshDials(addr);
     }
   }, [currentStep, activeTab, isDeviceConnected]);
+  /** 管理页拉一次本地视频作品，给已装表盘标类型（不联网，只读本机密文索引） */
+  useEffect(() => {
+    if (currentStep !== "main" || activeTab !== "manage" || !invoke) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const v = (await invoke("video_project_list")) as { items?: any[] };
+        const map: Record<string, VideoDialProject> = {};
+        for (const p of v?.items || []) {
+          const ids = Array.isArray(p?.watchface_ids)
+            ? p.watchface_ids
+            : p?.watchface_id
+              ? [p.watchface_id]
+              : [];
+          for (const wid of ids) {
+            if (wid) {
+              map[String(wid)] = {
+                id: String(p.id),
+                title: p.title,
+                style_name: p.style_name,
+                canvas_w: p.canvas_w,
+                canvas_h: p.canvas_h,
+                preview_b64: p.preview_b64,
+                preview_url: p.preview_url,
+              };
+            }
+          }
+        }
+        if (alive) setVideoDialProjects(map);
+      } catch {
+        /* 本地没有作品目录：保持空表 */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [currentStep, activeTab, dials.length]);
   useEffect(() => {
     const onPop = (event: PopStateEvent) => {
       // 安装中锁死返回键：把历史退回本页（一步也走不了），并告诉用户原因
@@ -3522,6 +3623,9 @@ export default function App() {
         navDepth.current += 1;
         return;
       }
+      // 视频表盘页内的层级：它自己已经退了一屏并同步了 navDepth；
+      // 这条历史本来就是页内压进去的，不要再补一条（补历史会让安卓 canGoBack 误判）。
+      if (videoBackGuardRef.current?.()) return;
       if (ignorePop.current.length) {
         const expected = ignorePop.current[ignorePop.current.length - 1];
         const target = (event.state as { route?: string } | null)?.route ?? null;
@@ -3698,7 +3802,9 @@ export default function App() {
           };
           let text = p.detail || p.phase || "";
           if (p.total && p.total > 0) {
-            const pct = Math.min(100, Math.round(((p.sent || 0) / p.total) * 100));
+            const ratio = (p.sent || 0) / p.total;
+            noteInstallEta(ratio);
+            const pct = Math.min(100, Math.round(ratio * 100));
             setInstallProgress(pct);
             text = `${text} ${pct}%`;
           }
@@ -3719,16 +3825,44 @@ export default function App() {
           };
           const ratio = Number(p.progress);
           if (!Number.isFinite(ratio)) return;
+          noteInstallEta(ratio);
           const pct = Math.max(0, Math.min(100, Math.round(ratio * 100)));
           if (pct >= 100) {
+            setInstallEtaSec(null);
             setInstallProgress(100);
+            // 传输 100% ≠ 装完：vivo 还要等手表回安装结果（阶段事件随后会覆盖这句）
             setProgressPhase(
-              installKindRef.current === "quickapp" ? "安装完成" : "安装完成，正在激活..."
+              installKindRef.current === "quickapp" ? "安装完成" : "传输完成，等待手表确认…"
             );
             return;
           }
           setInstallProgress(pct);
           setProgressPhase(`正在传输至手环 ${pct}%...`);
+        })
+      );
+      // vivo 安装阶段：push → trigger → wait → done（百分比仍由 wf-install-progress 报）
+      track(
+        await lis("wf-install-stage", ev => {
+          installBeat.current = Date.now(); // 阶段在动 → 停滞看门狗别误判
+          const stage = String((ev.payload as { stage?: string } | null)?.stage || "");
+          switch (stage) {
+            case "push":
+              setProgressPhase("正在传输至手表…");
+              break;
+            case "push_done":
+              setProgressPhase("传输完成，正在通知手表安装…");
+              break;
+            case "trigger":
+              setProgressPhase("正在通知手表安装…");
+              break;
+            case "wait":
+              setProgressPhase("手表正在安装，请稍候…");
+              break;
+            case "done":
+              setInstallProgress(100);
+              setProgressPhase("安装完成");
+              break;
+          }
         })
       );
       // 付费表盘进度：验证授权 → 下载（按字节）→ 解密 → 传输（交给 wf-install-progress 报百分比）
@@ -4468,8 +4602,11 @@ export default function App() {
    * 不能 resetStackTo 之后再 pushRoute（异步回退和同步 pushState 会打架）。
    */
   const handleOpenDialEdit = (dial: InstalledDial, fromRoot?: string) => {
+    // 视频表盘：也进普通编辑页；图片区会换成「视频表盘编辑」卡片（见编辑页里的分支）
+    const videoProject = videoDialProjects[dial.id];
     // F：只支持编辑本 APP 装过的表盘（设备上的表盘无法回读，没有留档就没有可编辑的图层模型）
-    if (invoke && !archivedIds.current[dial.id]) {
+    //    视频作品有自己的本地工程，不受「没有留档」限制
+    if (invoke && !archivedIds.current[dial.id] && !videoProject) {
       showToast("仅支持编辑通过本 APP 安装的表盘", "error");
       return;
     }
@@ -4505,7 +4642,7 @@ export default function App() {
     }
     if (fromRoot) resetStackTo(fromRoot, "dial-edit");
     else pushRoute("dial-edit"); // 进编辑页 = 压一层页面栈
-    void loadDialSession(dial);
+    void loadDialSession(dial, videoProject);
   };
 
   const toggleSection = (section: AccordionSection) => {
@@ -4558,7 +4695,6 @@ export default function App() {
         photos: wallpaperMeta.current.map(p => ({ name: p.name, b64: p.b64, crop: p.crop }))
       }).catch(() => {});
     }
-    showToast("已删除壁纸");
   };
 
   const handleAddWallpaper = () => {
@@ -4573,8 +4709,22 @@ export default function App() {
 
   // ================= 付费表盘：绑定 → 我的表盘 → 安装 =================
 
+  /** 绑定成功后要去哪：默认「我的表盘」；从视频表盘入口进来的话去视频表盘页 */
+  const afterBindRef = useRef<null | "video">(null);
+
   /** 进列表页（从绑定页过来时把栈顶改写成列表页，返回键直接回首页） */
   const goToList = () => {
+    if (afterBindRef.current === "video") {
+      afterBindRef.current = null;
+      setVideoOpenId("");
+      if (currentRoute() === "paid") {
+        navStack.current = [...navStack.current.slice(0, -1), "video"];
+        applyRoute("video");
+      } else {
+        pushRoute("video");
+      }
+      return;
+    }
     if (currentRoute() === "paid") {
       navStack.current = [...navStack.current.slice(0, -1), "paid/dials"];
       applyRoute("paid/dials");
@@ -4640,6 +4790,52 @@ export default function App() {
   /** 绑定态的最新值（openPaidFlow 里要读，避免闭包拿到旧 state） */
   const paidBoundRef = useRef(false);
   paidBoundRef.current = paidBound;
+
+  /**
+   * 首页「视频表盘制作」入口：未绑定爱发电先走绑定页，绑完直接进制作页。
+   * 判据和「安装已购表盘」一致（现场读 paid_status，不看上一帧的 state）。
+   */
+  const openVideoFlow = () => {
+    if (deviceVendor() === "vivo") {
+      showToast("视频表盘仅支持小米设备", "error");
+      return;
+    }
+    const inv = invoke;
+    if (!inv) {
+      // 浏览器预览没有原生桥：直接进页面，方便对界面
+      setVideoOpenId("");
+      pushRoute("video");
+      return;
+    }
+    setPaidError(null);
+    void (async () => {
+      let bound = paidBoundRef.current;
+      try {
+        const st = (await inv("paid_status")) as {
+          bound?: boolean;
+          display?: string;
+          afdian_user_id?: string;
+          afdian_name?: string;
+          mi_user_id?: string;
+        } | null;
+        bound = !!st?.bound;
+        setPaidBound(bound);
+        setPaidDisplay(st?.display ?? null);
+        setPaidAfdianId(st?.afdian_user_id ?? "");
+        setPaidAfdianName(st?.afdian_name ?? "");
+        setMiUserId(st?.mi_user_id ?? "");
+      } catch {
+        /* 状态读不到：按当前界面态走 */
+      }
+      if (bound) {
+        setVideoOpenId("");
+        pushRoute("video");
+        return;
+      }
+      afterBindRef.current = "video";
+      goPaidBindPage();
+    })();
+  };
 
   /** 停掉等待授权的轮询（离开绑定页 / 成功 / 超时都走这里） */
   const stopPaidOauthPoll = () => {
@@ -4903,15 +5099,18 @@ export default function App() {
         showToast("请用新的爱发电账号登录");
         return;
       }
-      showToast("已退出爱发电账号");
       // 在「账号」页退出时不必跳走：那张卡会当场变成「未绑定」
       if (currentRoute() !== "settings/account") goBackOr("main/settings");
     })();
   };
 
-  // 离开绑定页就别再轮询了（成功/超时各自会停）
+  // 离开绑定页就别再轮询了（成功/超时各自会停）；顺手清掉「绑完去视频表盘」的待办，
+  // 否则用户退出绑定页后再从「安装已购表盘」绑定，会被错误地带去视频页。
   useEffect(() => {
-    if (currentStep !== "paid_bind") stopPaidOauthPoll();
+    if (currentStep !== "paid_bind") {
+      stopPaidOauthPoll();
+      afterBindRef.current = null;
+    }
   }, [currentStep]);
 
   /**
@@ -5209,6 +5408,7 @@ export default function App() {
     setInstallStoppable(false);
     setInstallPartial(null);
     setInstallProgress(2);
+    resetInstallEta();
     setProgressPhase("正在下载表盘…");
     if (currentRoute() === "install") setCurrentStep("redeem_installing");
     else pushRoute("install");
@@ -5310,12 +5510,30 @@ export default function App() {
   /**
    * 当前设备品牌。同屏跨品牌（vivo 432×514 与红米 5/6）必须靠它选设备行，
    * 只看屏幕会把 .bin 发给 vivo、把 .rpk 发给小米。
+   * 已连接时以连接地址对应的设备为准，避免 selectedDevice 还是默认小米设备时误判。
    */
-  const deviceVendor = (): "xiaomi" | "vivo" =>
-    selectedDevice.brand === "vivo" ? "vivo" : "xiaomi";
+  const deviceVendor = (): "xiaomi" | "vivo" => {
+    const addr = connected.current.addr;
+    if (isDeviceConnected && addr) {
+      const dev = mockDevicesList.find((d) => d.id === addr);
+      if (dev?.brand === "vivo") return "vivo";
+      if (dev?.brand === "xiaomi") return "xiaomi";
+      if (readVivoDevices().some((v) => v.id === addr)) return "vivo";
+      if (selectedDevice.id === addr && selectedDevice.brand === "vivo") return "vivo";
+    }
+    return selectedDevice.brand === "vivo" ? "vivo" : "xiaomi";
+  };
 
   /** 本机记着的 vivo 设备：账号页「VIVO 设备」卡与各处文案按品牌分流用 */
   const vivoDeviceList = mockDevicesList.filter(d => d.brand === "vivo");
+
+  // 视频页只在小米设备上展示；连接/切到 vivo 时如果还停在视频页，直接退回首页
+  useEffect(() => {
+    if (currentStep === "video_watchface" && deviceVendor() === "vivo") {
+      showToast("视频表盘仅支持小米设备", "error");
+      goBackOr("main/home");
+    }
+  }, [currentStep, isDeviceConnected, selectedDevice.id, selectedDevice.brand, mockDevicesList]);
 
   /** 这个设备行是不是当前品牌的（服务端没给 vendor 时按包体扩展名兜底） */
   const variantMatchesVendor = (v: PaidVariant, vendor: "xiaomi" | "vivo"): boolean => {
@@ -5489,6 +5707,7 @@ export default function App() {
     setInstallStopRequested(false);
     setInstallPartial(null);
     setInstallProgress(2);
+    resetInstallEta();
     setProgressPhase("正在验证授权…");
     if (currentRoute() === "install") setCurrentStep("redeem_installing");
     else pushRoute("install");
@@ -5608,6 +5827,7 @@ export default function App() {
     setInstallStoppable(false);
     setInstallPartial(null);
     setInstallProgress(6);
+    resetInstallEta();
     setProgressPhase(isQuickApp ? "正在校验快应用文件..." : "正在校验表盘文件...");
     // 进安装进度页（与兑换流程同一套页面）：
     // 从确认页进来 = 把确认页换成进度页（成功后「完成」直接回确认页之前那一页）
@@ -5690,7 +5910,7 @@ export default function App() {
   const handleLocalInstall = () => {
     const inv = invoke;
     if (!inv) {
-      showToast("已打开 .bin 表盘文件选择器");
+      showToast("浏览器预览里没有文件选择器", "error");
       return;
     }
     const addr = connected.current.addr;
@@ -6531,7 +6751,7 @@ export default function App() {
 
   return (
     <IconContext.Provider value={{ weight: "bold" }}>
-    <div className="min-h-screen bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
+    <div className="min-h-screen bg-[#F5F6F9] md:bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
       {/* 手机容器：400px 上限只给桌面预览（手机视口比 400 宽时留黑边，见 411dp 的小米机型） */}
       <div className="w-full md:max-w-[400px] h-[100dvh] md:h-[844px] bg-[#F5F6F9] md:rounded-[44px] relative flex flex-col overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.3)]">
         
@@ -6621,7 +6841,6 @@ export default function App() {
                   rel="noopener noreferrer"
                   onClick={(e) => {
                     openLink(e, BEIAN_URL);
-                    showToast("正在打开工信部备案系统…");
                   }}
                   className="inline-flex items-center gap-1 text-[12px] font-medium text-black/35 hover:text-[#4361EE] transition-colors cursor-pointer"
                 >
@@ -6929,7 +7148,6 @@ export default function App() {
                                 try {
                                   const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
                                   applyCloudDevices(devices);
-                                  showToast("已重新拉取小米设备");
                                 } catch (err) {
                                   console.error("[xiaomi_restore] 重新导入失败：", err);
                                   showToast("重新导入失败，请稍后重试", "error");
@@ -6938,7 +7156,6 @@ export default function App() {
                               return;
                             }
                             setMockDevicesList(MOCK_DEVICES);
-                            showToast("已重新拉取小米设备");
                           }}
                           className="h-[44px] px-5 rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold text-[16px] cursor-pointer active:scale-95 transition-all"
                         >
@@ -7085,22 +7302,21 @@ export default function App() {
                         <button
                           type="button"
                           onClick={handleLocalInstall}
-                          className="w-full text-left bg-white rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col"
+                          className="w-full text-left bg-white rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col justify-between min-h-[168px]"
                         >
-                          <div className="w-14 h-14 rounded-2xl bg-[#0C0D0E] text-white flex items-center justify-center mb-6">
-                            <FolderOpen className="w-6 h-6 stroke-[2]" />
-                          </div>
-
-                          <div className="flex items-baseline justify-between w-full">
+                          <div>
                             <h2 className="text-[22px] font-bold text-black tracking-tight leading-tight">
                               本地资源安装
                             </h2>
-                            <CaretRight className="w-6 h-6 text-black/25 group-hover:text-black/45 group-hover:translate-x-0.5 transition-all" />
+                            <p className="text-[13px] font-medium text-black/45 mt-1.5">
+                              选择表盘或者快应用文件
+                            </p>
                           </div>
-
-                          <p className="text-[13px] font-medium text-black/45 mt-1.5">
-                            选择表盘或者快应用文件
-                          </p>
+                          <div className="flex justify-end">
+                            <span className="w-8 h-8 rounded-full bg-black/[0.04] text-black/30 flex items-center justify-center group-hover:bg-black/[0.06] group-hover:translate-x-0.5 transition-all">
+                              <CaretRight className="w-4 h-4" />
+                            </span>
+                          </div>
                         </button>
 
                         <div className="mt-3">
@@ -7110,19 +7326,7 @@ export default function App() {
                             className="w-full flex items-center justify-between px-5 h-[52px] rounded-2xl bg-white active:scale-[0.98] transition-all text-black/80 cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
                           >
                             <div className="flex items-center gap-3">
-                              {/* 极简纯粹的卡券线性图标 */}
-                              <svg
-                                viewBox="0 0 24 24"
-                                className="w-5 h-5 text-[#4361EE]"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                              >
-                                <rect x="3" y="6" width="18" height="12" rx="3" />
-                                <line x1="9" y1="6" x2="9" y2="18" strokeDasharray="2 2" />
-                              </svg>
+                              <Ticket className="w-5 h-5 text-black/40 stroke-[2]" />
                               <span className="text-[16px] font-bold text-black/80">
                                 安装已购表盘
                               </span>
@@ -7145,42 +7349,30 @@ export default function App() {
                         <button
                           type="button"
                           onClick={openPaidFlow}
-                          className="w-full text-left bg-white rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col"
+                          className="relative w-full text-left bg-white rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col justify-between min-h-[168px]"
                         >
-                          <div className="relative w-14 h-14 rounded-2xl bg-[#4361EE] text-white flex items-center justify-center mb-6">
-                            {/* 极简大方、克制的卡券线性图标 */}
-                            <svg
-                              viewBox="0 0 24 24"
-                              className="w-6 h-6 text-white"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            >
-                              <rect x="3" y="6" width="18" height="12" rx="3" />
-                              <line x1="9" y1="6" x2="9" y2="18" strokeDasharray="2 2" />
-                            </svg>
-                            {/* 有可更新的已购表盘 → 角标（点进去就能看到是哪几个） */}
-                            {paidUpdateCount > 0 && (
-                              <span className="absolute -top-1.5 -right-1.5 min-w-[20px] h-5 px-1 rounded-full bg-[#D4973B] text-white text-[12px] font-bold flex items-center justify-center ring-2 ring-white">
-                                {paidUpdateCount}
-                              </span>
-                            )}
-                          </div>
+                          {paidUpdateCount > 0 && (
+                            <span className="absolute right-5 top-5 min-w-[20px] h-5 px-1 rounded-full bg-[#D4973B] text-white text-[12px] font-bold flex items-center justify-center">
+                              {paidUpdateCount}
+                            </span>
+                          )}
 
-                          <div className="flex items-baseline justify-between w-full">
+                          <div>
                             <h2 className="text-[22px] font-bold text-black tracking-tight leading-tight">
                               安装已购表盘
                             </h2>
-                            <CaretRight className="w-6 h-6 text-black/25 group-hover:text-black/45 group-hover:translate-x-0.5 transition-all" />
+                            <p className="text-[13px] font-medium text-black/45 mt-1.5 pr-8">
+                              {paidUpdateCount > 0
+                                ? `有 ${paidUpdateCount} 个表盘可更新`
+                                : "绑定爱发电，同步你买过的表盘"}
+                            </p>
                           </div>
 
-                          <p className="text-[13px] font-medium text-black/45 mt-1.5">
-                            {paidUpdateCount > 0
-                              ? `有 ${paidUpdateCount} 个表盘可更新`
-                              : "绑定爱发电，同步你买过的表盘"}
-                          </p>
+                          <div className="flex justify-end">
+                            <span className="w-8 h-8 rounded-full bg-black/[0.04] text-black/30 flex items-center justify-center group-hover:bg-black/[0.06] group-hover:translate-x-0.5 transition-all">
+                              <CaretRight className="w-4 h-4" />
+                            </span>
+                          </div>
                         </button>
 
                         {/* 本地资源安装次级入口（受开关控制） */}
@@ -7204,6 +7396,25 @@ export default function App() {
                           </div>
                         )}
                       </>
+                    )}
+
+                    {/* 视频表盘：只在小米这边显示；未绑定爱发电先走绑定页 */}
+                    {deviceVendor() !== "vivo" && (
+                      <button
+                        type="button"
+                        onClick={openVideoFlow}
+                        className="mt-3 w-full flex items-center justify-between px-5 h-[52px] rounded-2xl bg-white active:scale-[0.98] transition-all text-black/80 cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                      >
+                        <div className="flex items-center gap-3">
+                          <VideoCamera className="w-5 h-5 text-black/40 stroke-[2]" />
+                          <span className="text-[16px] font-bold text-black/80">
+                            制作视频表盘
+                          </span>
+                        </div>
+                        <span className="text-[13px] font-medium text-black/40">
+                          上传视频生成
+                        </span>
+                      </button>
                     )}
                   </div>
                 </div>
@@ -7497,7 +7708,6 @@ export default function App() {
                             if (invoke && connected.current.addr) {
                               void refreshDials(connected.current.addr);
                             }
-                            showToast("已重新拉取手环表盘");
                           }}
                           className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] cursor-pointer active:scale-95 transition-all"
                         >
@@ -7559,6 +7769,10 @@ export default function App() {
                                   <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-[12px] font-bold text-[#4361EE]">
                                     <span className="w-1.5 h-1.5 rounded-full bg-[#4361EE]" />
                                     使用中
+                                  </span>
+                                ) : videoDialProjects[dial.id] ? (
+                                  <span className="whitespace-nowrap text-[12px] font-bold px-2 py-0.5 bg-[#4361EE]/10 text-[#4361EE] rounded-full">
+                                    视频
                                   </span>
                                 ) : dial.isPhotoDial ? (
                                   <span className="whitespace-nowrap text-[12px] font-bold px-2 py-0.5 bg-black/5 text-black/40 rounded-full">
@@ -7727,7 +7941,6 @@ export default function App() {
                               setIsPrimaryLocal(false);
                               storeFlag("panfang.primaryLocal", false);
                             }
-                            showToast(next ? "已开启本地资源安装入口" : "已隐藏本地资源安装入口");
                           }}
                           className={`w-[52px] h-[30px] rounded-full p-1 transition-colors duration-200 cursor-pointer flex items-center shrink-0 ${
                             enableLocalInstall ? "bg-[#34C759]" : "bg-black/10"
@@ -7758,7 +7971,6 @@ export default function App() {
                             onClick={() => {
                               setIsPrimaryLocal(!isPrimaryLocal);
                               storeFlag("panfang.primaryLocal", !isPrimaryLocal);
-                              showToast(`已设「${!isPrimaryLocal ? "本地资源安装" : "安装已购表盘"}」为主卡片`);
                             }}
                             className="flex items-center gap-1.5 px-3.5 h-[32px] rounded-full bg-black/5 hover:bg-black/10 active:bg-black/15 text-black font-bold text-[13px] cursor-pointer transition-all active:scale-95 shrink-0"
                           >
@@ -7859,7 +8071,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.3.98"}
+                      盘坊 v{appVersion ?? "0.3.99"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -7868,7 +8080,6 @@ export default function App() {
                       rel="noopener noreferrer"
                       onClick={(e) => {
                         openLink(e, BEIAN_URL);
-                        showToast("正在打开工信部备案系统…");
                       }}
                       className="inline-block mt-1.5 text-[12px] font-medium text-black/30 hover:text-[#4361EE] transition-colors cursor-pointer"
                     >
@@ -8099,6 +8310,36 @@ export default function App() {
                     <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
                   </button>
 
+                  {/* vivo 绑定状态：型号/固件、绑到哪台手机、上次成功通道（失败静默，不占页面） */}
+                  {deviceVendor() === "vivo" && (vivoBindState || vivoDeviceInfo) && (
+                    <div className="px-5 py-3.5 space-y-1.5">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-[13px] font-medium text-black/40">型号 / 固件</span>
+                        <span className="text-[13px] font-bold text-black/70 text-right truncate">
+                          {[vivoDeviceInfo?.model, vivoDeviceInfo?.firmwareVersion]
+                            .filter(Boolean)
+                            .join("，") || "—"}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-[13px] font-medium text-black/40">绑定状态</span>
+                        <span className="text-[13px] font-bold text-black/70 text-right">
+                          {vivoBindState?.label || "未知"}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-[13px] font-medium text-black/40">连接通道</span>
+                        <span className="text-[13px] font-bold text-black/70 text-right">
+                          {vivoBindState?.channel === "ble"
+                            ? "BLE"
+                            : vivoBindState?.channel === "spp"
+                              ? "SPP"
+                              : "—"}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
                   {/* 重新导入设备：与设备抽屉里的「重新导入小米设备」同一口径。
                       小米账号专属 —— 没登录就不出现，vivo 用户不需要它。 */}
                   {userProfile.nickname && (
@@ -8112,7 +8353,6 @@ export default function App() {
                               const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
                               applyCloudDevices(devices);
                               openDeviceDrawer();
-                              showToast("已重新导入小米设备");
                             } catch (err) {
                               console.error("[xiaomi_restore] 重新导入失败：", err);
                               showToast("重新导入失败，请稍后重试", "error");
@@ -8122,7 +8362,6 @@ export default function App() {
                         }
                         setMockDevicesList(MOCK_DEVICES);
                         openDeviceDrawer();
-                        showToast("已重新导入小米设备");
                       }}
                       className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
                     >
@@ -8314,7 +8553,6 @@ export default function App() {
                       type="button"
                       onClick={(e) => {
                         openLink(e, paidShopUrl || "https://afdian.com/a/Hobjl");
-                        showToast("正在前往爱发电…");
                       }}
                       className="text-[13px] font-bold text-black/45 hover:text-black/70 transition-colors cursor-pointer"
                     >
@@ -8322,13 +8560,21 @@ export default function App() {
                     </button>
                   </div>
                   {/* 找开发者之前先把「版本 + 机型 + 最近问题」复制好：省掉来回问现象 */}
-                  <div className="flex justify-center mt-3">
+                  <div className="flex justify-center items-center gap-4 mt-3">
                     <button
                       type="button"
                       onClick={() => void copyDiag()}
                       className="text-[13px] font-bold text-[#4361EE]/80 hover:text-[#4361EE] transition-colors cursor-pointer"
                     >
                       复制诊断信息
+                    </button>
+                    <button
+                      type="button"
+                      disabled={diagBusy}
+                      onClick={() => void exportDiag()}
+                      className="text-[13px] font-bold text-[#4361EE]/80 hover:text-[#4361EE] transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      {diagBusy ? "正在导出…" : "导出诊断包"}
                     </button>
                   </div>
                   {diagText && (
@@ -9137,39 +9383,61 @@ export default function App() {
                   />
                 </div>
 
+                {/* 剩余时间：按最近十几秒的实测速率外推。样本不够就先不显示，别给个假数字 */}
+                {!installError && installEtaSec != null && installProgress < 100 && (
+                  <p className="text-[13px] font-medium text-black/40 mt-3 tabular-nums">
+                    预计还需 {formatEta(installEtaSec)}
+                  </p>
+                )}
+
                 {/* C4. 错误态样例 3：安装失败行内错误提示 */}
                 {installError ? (
                   <div className="flex flex-col items-center mt-6">
                     <p className="text-[13px] text-[#FF3B30] font-bold text-center">
                       {installError}
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        // 本地安装失败：用同一份文件字节重跑
-                        const pending = localInstall.current;
-                        if (installSource === "local" && pending) {
-                          runLocalInstall({ ...pending, name: dialName });
-                          return;
-                        }
-                        // 付费安装失败：重新走「认证 → 下载 → 传输」（装上次勾的那几个包体）
-                        const paid = paidTarget.current;
-                        if (installSource === "paid" && paid) {
-                          startPaidInstall(paid.product, paid.variant, paid.fileIds);
-                          return;
-                        }
-                        // 集市安装失败：同一个表盘重走「下载 → 传输」
-                        const market = marketTarget.current;
-                        if (installSource === "market" && market) {
-                          startMarketInstall(market.face);
-                          return;
-                        }
-                        setInstallError(null);
-                      }}
-                      className="mt-3 h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all"
-                    >
-                      重试安装
-                    </button>
+                    {installError.includes("安装未确认") && (
+                      <p className="text-[12px] text-black/40 font-medium text-center mt-2 max-w-[280px]">
+                        重试会先删除手表上的半成品表盘，再重新安装
+                      </p>
+                    )}
+                    <div className="flex items-center gap-3 mt-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // 本地安装失败：用同一份文件字节重跑
+                          const pending = localInstall.current;
+                          if (installSource === "local" && pending) {
+                            runLocalInstall({ ...pending, name: dialName });
+                            return;
+                          }
+                          // 付费安装失败：重新走「认证 → 下载 → 传输」（装上次勾的那几个包体）
+                          const paid = paidTarget.current;
+                          if (installSource === "paid" && paid) {
+                            startPaidInstall(paid.product, paid.variant, paid.fileIds);
+                            return;
+                          }
+                          // 集市安装失败：同一个表盘重走「下载 → 传输」
+                          const market = marketTarget.current;
+                          if (installSource === "market" && market) {
+                            startMarketInstall(market.face);
+                            return;
+                          }
+                          setInstallError(null);
+                        }}
+                        className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all"
+                      >
+                        重试安装
+                      </button>
+                      <button
+                        type="button"
+                        disabled={diagBusy}
+                        onClick={() => void exportDiag()}
+                        className="h-[44px] px-5 rounded-full bg-[#4361EE]/10 hover:bg-[#4361EE]/15 text-[#4361EE] font-bold text-[13px] active:scale-95 transition-all disabled:opacity-50"
+                      >
+                        {diagBusy ? "正在导出…" : "导出诊断"}
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="flex flex-col items-center gap-1 mt-3">
@@ -9517,8 +9785,27 @@ export default function App() {
                 {/* 2. 手风琴式展开配置区（收紧版间距） */}
                 <div className="flex flex-col gap-2.5">
                   
-                  {/* 壁纸卡片（仅照片表盘显示，支持 10+ 张正方形预览与快捷点击切换） */}
-                  {editingDial.isPhotoDial && (
+                  {/* 视频表盘：图片区换成「视频表盘编辑」入口（打开作品详情） */}
+                  {editingVideoProject ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setVideoOpenId(editingVideoProject.id);
+                        pushRoute("video");
+                      }}
+                      className="w-full text-left bg-white rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex items-center justify-between active:scale-[0.99] transition-all cursor-pointer"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-[16px] font-bold text-black tracking-tight">
+                          视频表盘编辑
+                        </div>
+                        <p className="text-[13px] font-medium text-black/40 mt-1 truncate">
+                          {editingVideoProject.title || "视频表盘"}
+                        </p>
+                      </div>
+                      <CaretRight className="w-5 h-5 text-black/25 shrink-0" />
+                    </button>
+                  ) : editingDial.isPhotoDial && (
                     <div className="bg-white rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex flex-col gap-2.5">
                       <div className="flex items-center justify-between">
                         <span className="text-[16px] font-bold text-black tracking-tight">
@@ -9558,10 +9845,7 @@ export default function App() {
                           {dialDefaultPhoto ? (
                             <button
                               type="button"
-                              onClick={() => {
-                                setCurrentWallpaperIndex(-1);
-                                showToast("已切换至默认照片");
-                              }}
+                              onClick={() => setCurrentWallpaperIndex(-1)}
                               title="表盘自带的默认照片"
                               className={`relative w-15 h-15 rounded-xl overflow-hidden shrink-0 transition-all cursor-pointer active:scale-95 ${
                                 currentWallpaperIndex === -1
@@ -9595,10 +9879,7 @@ export default function App() {
                               <button
                                 key={idx}
                                 type="button"
-                                onClick={() => {
-                                  setCurrentWallpaperIndex(idx);
-                                  showToast(`已切换至壁纸第 ${idx + 1} 张`);
-                                }}
+                                onClick={() => setCurrentWallpaperIndex(idx)}
                                 className={`relative w-15 h-15 rounded-xl overflow-hidden shrink-0 transition-all cursor-pointer active:scale-95 group ${
                                   isSelected
                                     ? "ring-2 ring-[#4361EE]"
@@ -10325,6 +10606,29 @@ export default function App() {
             );
           })()}
 
+          {/* 视频表盘：只给小米设备；vivo 连接时整页不渲染，入口也由 deviceVendor 拦住 */}
+          {currentStep === "video_watchface" && deviceVendor() !== "vivo" && (
+            <VideoWatchface
+              onBack={() => goBackOr("main/home")}
+              deviceAddr={selectedDevice.id}
+              deviceName={selectedDevice.name}
+              deviceModel={connected.current.model || selectedDevice.model || ""}
+              deviceConnected={isDeviceConnected}
+              initialProjectId={videoOpenId || undefined}
+              backGuardRef={videoBackGuardRef}
+              onInternalDepthChange={(delta) => {
+                navDepth.current = Math.max(0, navDepth.current + delta);
+              }}
+              onInstallPayload={runLocalInstall}
+              onInstalled={() => {
+                const addr = connected.current.addr;
+                if (addr) void refreshDials(addr);
+              }}
+              onOpenPaid={openPaidFlow}
+              showToast={showToast}
+            />
+          )}
+
           {/* 8. 关于应用主页（一级页面，简约清晰） */}
           {currentStep === "about_app" && (
             <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top pb-8 page-enter-anim select-none">
@@ -10364,7 +10668,6 @@ export default function App() {
                     rel="noopener noreferrer"
                     onClick={(e) => {
                       openLink(e, "https://github.com/Hobjl-lian/panfang");
-                      showToast("正在前往 GitHub 源码仓库...");
                     }}
                     className="inline-flex items-center gap-1.5 text-[13px] font-medium text-black/50 hover:text-[#4361EE] transition-colors group cursor-pointer"
                   >
@@ -10396,7 +10699,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.98"}`}
+                            : `当前版本 v${appVersion ?? "0.3.99"}`}
                         </p>
                       </div>
                     </div>
@@ -10454,7 +10757,6 @@ export default function App() {
                     type="button"
                     onClick={(e) => {
                       openLink(e, `${LEGAL_BASE}/privacy`);
-                      showToast("正在打开隐私政策…");
                     }}
                     className="w-full p-4.5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
                   >
@@ -10479,7 +10781,6 @@ export default function App() {
                     type="button"
                     onClick={(e) => {
                       openLink(e, `${LEGAL_BASE}/terms`);
-                      showToast("正在打开用户协议…");
                     }}
                     className="w-full p-4.5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
                   >
@@ -10509,7 +10810,6 @@ export default function App() {
                   rel="noopener noreferrer"
                   onClick={(e) => {
                     openLink(e, BEIAN_URL);
-                    showToast("正在打开工信部备案系统…");
                   }}
                   className="inline-flex items-center gap-1 text-[12px] font-medium text-black/30 hover:text-[#4361EE] transition-colors cursor-pointer"
                 >
@@ -10576,7 +10876,6 @@ export default function App() {
                   rel="noopener noreferrer"
                   onClick={(e) => {
                     openLink(e, "https://afdian.com/a/Hobjl?utm_source=copylink&utm_medium=link");
-                    showToast("正在前往爱发电平台...");
                   }}
                   className="w-full h-[52px] rounded-full bg-[#4361EE] hover:bg-[#3853db] text-white font-bold text-[17px] active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer shadow-[0_8px_24px_rgba(0,0,0,0.10)] tracking-tight"
                 >
@@ -10584,13 +10883,21 @@ export default function App() {
                   <ArrowSquareOut className="w-5 h-5 stroke-[2]" />
                 </a>
                 {/* 找开发者时先把「版本 + 机型 + 最近问题」带上（比描述现象有用得多） */}
-                <div className="flex justify-center mt-4">
+                <div className="flex justify-center items-center gap-4 mt-4">
                   <button
                     type="button"
                     onClick={() => void copyDiag()}
                     className="text-[13px] font-bold text-black/45 hover:text-black/70 transition-colors cursor-pointer"
                   >
                     复制诊断信息
+                  </button>
+                  <button
+                    type="button"
+                    disabled={diagBusy}
+                    onClick={() => void exportDiag()}
+                    className="text-[13px] font-bold text-black/45 hover:text-black/70 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {diagBusy ? "正在导出…" : "导出诊断包"}
                   </button>
                 </div>
                 {diagText && (
@@ -10654,7 +10961,6 @@ export default function App() {
                           rel="noopener noreferrer"
                           onClick={(e) => {
                             openLink(e, "https://github.com/AstralSightStudios/AstroBox-NG");
-                            showToast("正在前往 AstroBox-NG 仓库...");
                           }}
                           className="font-medium text-[#4361EE] break-all inline-flex items-center gap-1 hover:underline"
                         >
@@ -10950,7 +11256,6 @@ export default function App() {
                             if (addr) await refreshDials(addr);
                             const devices = (await invoke("xiaomi_restore")) as CloudDevice[] | null;
                             applyCloudDevices(devices);
-                            showToast("已重新拉取小米设备列表");
                           } catch (err) {
                             console.error("[xiaomi_restore] 重新导入失败：", err);
                             showToast("重新导入失败，请稍后重试", "error");
@@ -10960,7 +11265,6 @@ export default function App() {
                       }
                       // 浏览器预览：把演示列表恢复原样（删除过的设备一并回来）
                       setMockDevicesList(MOCK_DEVICES);
-                      showToast("已重新拉取小米设备列表");
                     }}
                     className="w-full h-[44px] rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
                   >

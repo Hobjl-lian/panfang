@@ -1,6 +1,7 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <!-- Base application theme. -->
     <style name="Theme.wf_installer" parent="Theme.Material3.DayNight.NoActionBar">
-        <!-- Customize your theme here. -->
+        <!-- 键盘弹起 / WebView 缩高时露出的是浅色页面底，不要系统默认的黑 -->
+        <item name="android:windowBackground">#F5F6F9</item>
     </style>
 </resources>

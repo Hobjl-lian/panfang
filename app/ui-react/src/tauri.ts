@@ -617,6 +617,8 @@ export interface AppUpdateCheck {
   notes?: string;
   size?: number;
   sha256?: string;
+  /** 灰度版：启动检查不弹窗，只有用户手动「检查更新」才提示 */
+  silent?: boolean;
 }
 
 /** 问服务端有没有新版本（不下载）。浏览器预览 / 桌面不可用时抛错。 */

@@ -134,6 +134,7 @@ pub async fn app_update_check(
     out["notes"] = d["notes"].clone();
     out["size"] = d["size"].clone();
     out["sha256"] = d["sha256"].clone();
+    out["silent"] = json!(d["silent"].as_bool().unwrap_or(false));
     Ok(out)
 }
 

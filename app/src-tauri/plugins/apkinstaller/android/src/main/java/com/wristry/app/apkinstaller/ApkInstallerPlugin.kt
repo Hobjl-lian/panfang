@@ -12,11 +12,24 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStreamReader
 
 @InvokeArg
 class InstallArg {
     lateinit var path: String
+}
+
+@InvokeArg
+class ShareArg {
+    lateinit var path: String
+    var mime: String = "application/zip"
+}
+
+@InvokeArg
+class LogcatArg {
+    var lines: Int = 2000
 }
 
 /**
@@ -70,6 +83,59 @@ class ApkInstallerPlugin(private val activity: Activity) : Plugin(activity) {
         val ret = JSObject()
         ret.put("path", activity.cacheDir.absolutePath)
         invoke.resolve(ret)
+    }
+
+    /** 诊断导出：抓本应用 tag 的 logcat 尾部（读不到就返回空串，不当作失败）。 */
+    @Command
+    fun readLogcat(invoke: Invoke) {
+        val args = invoke.parseArgs(LogcatArg::class.java)
+        val lines = if (args.lines in 100..20000) args.lines else 2000
+        val text = try {
+            val proc = Runtime.getRuntime().exec(
+                arrayOf("logcat", "-d", "-t", lines.toString(), "-s", "WFInstaller:*"),
+            )
+            val out = BufferedReader(InputStreamReader(proc.inputStream)).use { it.readText() }
+            proc.waitFor()
+            out
+        } catch (_: Exception) {
+            ""
+        }
+        val ret = JSObject()
+        ret.put("text", text)
+        invoke.resolve(ret)
+    }
+
+    /** 分享诊断包：先复制进内部 cacheDir 再走 FileProvider（外部 cache 不在白名单）。 */
+    @Command
+    fun shareFile(invoke: Invoke) {
+        val args = invoke.parseArgs(ShareArg::class.java)
+        try {
+            val src = File(args.path)
+            if (!src.exists() || src.length() <= 0) {
+                invoke.reject("FILE_NOT_FOUND", "要分享的文件不存在")
+                return
+            }
+            val dir = File(activity.cacheDir, "diag")
+            if (!dir.exists()) dir.mkdirs()
+            val dst = File(dir, src.name)
+            src.copyTo(dst, overwrite = true)
+            val uri = FileProvider.getUriForFile(
+                activity,
+                "${activity.packageName}.fileprovider",
+                dst,
+            )
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = args.mime.ifEmpty { "application/zip" }
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            activity.runOnUiThread {
+                activity.startActivity(Intent.createChooser(send, "分享诊断包"))
+            }
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject("SHARE_FAILED", e.message ?: "分享失败")
+        }
     }
 
     @Command
