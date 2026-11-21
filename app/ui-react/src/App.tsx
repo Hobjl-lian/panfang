@@ -8096,7 +8096,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.4.1"}
+                      盘坊 v{appVersion ?? "0.4.2"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -10724,7 +10724,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.4.1"}`}
+                            : `当前版本 v${appVersion ?? "0.4.2"}`}
                         </p>
                       </div>
                     </div>
@@ -11530,30 +11530,20 @@ export default function App() {
         {videoNoticeOpen && currentStep === "video_watchface" && (
           <div className="absolute inset-0 z-[90] bg-black/40 flex items-center justify-center p-6 animate-in fade-in duration-200">
             <div
-              className="bg-white w-full max-w-[330px] rounded-3xl overflow-hidden shadow-[0_10px_30px_rgba(0,0,0,0.14)] border border-black/5 text-center"
+              className="bg-white w-full max-w-[330px] rounded-3xl overflow-hidden shadow-[0_10px_30px_rgba(0,0,0,0.14)] border border-black/5 text-left"
               onClick={(e) => e.stopPropagation()}
             >
-              <div className="pt-6 px-6 pb-4">
+              <div className="pt-6 px-6 pb-5">
                 <h3 className="text-[17px] font-bold text-black tracking-tight">动态表盘使用说明</h3>
-                <p className="text-[12.5px] text-black/45 font-medium mt-1.5 leading-relaxed">
-                  动态表盘会持续占用更多手表性能，建议这样设置：
-                </p>
-                <div className="mt-3 rounded-2xl bg-black/[0.03] px-4 py-3 text-left flex flex-col gap-1.5">
-                  <p className="text-[13px] font-semibold text-black/70">1. 推荐视频时长不超过 3 秒</p>
-                  <p className="text-[13px] font-semibold text-black/70">2. 优先选择「省电」或「标准」档</p>
-                  <p className="text-[13px] font-semibold text-black/70">3. 播放方式选择「播放 1 次」</p>
+                <div className="mt-3 space-y-1.5 text-[13px] font-medium text-black/50 leading-relaxed">
+                  <p>1. 视频不超过 3 秒</p>
+                  <p>2. 优先选择「省电」或「标准」档</p>
+                  <p>3. 播放方式选择「播放 1 次」</p>
                 </div>
-                <div className="mt-3 text-left">
-                  <p className="text-[12px] font-bold text-[#D4973B]">不按推荐设置，可能出现：</p>
-                  <ul className="mt-1 pl-4 list-disc text-[12px] font-medium text-black/50 leading-relaxed space-y-0.5">
-                    <li>手表耗电加快</li>
-                    <li>表盘界面滑动卡顿</li>
-                    <li>在表盘界面，或同时安装了占用内存较多的快应用时，可能触发手环重启</li>
-                  </ul>
+                <div className="mt-4 space-y-1.5 text-[13px] font-medium text-black/50 leading-relaxed">
+                  <p>不按推荐设置，可能耗电加快、滑动卡顿。</p>
+                  <p>在表盘界面，或同时开了占内存较多的快应用时，手环可能重启；重启只释放内存，不会损坏表盘或固件。</p>
                 </div>
-                <p className="mt-3 text-[11.5px] font-medium text-black/35 leading-relaxed text-left">
-                  动态表盘性能占用更高，运存不足时手环会通过重启释放内存；重启不会损坏已安装的表盘或手表固件，恢复后即可继续使用。
-                </p>
               </div>
               <button
                 type="button"
