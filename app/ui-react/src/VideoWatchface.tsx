@@ -16,6 +16,7 @@ import {
   DeviceMobile,
   FilmStrip,
   LockSimple,
+  Palette,
   Pause,
   Play,
   Plus,
@@ -26,6 +27,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import {
+  b64ToBytes,
   bytesToB64,
   frameSizeFor,
   invoke,
@@ -39,9 +41,12 @@ const API_BASE = "https://api.hobjl-shop.top";
 const MAX_VIDEO_BYTES = 80 * 1024 * 1024;
 /**
  * 流畅度档位：用户选的是「看起来多顺」，帧数由帧率 × 片段时长自动算。
- * 「丝滑」按 180 帧封顶（5 秒片段约 36 帧/秒），避免直接顶到 25MB 上限。
+ * 「省电」12fps、最多 60 帧（官方普通版序列帧上限，5 秒=12fps，功耗 2 级）；
+ * 手环 8 Pro（M67）官方上限 30 帧，取 30。
+ * 「丝滑」按 180 帧封顶（5 秒片段约 36 帧/秒），避免直接顶到成品上限。
  */
 const QUALITY_LEVELS = [
+  { key: "eco", label: "省电", fps: 12, maxFrames: 60 },
   { key: "standard", label: "标准", fps: 24, maxFrames: 300 },
   { key: "smooth", label: "流畅", fps: 30, maxFrames: 300 },
   { key: "silky", label: "丝滑", fps: 45, maxFrames: 180 },
@@ -52,14 +57,26 @@ const JOB_SEEN_KEY = "pf_video_job_seen_v1";
 /** 轨道序列帧格数：放大后按新视野重新取帧，不是把旧图拉大 */
 const THUMB_TILES = 16;
 
+type FrameColor = {
+  i: number;
+  name: string;
+  swatch: string;
+};
+
 type Style = {
   id: string;
   name: string;
   device_type: string;
   canvas_w: number;
   canvas_h: number;
+  /** 成品体积上限（服务端按画布分档下发；旧服务端没有时按画布兜底） */
+  max_bin?: number;
   frame_count: number;
   preview_url: string;
+  /** 透明布局叠层（时间/日期等前景层，视频和背景之外） */
+  overlay_url?: string;
+  has_frame?: boolean;
+  frame_colors?: FrameColor[];
 };
 
 type Template = {
@@ -88,6 +105,8 @@ type Project = {
   frame_count?: number;
   fps?: number;
   mode?: string;
+  frame_color?: string;
+  frame_colors?: FrameColor[];
   watchface_id?: string;
   watchface_ids?: string[];
   job_id?: string;
@@ -162,6 +181,14 @@ function previewSrc(p: { preview_b64?: string; preview_url?: string }): string {
   return "";
 }
 
+/** 缩略图按画布比例：高度固定，宽度随画布宽高比（212 细长、432 偏方）；未知画布回退 336×480 */
+function thumbBox(cw?: number, ch?: number, h = 56): { width: string; height: string } {
+  const w = cw && ch ? cw : 336;
+  const hh = cw && ch ? ch : 480;
+  const width = Math.max(16, Math.round((h * w) / hh));
+  return { width: `${width}px`, height: `${h}px` };
+}
+
 function fmtDate(ts?: number): string {
   if (!ts) return "";
   const d = new Date(ts * 1000);
@@ -195,8 +222,10 @@ function statusLabel(s?: string): string {
 /** 服务端/worker 的原始错误 → 用户能看懂的下一步 */
 function friendlyJobError(err?: string): string {
   const s = String(err || "");
-  if (/2[05]\s*MB/i.test(s)) {
-    return "成品超过 25MB 上限，请把流畅度调低一档，或缩短视频后重试。";
+  // 只改写成品超限；帧包超限（80MB）保持原话，别误导成成品问题。
+  // 不向用户报具体体积/上限数字：他们看不懂，也反馈不了怎么减。
+  if (/成品[^0-9]{0,8}\d+\s*MB/i.test(s) || /成品超过.{0,12}上限/.test(s)) {
+    return "成品超出本机型的安装上限，请把流畅度调低一档，或缩短视频后重试。";
   }
   return s || "这次没有制作成功，请稍后重试。";
 }
@@ -374,6 +403,8 @@ export default function VideoWatchface({
 }: Props) {
   const [screen, setScreen] = useState<Screen>(initialProjectId ? "project" : "home");
   const [projects, setProjects] = useState<Project[]>([]);
+  /** style_id → 布局叠层 URL（历史/详情预览用） */
+  const [overlayByStyle, setOverlayByStyle] = useState<Record<string, string>>({});
   /** projectId → jobId:status。进过历史记录页的结果不再在入口卡上提示 */
   const [seenJobs, setSeenJobs] = useState<Record<string, string>>(() => {
     try {
@@ -394,6 +425,10 @@ export default function VideoWatchface({
   const [template, setTemplate] = useState<Template | null>(null);
   const [projectId, setProjectId] = useState("");
   const [project, setProject] = useState<Project | null>(null);
+  /** 模板相框：当前样式可选的配色 + 选中的色号 + 叠在预览上的 PNG */
+  const [frameColors, setFrameColors] = useState<FrameColor[]>([]);
+  const [frameColor, setFrameColor] = useState("");
+  const [framePreviewUrl, setFramePreviewUrl] = useState("");
 
   const [videoUrl, setVideoUrl] = useState("");
   const [videoName, setVideoName] = useState("");
@@ -410,7 +445,7 @@ export default function VideoWatchface({
   const [customCount, setCustomCount] = useState("");
   /** 自定义帧数输入框是否展开（和内容是否为空分开：清空不能把输入框卸载） */
   const [customOpen, setCustomOpen] = useState(false);
-  const [mode, setMode] = useState<"loop" | "once">("loop");
+  const [mode, setMode] = useState<"loop" | "once">("once");
   const [playing, setPlaying] = useState(false);
   /** 播放头（秒）：进度条与轨道上的白线共用 */
   const [playhead, setPlayhead] = useState(0);
@@ -422,7 +457,11 @@ export default function VideoWatchface({
 
   const [busy, setBusy] = useState("");
   const [progress, setProgress] = useState(0);
-  const [job, setJob] = useState<{ id: string; status: string; error?: string } | null>(null);
+  const [job, setJob] = useState<{
+    id: string;
+    status: string;
+    error?: string;
+  } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   /** 清理表盘文件前确认：删掉后编辑页读不到成品 bin，作品就不能继续编辑了 */
   const [clearBinAsk, setClearBinAsk] = useState(false);
@@ -433,6 +472,7 @@ export default function VideoWatchface({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const cropRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const frameUrlRef = useRef("");
   const dragRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
   const fetchedRef = useRef(false);
   const videoUrlRef = useRef("");
@@ -558,6 +598,8 @@ export default function VideoWatchface({
 
   const cw = style?.canvas_w || 336;
   const ch = style?.canvas_h || 480;
+  // 布局叠层：和视频预览同尺寸的透明前景层（时间/日期等），由 worker 从模板渲染
+  const overlayUrl = style?.overlay_url ? `${API_BASE}${style.overlay_url}` : "";
   const clipLen = Math.max(0, trimEnd - trimStart);
   const fps = clipLen > 0 ? count / clipLen : 0;
   const fpsBad = fps > 60.001 || (clipLen > 0 && fps < 0.999);
@@ -568,9 +610,11 @@ export default function VideoWatchface({
   /** 某一档在给定时长下对应的总帧数（不超过档位上限，也不超过 60fps） */
   const framesForQuality = (key: Exclude<QualityKey, "custom">, len: number) => {
     const level = QUALITY_LEVELS.find((l) => l.key === key) || QUALITY_LEVELS[0];
+    // 官方 8 Pro（M67）的序列帧硬上限是 30，省电档也要按设备收口
+    const cap = key === "eco" && style?.device_type === "M67" ? 30 : level.maxFrames;
     return Math.max(
       1,
-      Math.min(300, Math.floor(Math.max(len, 0) * 60), level.maxFrames, Math.round(level.fps * Math.max(len, 0)))
+      Math.min(300, Math.floor(Math.max(len, 0) * 60), cap, Math.round(level.fps * Math.max(len, 0)))
     );
   };
 
@@ -601,7 +645,7 @@ export default function VideoWatchface({
 
   // ---------------------------------------------------------------- 项目/模板
 
-  const loadProjects = useCallback(async () => {
+  const loadProjects = useCallback(async (silent = false) => {
     if (!invoke) {
       setLoadingProjects(false);
       return [];
@@ -612,12 +656,27 @@ export default function VideoWatchface({
       setProjects(items);
       return items;
     } catch (e) {
-      toastRef.current(String(e), "error");
+      // 轮询补下载时不弹 toast，避免断网期间每轮都刷一条
+      if (!silent) toastRef.current(String(e), "error");
       return [];
     } finally {
       setLoadingProjects(false);
     }
   }, []);
+
+  /** 服务端已 done 但本地没有 bin（断网/清理过）时手动补下载 */
+  const refetchBin = async (p: Project) => {
+    if (!invoke) return;
+    try {
+      await invoke("video_job_fetch", { projectId: p.id });
+      const items = await loadProjects();
+      const hit = (items || []).find((x) => x.id === p.id);
+      if (hit) setProject(hit);
+      showToast("成品已重新下载");
+    } catch (e) {
+      showToast(String(e), "error");
+    }
+  };
 
   const loadTemplates = useCallback(async () => {
     if (!invoke) return;
@@ -667,15 +726,18 @@ export default function VideoWatchface({
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [screen, loadTemplates]);
 
-  // 首页：把「排队中/制作中」的任务补问一次；有任务在跑时每 4 秒刷新一次入口卡状态。
+  // 首页：补问排队/制作中的任务；已完成但本地没 bin 的也继续补下载（4s→10s→30s 退避）。
   useEffect(() => {
     const inv = invoke;
     if (screen !== "home" || !inv) return;
     let alive = true;
     let timer: number | undefined;
+    let fails = 0;
+    const nextDelay = () => [4000, 10000, 30000][Math.min(fails, 2)];
     const tick = async () => {
-      const items = await loadProjects();
+      const items = await loadProjects(true);
       if (!alive) return;
+      let ok = true;
       for (const p of items) {
         const active = ["queued", "running"].includes(p.job_status || "");
         const doneNoBin = p.job_status === "done" && !p.has_bin;
@@ -686,57 +748,115 @@ export default function VideoWatchface({
           if (st === "done") await inv("video_job_fetch", { projectId: p.id });
           if (!alive) return;
         } catch {
-          /* 网络抖动：下次再问 */
+          ok = false;
         }
       }
       if (!alive) return;
-      const fresh = await loadProjects();
-      if (alive && fresh.some((p) => ["queued", "running"].includes(p.job_status || ""))) {
-        timer = window.setTimeout(tick, 4000);
-      }
+      fails = ok ? 0 : fails + 1;
+      const fresh = await loadProjects(true);
+      if (!alive) return;
+      const need = fresh.some(
+        (p) =>
+          ["queued", "running"].includes(p.job_status || "") ||
+          (p.job_status === "done" && !p.has_bin)
+      );
+      if (need) timer = window.setTimeout(tick, nextDelay());
     };
+    const onVis = () => {
+      if (document.visibilityState !== "visible") return;
+      if (timer) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+      void tick();
+    };
+    document.addEventListener("visibilitychange", onVis);
     void tick();
     return () => {
       alive = false;
+      document.removeEventListener("visibilitychange", onVis);
       if (timer) window.clearTimeout(timer);
     };
   }, [screen, loadProjects]);
 
-  // 历史记录页：每 4 秒问一次进行中、以及「已完成但还没下下来」的任务
-  // （后者超过服务端保留期后会被判过期，必须在列表里如实标出来）
+  // 历史/详情预览叠层：进页面时建 style_id → overlay_url 映射（老作品也能显示时间层）
+  useEffect(() => {
+    const inv = invoke;
+    if (!inv || (screen !== "projects" && screen !== "project")) return;
+    let alive = true;
+    (async () => {
+      try {
+        const v = (await inv("video_templates")) as any;
+        const map: Record<string, string> = {};
+        for (const t of v?.items || []) {
+          for (const s of t.styles || []) {
+            if (s?.id && s?.overlay_url) map[s.id] = s.overlay_url;
+          }
+        }
+        if (alive) setOverlayByStyle(map);
+      } catch {
+        /* 离线/未登录：不叠层 */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [screen, invoke]);
+
+  // 历史记录页：每 4 秒问一次进行中、以及「已完成但还没下下来」的任务。
+  // 补下载失败按 4s→10s→30s 退避，回到前台立刻再试；成功后 has_bin 会刷新。
   useEffect(() => {
     const inv = invoke;
     if (screen !== "projects" || !inv) return;
     let alive = true;
     let timer: number | undefined;
-    const triedFetch = new Set<string>();
+    let inflight = false;
+    let fails = 0;
+    const nextDelay = () => [4000, 10000, 30000][Math.min(fails, 2)];
     const tick = async () => {
-      const items = await loadProjects();
-      if (!alive) return;
-      for (const p of items) {
-        const st = p.job_status || "";
-        const active = ["queued", "running"].includes(st);
-        const doneNoBin = st === "done" && !p.has_bin;
-        if (!p.job_id || (!active && !doneNoBin)) continue;
-        try {
-          const v = (await inv("video_job_status", { projectId: p.id })) as any;
-          if (!alive) return;
-          if (v?.job?.status === "done" && !p.has_bin && !triedFetch.has(p.id)) {
-            triedFetch.add(p.id);
-            await inv("video_job_fetch", { projectId: p.id });
+      if (inflight) return;
+      inflight = true;
+      let ok = true;
+      try {
+        const items = await loadProjects(true);
+        if (!alive) return;
+        for (const p of items) {
+          const st = p.job_status || "";
+          const active = ["queued", "running"].includes(st);
+          const doneNoBin = st === "done" && !p.has_bin;
+          if (!p.job_id || (!active && !doneNoBin)) continue;
+          try {
+            const v = (await inv("video_job_status", { projectId: p.id })) as any;
             if (!alive) return;
+            if (v?.job?.status === "done" && !p.has_bin) {
+              await inv("video_job_fetch", { projectId: p.id });
+              if (!alive) return;
+            }
+          } catch {
+            ok = false;
           }
-        } catch {
-          /* 网络抖动：下一轮再问 */
         }
+        if (!alive) return;
+        fails = ok ? 0 : fails + 1;
+        await loadProjects(true);
+      } finally {
+        inflight = false;
       }
-      if (!alive) return;
-      await loadProjects();
-      if (alive) timer = window.setTimeout(tick, 4000);
+      if (alive) timer = window.setTimeout(tick, nextDelay());
     };
+    const onVis = () => {
+      if (document.visibilityState !== "visible") return;
+      if (timer) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+      void tick();
+    };
+    document.addEventListener("visibilitychange", onVis);
     void tick();
     return () => {
       alive = false;
+      document.removeEventListener("visibilitychange", onVis);
       if (timer) window.clearTimeout(timer);
     };
   }, [screen, loadProjects]);
@@ -772,6 +892,57 @@ export default function VideoWatchface({
     void loadTemplates();
   };
 
+  // 相框预览：切颜色/进编辑页时拉一次 PNG；拉不到就只少一层预览，不影响生成。
+  useEffect(() => {
+    const inv = invoke;
+    const sid = style?.id || "";
+    if (!inv || screen !== "edit" || !sid || !frameColor) {
+      if (frameUrlRef.current) {
+        URL.revokeObjectURL(frameUrlRef.current);
+        frameUrlRef.current = "";
+      }
+      setFramePreviewUrl("");
+      return;
+    }
+    let alive = true;
+    if (frameUrlRef.current) {
+      URL.revokeObjectURL(frameUrlRef.current);
+      frameUrlRef.current = "";
+    }
+    setFramePreviewUrl("");
+    (async () => {
+      try {
+        const v = (await inv("video_frame_asset", {
+          styleId: sid,
+          color: frameColor,
+        })) as any;
+        if (!alive || !v?.b64) return;
+        const bytes = b64ToBytes(v.b64);
+        const buf = new ArrayBuffer(bytes.byteLength);
+        new Uint8Array(buf).set(bytes);
+        const url = URL.createObjectURL(new Blob([buf], { type: "image/png" }));
+        frameUrlRef.current = url;
+        setFramePreviewUrl(url);
+      } catch {
+        /* 预览失败不报错：成品仍会带相框 */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [screen, style?.id, frameColor]);
+
+  // 卸载时释放相框 Blob URL
+  useEffect(
+    () => () => {
+      if (frameUrlRef.current) {
+        URL.revokeObjectURL(frameUrlRef.current);
+        frameUrlRef.current = "";
+      }
+    },
+    []
+  );
+
   const startNew = (tpl: Template, st: Style) => {
     if (!tpl.unlocked) {
       if (invoke) void invoke("open_external", { url: tpl.buy_url });
@@ -779,6 +950,8 @@ export default function VideoWatchface({
     }
     setTemplate(tpl);
     setStyle(st);
+    setFrameColors(st.frame_colors || []);
+    setFrameColor(st.frame_colors?.length ? String(st.frame_colors[0].i) : "");
     setProject(null);
     setProjectId("");
     setVideoName("");
@@ -796,7 +969,7 @@ export default function VideoWatchface({
     setQuality("standard");
     setCustomCount("");
     setCustomOpen(false);
-    setMode("loop");
+    setMode("once");
     setJob(null);
     fetchedRef.current = false;
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
@@ -837,7 +1010,35 @@ export default function VideoWatchface({
         canvas_h: p.canvas_h || 480,
         frame_count: p.frame_count || 0,
         preview_url: p.preview_url || "",
+        frame_colors: p.frame_colors || [],
       };
+      // 老作品快照里没有叠层/相框/上限：统一按 style_id 从模板接口补齐一次。
+      // 离线就用本地快照（叠层不显示，但编辑/生成不受影响）。
+      let colors = p.frame_colors || [];
+      if (p.style_id) {
+        try {
+          const v = (await invoke("video_templates")) as any;
+          const found = (v?.items || [])
+            .flatMap((t: any) => t.styles || [])
+            .find((s: any) => s.id === p.style_id);
+          if (found?.frame_colors?.length) {
+            colors = found.frame_colors;
+            st.frame_colors = found.frame_colors;
+          }
+          if (found?.overlay_url) st.overlay_url = found.overlay_url;
+          if (found?.max_bin) st.max_bin = found.max_bin;
+        } catch {
+          /* 离线：用本地快照，没有叠层就不显示 */
+        }
+      }
+      setFrameColors(colors);
+      const savedColor =
+        p.frame_color && colors.some((c) => String(c.i) === p.frame_color)
+          ? p.frame_color
+          : colors[0]
+          ? String(colors[0].i)
+          : "";
+      setFrameColor(savedColor);
       setStyle(st);
       setTemplate(null);
       setProject(p);
@@ -851,7 +1052,8 @@ export default function VideoWatchface({
       setQuality(restoredQuality);
       setCustomCount(String(p.frame_count || 120));
       setCustomOpen(restoredQuality === "custom");
-      setMode(p.mode === "once" ? "once" : "loop");
+      // 老作品可能没存 mode：默认按「播放一次」恢复，减少持续性能占用
+      setMode(p.mode === "loop" ? "loop" : "once");
       setTlZoom(1);
       setViewStart(0);
       setPlayhead(0);
@@ -959,6 +1161,10 @@ export default function VideoWatchface({
         canvas_w: cw,
         canvas_h: ch,
         preview_url: style?.preview_url || project?.preview_url || "",
+        frame_colors: style?.frame_colors || project?.frame_colors || [],
+        frame_color:
+          project?.frame_color ||
+          (style?.frame_colors?.length ? String(style.frame_colors[0].i) : ""),
         video_name: file.name,
         created_at: project?.created_at || now,
         // 换视频时保留旧成品的身份：管理页的「视频」角标还要能对上已经装在表上的那张
@@ -1481,13 +1687,15 @@ export default function VideoWatchface({
       await Promise.all(sends);
       if (sendError) throw sendError;
       setBusy("正在上传帧包…");
-      const v2 = (await inv("video_job_create", {
+      const jobArgs: any = {
         projectId,
         styleId: style.id,
         count,
         fps,
         mode,
-      })) as any;
+      };
+      if (frameColor) jobArgs.frameColor = frameColor;
+      const v2 = (await inv("video_job_create", jobArgs)) as any;
       await inv("video_project_update_meta", {
         projectId,
         patchJson: JSON.stringify({
@@ -1496,6 +1704,8 @@ export default function VideoWatchface({
           zoom,
           pan_x: panX,
           pan_y: panY,
+          frame_color: frameColor || "",
+          frame_colors: frameColors,
         }),
       });
       const jobId = v2?.job?.id || "";
@@ -1526,7 +1736,11 @@ export default function VideoWatchface({
         const v = (await inv("video_job_status", { projectId })) as any;
         const st = v?.job?.status || "running";
         if (!alive) return;
-        setJob({ id: jobId, status: st, error: v?.job?.error || "" });
+        setJob({
+          id: jobId,
+          status: st,
+          error: v?.job?.error || "",
+        });
         if (st === "done" && !fetchedRef.current) {
           fetchedRef.current = true;
           try {
@@ -1912,6 +2126,9 @@ export default function VideoWatchface({
               const failed = p.job_status === "failed";
               const total =
                 (p.video_size || 0) + (p.frames_size || 0) + (p.bin_size || 0);
+              // 有用户首帧预览（preview_b64）时叠上布局层；纯样式预览本身已带时间，不再叠
+              const overlaySrc =
+                p.preview_b64 && p.style_id ? overlayByStyle[p.style_id] || "" : "";
               return (
                 <button
                   key={p.id}
@@ -1919,7 +2136,10 @@ export default function VideoWatchface({
                   onClick={() => openProject(p)}
                   className="w-full text-left bg-white rounded-3xl p-4 flex items-center gap-3 active:scale-[0.98] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
                 >
-                  <div className="w-12 h-16 rounded-xl bg-black/5 overflow-hidden shrink-0">
+                  <div
+                    className="relative rounded-xl bg-black/5 overflow-hidden shrink-0"
+                    style={thumbBox(p.canvas_w, p.canvas_h, 64)}
+                  >
                     {previewSrc(p) ? (
                       <img
                         src={previewSrc(p)}
@@ -1930,6 +2150,17 @@ export default function VideoWatchface({
                       <div className="w-full h-full flex items-center justify-center text-black/20">
                         <FilmStrip className="w-5 h-5" />
                       </div>
+                    )}
+                    {overlaySrc && (
+                      <img
+                        src={`${API_BASE}${overlaySrc}`}
+                        alt=""
+                        draggable={false}
+                        onError={(e) => {
+                          e.currentTarget.style.display = "none";
+                        }}
+                        className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
+                      />
                     )}
                   </div>
                   <div className="flex-1 min-w-0">
@@ -2068,7 +2299,10 @@ export default function VideoWatchface({
                         tpl.unlocked ? "bg-black/[0.03]" : "bg-black/[0.02] opacity-70"
                       }`}
                     >
-                      <div className="w-10 h-14 rounded-lg bg-black/5 overflow-hidden shrink-0">
+                      <div
+                        className="rounded-lg bg-black/5 overflow-hidden shrink-0"
+                        style={thumbBox(st.canvas_w, st.canvas_h, 56)}
+                      >
                         {st.preview_url ? (
                           <img
                             src={`${API_BASE}${st.preview_url}`}
@@ -2085,6 +2319,9 @@ export default function VideoWatchface({
                         <p className="text-[14px] font-bold text-black truncate">{st.name}</p>
                         <p className="text-[12px] font-medium text-black/40 mt-0.5">
                           {st.canvas_w}×{st.canvas_h} 画布
+                          {st.frame_colors?.length
+                            ? ` · 相框 ${st.frame_colors.length} 色`
+                            : ""}
                         </p>
                       </div>
                       {tpl.unlocked ? (
@@ -2187,6 +2424,25 @@ export default function VideoWatchface({
                 <span className="text-[11px] font-medium text-white/40">5 秒以内，最大 80MB</span>
               </button>
             )}
+            {videoUrl && framePreviewUrl && (
+              <img
+                src={framePreviewUrl}
+                alt=""
+                draggable={false}
+                className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
+              />
+            )}
+            {videoUrl && overlayUrl && (
+              <img
+                src={overlayUrl}
+                alt=""
+                draggable={false}
+                onError={(e) => {
+                  e.currentTarget.style.display = "none";
+                }}
+                className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
+              />
+            )}
             {videoUrl && (
               <button
                 type="button"
@@ -2199,7 +2455,9 @@ export default function VideoWatchface({
           </div>
 
           <p className="mt-1.5 text-center text-[11px] font-medium text-black/35">
-            拖动画面调整位置
+            {frameColors.length > 0
+              ? "拖动画面调整位置（相框外的画面会被遮住）"
+              : "拖动画面调整位置"}
           </p>
         </div>
 
@@ -2216,6 +2474,43 @@ export default function VideoWatchface({
           data-rb-always="1"
           className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-4 pb-4 flex flex-col gap-3"
         >
+
+          {frameColors.length > 0 && (
+            <section className="bg-white rounded-2xl p-4 flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-[16px] font-bold text-black flex items-center gap-2">
+                  <Palette className="w-4 h-4 text-[#4361EE]" />
+                  相框颜色
+                </h3>
+                <span className="text-[12px] font-bold text-black/40">
+                  {frameColors.find((c) => String(c.i) === frameColor)?.name || ""}
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2.5">
+                {frameColors.map((c) => {
+                  const active = String(c.i) === frameColor;
+                  return (
+                    <button
+                      key={c.i}
+                      type="button"
+                      aria-label={c.name}
+                      title={c.name}
+                      onClick={() => setFrameColor(String(c.i))}
+                      className={`w-9 h-9 rounded-full transition-all cursor-pointer ${
+                        active
+                          ? "ring-2 ring-[#4361EE] ring-offset-2 ring-offset-white"
+                          : "ring-1 ring-black/10"
+                      }`}
+                      style={{ background: c.swatch }}
+                    />
+                  );
+                })}
+              </div>
+              <p className="text-[11px] font-medium text-black/35">
+                只换相框颜色；相框外的画面会被遮住。
+              </p>
+            </section>
+          )}
 
           {videoUrl && (
             <button
@@ -2387,7 +2682,7 @@ export default function VideoWatchface({
                 高级
               </button>
             </div>
-            <div className="grid grid-cols-3 gap-2">
+            <div className="grid grid-cols-4 gap-2">
               {QUALITY_LEVELS.map((level) => (
                 <button
                   key={level.key}
@@ -2646,6 +2941,8 @@ export default function VideoWatchface({
   const p = project;
   const total = (p?.video_size || 0) + (p?.frames_size || 0) + (p?.bin_size || 0);
   const jobActive = ["queued", "running"].includes(p?.job_status || "");
+  const detailOverlaySrc =
+    p?.preview_b64 && p?.style_id ? overlayByStyle[p.style_id] || "" : "";
   return (
     <div
       data-rb="y"
@@ -2659,13 +2956,27 @@ export default function VideoWatchface({
       ) : (
         <div className="flex flex-col gap-3">
           <div className="bg-white rounded-3xl p-4 flex gap-4">
-            <div className="w-20 h-28 rounded-2xl bg-black/5 overflow-hidden shrink-0">
+            <div
+              className="relative rounded-2xl bg-black/5 overflow-hidden shrink-0"
+              style={thumbBox(p.canvas_w, p.canvas_h, 112)}
+            >
               {previewSrc(p) ? (
                 <img src={previewSrc(p)} alt="" className="w-full h-full object-cover" />
               ) : (
                 <div className="w-full h-full flex items-center justify-center text-black/20">
                   <FilmStrip className="w-6 h-6" />
                 </div>
+              )}
+              {detailOverlaySrc && (
+                <img
+                  src={`${API_BASE}${detailOverlaySrc}`}
+                  alt=""
+                  draggable={false}
+                  onError={(e) => {
+                    e.currentTarget.style.display = "none";
+                  }}
+                  className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
+                />
               )}
             </div>
             <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
@@ -2678,7 +2989,7 @@ export default function VideoWatchface({
                 </p>
               </div>
               <p className="text-[12px] font-medium text-black/30 truncate">
-                {p.mode === "once" ? "播放一次" : "循环播放"}，{fmtDate(p.created_at)}
+                {p.mode === "loop" ? "循环播放" : "播放一次"}，{fmtDate(p.created_at)}
               </p>
             </div>
           </div>
@@ -2733,6 +3044,16 @@ export default function VideoWatchface({
             >
               <ArrowClockwise className="w-4 h-4 animate-spin" />
               查看制作进度（{statusLabel(p.job_status)}）
+            </button>
+          )}
+
+          {p.job_status === "done" && !p.has_bin && (
+            <button
+              type="button"
+              onClick={() => void refetchBin(p)}
+              className="h-11 rounded-2xl bg-[#4361EE]/10 text-[#4361EE] text-[14px] font-bold cursor-pointer active:scale-[0.99] transition-all"
+            >
+              重新下载成品
             </button>
           )}
 

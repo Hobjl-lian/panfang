@@ -604,6 +604,9 @@ function storeList(key: string, list: string[]) {
 const APP_UPDATE_SNOOZE_KEY = "panfang.updateSnoozed";
 const APP_UPDATE_SNOOZE_MS = 24 * 3600 * 1000;
 
+/** 视频表盘首次进入的使用说明：点过「我已知晓」后不再弹 */
+const VIDEO_NOTICE_ACK_KEY = "panfang.videoNoticeAck.v1";
+
 function readUpdateSnooze(): { version: string; at: number } | null {
   try {
     const raw = localStorage.getItem(APP_UPDATE_SNOOZE_KEY);
@@ -2120,6 +2123,8 @@ export default function App() {
   const [appUpdate, setAppUpdate] = useState<AppUpdateCheck | null>(null);
   const [appUpdatePrompt, setAppUpdatePrompt] = useState(false);
   const [appUpdatePhase, setAppUpdatePhase] = useState<{ step: "downloading" | "installing"; percent: number } | null>(null);
+  /** 首次进入视频表盘：使用建议与风险说明（固定弹窗，点遮罩不关） */
+  const [videoNoticeOpen, setVideoNoticeOpen] = useState(false);
   /** 上次检查到的新版本号（localStorage 记住）：关于页在没有实时结果时也能显示「有新版本」 */
   const [appUpdateKnown, setAppUpdateKnown] = useState<string | null>(() => {
     try {
@@ -2242,6 +2247,26 @@ export default function App() {
     // 只在启动时挂一次：节流与「稍后」都在检查逻辑里
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 第一次进视频表盘：先说明推荐设置和风险，必须点「我已知晓」才能继续。
+  useEffect(() => {
+    if (currentStep !== "video_watchface") return;
+    try {
+      if (localStorage.getItem(VIDEO_NOTICE_ACK_KEY) === "1") return;
+    } catch {
+      /* 读不到就弹，宁可多提示一次 */
+    }
+    setVideoNoticeOpen(true);
+  }, [currentStep]);
+
+  const ackVideoNotice = () => {
+    try {
+      localStorage.setItem(VIDEO_NOTICE_ACK_KEY, "1");
+    } catch {
+      /* 存不下就只关这一次 */
+    }
+    setVideoNoticeOpen(false);
+  };
 
   // 登录页状态规范化（按单独交付版文档）
   const [loginButtonText, setLoginButtonText] = useState("登录");
@@ -8071,7 +8096,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.3.99"}
+                      盘坊 v{appVersion ?? "0.4.1"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -10699,7 +10724,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.3.99"}`}
+                            : `当前版本 v${appVersion ?? "0.4.1"}`}
                         </p>
                       </div>
                     </div>
@@ -11501,15 +11526,49 @@ export default function App() {
           </div>
         )}
 
+        {/* 视频表盘首次进入：使用建议与风险说明（固定弹窗，点遮罩不关，必须点按钮） */}
+        {videoNoticeOpen && currentStep === "video_watchface" && (
+          <div className="absolute inset-0 z-[90] bg-black/40 flex items-center justify-center p-6 animate-in fade-in duration-200">
+            <div
+              className="bg-white w-full max-w-[330px] rounded-3xl overflow-hidden shadow-[0_10px_30px_rgba(0,0,0,0.14)] border border-black/5 text-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="pt-6 px-6 pb-4">
+                <h3 className="text-[17px] font-bold text-black tracking-tight">动态表盘使用说明</h3>
+                <p className="text-[12.5px] text-black/45 font-medium mt-1.5 leading-relaxed">
+                  动态表盘会持续占用更多手表性能，建议这样设置：
+                </p>
+                <div className="mt-3 rounded-2xl bg-black/[0.03] px-4 py-3 text-left flex flex-col gap-1.5">
+                  <p className="text-[13px] font-semibold text-black/70">1. 推荐视频时长不超过 3 秒</p>
+                  <p className="text-[13px] font-semibold text-black/70">2. 优先选择「省电」或「标准」档</p>
+                  <p className="text-[13px] font-semibold text-black/70">3. 播放方式选择「播放 1 次」</p>
+                </div>
+                <div className="mt-3 text-left">
+                  <p className="text-[12px] font-bold text-[#D4973B]">不按推荐设置，可能出现：</p>
+                  <ul className="mt-1 pl-4 list-disc text-[12px] font-medium text-black/50 leading-relaxed space-y-0.5">
+                    <li>手表耗电加快</li>
+                    <li>表盘界面滑动卡顿</li>
+                    <li>在表盘界面，或同时安装了占用内存较多的快应用时，可能触发手环重启</li>
+                  </ul>
+                </div>
+                <p className="mt-3 text-[11.5px] font-medium text-black/35 leading-relaxed text-left">
+                  动态表盘性能占用更高，运存不足时手环会通过重启释放内存；重启不会损坏已安装的表盘或手表固件，恢复后即可继续使用。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={ackVideoNotice}
+                className="w-full py-3.5 border-t border-black/5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
+              >
+                我已知晓
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* App 更新：发现新版本（开屏自动弹出；样式与「退出登录确认」同一套 Apple 风格） */}
         {appUpdatePrompt && appUpdate && (
-          <div
-            className="absolute inset-0 z-[60] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
-            onClick={() => {
-              snoozeUpdate(appUpdate.version_name);
-              setAppUpdatePrompt(false);
-            }}
-          >
+          <div className="absolute inset-0 z-[60] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
             <div
               className="bg-white/95 backdrop-blur-2xl w-full max-w-[320px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5 text-center"
               onClick={(e) => e.stopPropagation()}
@@ -11541,14 +11600,14 @@ export default function App() {
                   }}
                   className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
                 >
-                  稍后
+                  跳过
                 </button>
                 <button
                   type="button"
                   onClick={() => void startAppUpdate()}
                   className="py-3.5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
                 >
-                  立即更新
+                  确定更新
                 </button>
               </div>
             </div>

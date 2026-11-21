@@ -4,7 +4,8 @@
 //! - 本地留档三件套（视频 / 帧包 / 成品）全部用设备密钥加密（`paid::seal_archive`），
 //!   与付费表盘留档同一套 WFENC1 格式，只有本机能解开。
 //!
-//! 约束：成品 < 25MB、播放时长 = 帧数 / fps ≤ 5 秒（服务端与 worker 都会再校验）。
+//! 约束：成品体积按画布分档（432×514 35MB / 336×480 与 212×520 30MB / 其余 25MB）、
+//! 播放时长 = 帧数 / fps ≤ 5 秒（服务端与 worker 都会再校验）。
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -18,7 +19,17 @@ use crate::paid;
 const MAX_FRAMES: usize = 300;
 const MAX_TEMP_PNG: usize = 12 * 1024 * 1024;
 const MAX_VIDEO: usize = 80 * 1024 * 1024;
-const MAX_FRAMES_ZIP: usize = 64 * 1024 * 1024;
+// 432×514 的成品上限已放宽到 35MB，180 帧的帧包可能到 70MB 以上（< nginx 的 96m）。
+const MAX_FRAMES_ZIP: usize = 80 * 1024 * 1024;
+/// 成品体积上限（与 server/src/video_jobs.rs 的 max_bin_bytes 保持一致）。
+fn max_bin_for_canvas(cw: u32, ch: u32) -> usize {
+    let mb = match (cw, ch) {
+        (432, _) => 35,
+        (336, _) | (212, _) => 30,
+        _ => 25,
+    };
+    mb * 1024 * 1024
+}
 
 fn b64d(s: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
@@ -196,6 +207,64 @@ async fn get_json(state: &AppState, path: &str) -> Result<Value, String> {
 #[tauri::command]
 pub async fn video_templates(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     get_json(&state, "/v1/video/templates").await
+}
+
+/// GET /v1/video/style/:id/frame/:color —— 相框 PNG（编辑页实时预览用）。
+/// 服务端会校验 license 与购买状态；这里只把字节转 base64 回前端。
+#[tauri::command]
+pub async fn video_frame_asset(
+    state: tauri::State<'_, AppState>,
+    style_id: String,
+    color: String,
+) -> Result<Value, String> {
+    let sid = style_id.trim();
+    let ok_id = !sid.is_empty()
+        && sid.len() <= 64
+        && sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok_id {
+        return Err("样式 ID 非法".into());
+    }
+    let c = color.trim();
+    if c.is_empty() || c.len() > 8 || !c.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("相框颜色非法".into());
+    }
+    let base = paid::service_base(&state)?;
+    let t = token(&state)?;
+    let resp = paid::http()
+        .map_err(|e| e.to_string())?
+        .get(format!(
+            "{}/v1/video/style/{}/frame/{}",
+            base.trim_end_matches('/'),
+            sid,
+            c
+        ))
+        .bearer_auth(t)
+        .send()
+        .await
+        .map_err(|e| format!("网络请求失败：{e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let msg = v["message"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&text);
+        return Err(msg.to_string());
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取相框失败：{e}"))?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("相框超过 4MB".into());
+    }
+    Ok(json!({
+        "b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "size": bytes.len(),
+    }))
 }
 
 // ---------------------------------------------------------------- 项目留档
@@ -464,6 +533,7 @@ pub async fn video_job_create(
     count: usize,
     fps: f64,
     mode: String,
+    frame_color: Option<String>,
 ) -> Result<Value, String> {
     if count == 0 || count > MAX_FRAMES {
         return Err(format!("帧数需在 1~{MAX_FRAMES}"));
@@ -475,8 +545,18 @@ pub async fn video_job_create(
         return Err("视频时长不能超过 5 秒".into());
     }
     let mode = if mode == "once" { "once" } else { "loop" };
+    let frame_color = frame_color
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(c) = &frame_color {
+        if c.len() > 8 || !c.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err("相框颜色非法".into());
+        }
+    }
     let pdir = project_dir(&state, &project_id)?;
     let mut meta = read_meta(&pdir)?;
+    let cw = meta["canvas_w"].as_u64().unwrap_or(0) as u32;
+    let ch = meta["canvas_h"].as_u64().unwrap_or(0) as u32;
     let fdir = temp_frames_dir(&state, &project_id)?;
     let paid_dir = paid::paid_dir(&app_data(&state)?);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&fdir)
@@ -515,9 +595,17 @@ pub async fn video_job_create(
         .into_inner();
     if zip_bytes.len() > MAX_FRAMES_ZIP {
         return Err(format!(
-            "帧包 {:.1}MB，超过 64MB 上限。请减少帧数或缩短视频后重试",
-            zip_bytes.len() as f64 / 1048576.0
+            "帧包 {:.1}MB，超过 {}MB 上限。请减少帧数或缩短视频后重试",
+            zip_bytes.len() as f64 / 1048576.0,
+            MAX_FRAMES_ZIP / 1024 / 1024
         ));
+    }
+    // 成品体积预检：等 worker 导出完再报「超过上限」要白等 2~5 分钟。
+    // 实测成品 ≈ 0.5 × 帧包（同一批 PNG 的 RLE 压缩比），超限直接拦在提交前。
+    let limit = max_bin_for_canvas(cw, ch);
+    let est = (zip_bytes.len() as f64 * 0.5) as usize + 1024 * 1024;
+    if cw > 0 && ch > 0 && est > limit {
+        return Err("预计成品会超过本机型上限，请把流畅度调低一档，或缩短视频后重试。".into());
     }
 
     // 帧包留档（密文）先落盘：即使上传失败，用户重试/重新制作也不用再抽一次。
@@ -540,6 +628,9 @@ pub async fn video_job_create(
     // 同一个作品继续制作：复用原来的表盘 ID，装到表上会顶掉旧版而不是新增一张
     if let Some(wid) = meta["watchface_id"].as_str().filter(|s| !s.trim().is_empty()) {
         form = form.text("watchface_id", wid.trim().to_string());
+    }
+    if let Some(c) = &frame_color {
+        form = form.text("frame_color", c.clone());
     }
     let form = form.part(
             "file",
@@ -578,6 +669,9 @@ pub async fn video_job_create(
         obj.insert("fps".into(), json!(fps));
         obj.insert("mode".into(), json!(mode));
         obj.insert("style_id".into(), json!(style_id));
+        if let Some(c) = &frame_color {
+            obj.insert("frame_color".into(), json!(c));
+        }
     }
     touch(&mut meta);
     write_meta(&pdir, &meta)?;
@@ -673,8 +767,12 @@ pub async fn video_job_fetch(
         paid::device_identity(&state).map_err(|e| format!("读取设备密钥失败: {e}"))?;
     let bytes = paid::unwrap_and_decrypt(&secret, &v["key_wrap"], nonce, &cipher)
         .map_err(|e| format!("解密成品失败: {e:#}"))?;
-    if bytes.len() > 25 * 1024 * 1024 {
-        return Err("成品超过 25MB，已拒绝保存".into());
+    let limit = max_bin_for_canvas(
+        meta["canvas_w"].as_u64().unwrap_or(0) as u32,
+        meta["canvas_h"].as_u64().unwrap_or(0) as u32,
+    );
+    if bytes.len() > limit {
+        return Err("成品超出本机型上限，已拒绝保存。".into());
     }
     if let Some(want) = v["sha256"].as_str().filter(|s| !s.is_empty()) {
         if paid::sha256_hex(&bytes) != want {
@@ -698,7 +796,16 @@ pub async fn video_job_fetch(
     }
     let sealed =
         paid::seal_archive(&paid::paid_dir(&app_data(&state)?), &bytes).map_err(|e| e.to_string())?;
-    std::fs::write(pdir.join("bin.enc"), sealed).map_err(|e| format!("保存成品失败: {e}"))?;
+    // 原子落盘：先写 .tmp 再改名。断网重试/进程被杀时不会留下半截 bin.enc。
+    // Windows 上 rename 覆盖已存在文件会失败，先删旧文件（失败就重下，不会装坏包）。
+    let bin_path = pdir.join("bin.enc");
+    let tmp_path = pdir.join("bin.enc.tmp");
+    std::fs::write(&tmp_path, &sealed).map_err(|e| format!("保存成品失败: {e}"))?;
+    let _ = std::fs::remove_file(&bin_path);
+    std::fs::rename(&tmp_path, &bin_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("保存成品失败: {e}")
+    })?;
     if let Some(obj) = meta.as_object_mut() {
         obj.insert("job_status".into(), json!("done"));
         obj.insert("result_size".into(), json!(bytes.len()));

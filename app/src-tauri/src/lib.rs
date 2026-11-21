@@ -193,6 +193,7 @@ pub fn run() {
             app_update::app_update_download,
             app_update::app_update_install,
             video::video_templates,
+            video::video_frame_asset,
             video::video_project_create,
             video::video_project_list,
             video::video_project_get,
