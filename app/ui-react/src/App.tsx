@@ -682,9 +682,13 @@ function SubPageTopBar({ title, onBack }: { title: string; onBack: () => void })
     <div className="absolute top-0 left-0 right-0 z-40 pointer-events-none" style={{ height: HEADER_H }}>
       <div className="pf-topbar-blur" style={{ height: HEADER_H }} aria-hidden="true">
         <span className="pf-frost pf-frost-1" />
+
         <span className="pf-frost pf-frost-2" />
+
         <span className="pf-frost pf-frost-3" />
+
         <span className="pf-frost pf-frost-4" />
+
         <span className="pf-frost pf-frost-5" />
         <span className="pf-topbar-tint" />
       </div>
@@ -2045,6 +2049,7 @@ export default function App() {
     if (small) small.dataset.show = "0";
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, currentStep]);
+
 
   /**
    * 从集市详情返回：把列表滚回进去之前的位置。
@@ -7309,9 +7314,13 @@ export default function App() {
                   标题不在滚动容器里，靠 transform 跟着滚动缩小并滑到顶部居中，所以不会被顶栏裁掉。 */}
               <div className="pf-topbar-blur" style={{ height: HEADER_H }} aria-hidden="true">
                 <span className="pf-frost pf-frost-1" />
+
                 <span className="pf-frost pf-frost-2" />
+
                 <span className="pf-frost pf-frost-3" />
+
                 <span className="pf-frost pf-frost-4" />
+
                 <span className="pf-frost pf-frost-5" />
                 <span className="pf-topbar-tint" />
               </div>
@@ -7330,7 +7339,7 @@ export default function App() {
                   <div
                     ref={collapseSmallRef}
                     className="pf-title-small absolute z-30 pointer-events-none whitespace-nowrap pf-fs-19 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
-                    style={{ top: TITLE_END_TOP, left: "50%", transform: "translateX(-50%)" }}
+                    style={{ top: TITLE_END_TOP, left: 0, right: 0, textAlign: "center" }}
                   >
                     {TAB_TITLES[activeTab]}
                   </div>
@@ -8135,7 +8144,7 @@ export default function App() {
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
                     <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] tracking-wide">
-                      盘坊 v{appVersion ?? "0.4.5"}
+                      盘坊 v{appVersion ?? "0.4.6"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -10768,7 +10777,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.4.5"}`}
+                            : `当前版本 v${appVersion ?? "0.4.6"}`}
                         </p>
                       </div>
                     </div>

@@ -203,26 +203,31 @@ body {
    先让大标题淡开再出现，避免两行字同时压在屏幕上造成闪烁感。 */
 .pf-title-big {
   opacity: 1;
-  filter: blur(0);
+  transform: scale(1);
+  transform-origin: left top;
+  will-change: opacity, transform;
   transition:
-    opacity 180ms cubic-bezier(0.4, 0, 1, 1),
-    filter 180ms cubic-bezier(0.4, 0, 1, 1);
+    opacity 200ms cubic-bezier(0.4, 0, 1, 1),
+    transform 200ms cubic-bezier(0.4, 0, 1, 1);
 }
 .pf-title-big[data-hide="1"] {
   opacity: 0;
-  filter: blur(5px);
+  transform: scale(0.96);
 }
 .pf-title-small {
   opacity: 0;
-  filter: blur(5px);
+  transform: scale(0.96);
+  transform-origin: center top;
+  will-change: opacity, transform;
   transition:
-    opacity 240ms cubic-bezier(0, 0, 0.2, 1) 60ms,
-    filter 240ms cubic-bezier(0, 0, 0.2, 1) 60ms;
+    opacity 280ms cubic-bezier(0, 0, 0.2, 1) 40ms,
+    transform 280ms cubic-bezier(0, 0, 0.2, 1) 40ms;
 }
 .pf-title-small[data-show="1"] {
   opacity: 1;
-  filter: blur(0);
+  transform: scale(1);
 }
+
 
 /* 二级页内容起点：固定顶栏 82 + 12 = 94（留白在滚动容器内部，内容照常从顶栏下面滚过）。 */
 .subpage-top {
