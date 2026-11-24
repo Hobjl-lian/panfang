@@ -9,8 +9,10 @@
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bridge::AppState;
@@ -726,29 +728,55 @@ pub async fn video_job_status(
     Ok(v)
 }
 
-#[tauri::command]
-pub async fn video_job_fetch(
-    state: tauri::State<'_, AppState>,
-    project_id: String,
-) -> Result<Value, String> {
-    let pdir = project_dir(&state, &project_id)?;
-    let mut meta = read_meta(&pdir)?;
-    let job_id = meta["job_id"].as_str().unwrap_or("").to_string();
-    if job_id.is_empty() {
-        return Err("这个项目还没有提交过任务".into());
+/// 同一个项目同一时刻只允许一个下载在跑。
+///
+/// 轮询、历史页回前台、安装按钮三处都会调 `video_job_fetch`；以前它们会各发一份
+/// 25MB 的整包请求（2026-11-21 17:10 服务端被压到 load 66 的直接成因）。
+fn fetch_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(project_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// 本地是否已经有这个任务的成品（只认下载成功时写入的 `bin_job_id`；
+/// `job_status=done` 只是服务端状态，不代表手机已经把包拉下来）。
+fn bin_ready(pdir: &Path, job_id: &str) -> bool {
+    if !pdir.join("bin.enc").exists() {
+        return false;
     }
-    let base = paid::service_base(&state)?;
-    let t = token(&state)?;
-    let resp = http_long()?
-        .get(format!(
-            "{}/v1/video/jobs/{job_id}/bin",
-            base.trim_end_matches('/')
-        ))
-        .bearer_auth(t)
-        .send()
-        .await
-        .map_err(|e| format!("下载成品失败: {e}"))?;
+    read_meta(pdir)
+        .map(|m| m["bin_job_id"].as_str() == Some(job_id))
+        .unwrap_or(false)
+}
+
+/// 服务端 `/download` 响应头里的解密参数。
+struct DlHead {
+    size: u64,
+    sha256: String,
+    file_nonce: String,
+    key_wrap: Value,
+}
+
+/// 拉一次密文到 `part`（半截文件）。
+///
+/// - 有半截就发 `Range: bytes=N-`，服务端 206 只补缺的那段；
+/// - 服务端回 200（不带 Range）时从头覆盖写；
+/// - 拿到的长度必须等于响应头 `x-wf-size`，否则算失败，留给上层重试。
+async fn fetch_cipher(url: &str, token: &str, part: &Path) -> Result<DlHead, String> {
+    let offset = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+    let mut req = http_long()?.get(url).bearer_auth(token);
+    if offset > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+    }
+    let resp = req.send().await.map_err(|e| format!("{e}"))?;
     let status = resp.status();
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        let _ = std::fs::remove_file(part);
+        return Err("续传位置已失效，已从头重试".into());
+    }
     if !status.is_success() {
         let v = json_or_err(resp).await.unwrap_or(Value::Null);
         return Err(v["message"]
@@ -756,29 +784,121 @@ pub async fn video_job_fetch(
             .unwrap_or("成品还没准备好")
             .to_string());
     }
-    // 服务端现在只回「密文 + 设备公钥包裹的 CEK」，私钥不出本机。
-    let v: Value = resp
-        .json()
+    let hdr = |k: &str| -> String {
+        resp.headers()
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let head = DlHead {
+        size: hdr("x-wf-size").parse().unwrap_or(0),
+        sha256: hdr("x-wf-sha256"),
+        file_nonce: hdr("x-wf-file-nonce"),
+        key_wrap: json!({
+            "epk": hdr("x-wf-key-epk"),
+            "salt": hdr("x-wf-key-salt"),
+            "wrap_nonce": hdr("x-wf-key-wrap-nonce"),
+            "cipher": hdr("x-wf-key-wrap"),
+        }),
+    };
+    let resume = status == reqwest::StatusCode::PARTIAL_CONTENT && offset > 0;
+    let mut f = if resume {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(part)
+            .map_err(|e| format!("打开临时文件失败: {e}"))?
+    } else {
+        std::fs::File::create(part).map_err(|e| format!("创建临时文件失败: {e}"))?
+    };
+    let mut got = if resume { offset } else { 0 };
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("读取成品响应失败: {e}"))?;
-    let cipher = b64d(v["cipher"].as_str().unwrap_or(""))?;
-    let nonce = v["file_nonce"].as_str().unwrap_or("");
+        .map_err(|e| format!("接收数据中断: {e}"))?
+    {
+        f.write_all(&chunk)
+            .map_err(|e| format!("写入临时文件失败: {e}"))?;
+        got += chunk.len() as u64;
+    }
+    drop(f);
+    if head.size > 0 && got != head.size {
+        return Err(format!("下载不完整（{got}/{}），继续重试", head.size));
+    }
+    Ok(head)
+}
+
+#[tauri::command]
+pub async fn video_job_fetch(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let pdir = project_dir(&state, &project_id)?;
+    let meta = read_meta(&pdir)?;
+    let job_id = meta["job_id"].as_str().unwrap_or("").to_string();
+    if job_id.is_empty() {
+        return Err("这个项目还没有提交过任务".into());
+    }
+    // 已经下好且任务没换：直接复用（历史页每次回前台都会问一遍，不必再打服务端）
+    if bin_ready(&pdir, &job_id) {
+        return Ok(json!({ "ok": true, "cached": true }));
+    }
+    // 单飞：并发的第二、第三个调用在这里排队，等第一个下完后直接命中上面的缓存
+    let lock = fetch_lock(&project_id);
+    let _guard = lock.lock().await;
+    let mut meta = read_meta(&pdir)?;
+    if bin_ready(&pdir, &job_id) {
+        return Ok(json!({ "ok": true, "cached": true }));
+    }
+
+    let base = paid::service_base(&state)?;
+    let t = token(&state)?;
+    let url = format!(
+        "{}/v1/video/jobs/{job_id}/download",
+        base.trim_end_matches('/')
+    );
+    // 半截密文留在项目目录：断网/切后台后重新进来接着下，不用从 0 开始
+    let part = pdir.join("bin.enc.part");
+    let mut last_err = String::new();
+    let mut head: Option<DlHead> = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            let wait = if attempt == 1 { 2 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        }
+        match fetch_cipher(&url, &t, &part).await {
+            Ok(h) => {
+                head = Some(h);
+                break;
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    let head = head.ok_or_else(|| format!("下载成品失败（已重试 3 次）：{last_err}"))?;
+    let cipher = std::fs::read(&part).map_err(|e| format!("读取下载文件失败: {e}"))?;
+
+    // 服务端只回「密文 + 设备公钥包裹的 CEK」，私钥不出本机。
     let (secret, _, _) =
         paid::device_identity(&state).map_err(|e| format!("读取设备密钥失败: {e}"))?;
-    let bytes = paid::unwrap_and_decrypt(&secret, &v["key_wrap"], nonce, &cipher)
-        .map_err(|e| format!("解密成品失败: {e:#}"))?;
+    let bytes = paid::unwrap_and_decrypt(&secret, &head.key_wrap, &head.file_nonce, &cipher)
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&part);
+            format!("解密成品失败: {e:#}")
+        })?;
     let limit = max_bin_for_canvas(
         meta["canvas_w"].as_u64().unwrap_or(0) as u32,
         meta["canvas_h"].as_u64().unwrap_or(0) as u32,
     );
     if bytes.len() > limit {
+        let _ = std::fs::remove_file(&part);
         return Err("成品超出本机型上限，已拒绝保存。".into());
     }
-    if let Some(want) = v["sha256"].as_str().filter(|s| !s.is_empty()) {
-        if paid::sha256_hex(&bytes) != want {
-            return Err("成品校验失败（内容与服务端不一致）".into());
-        }
+    if !head.sha256.is_empty() && paid::sha256_hex(&bytes) != head.sha256 {
+        let _ = std::fs::remove_file(&part);
+        return Err("成品校验失败（内容与服务端不一致）".into());
     }
+    let _ = std::fs::remove_file(&part);
     // bin 自带的预览图先当兜底；服务端合成的「首帧 + 模板前景」优先覆盖它。
     if !pdir.join("preview.png").exists() {
         if let Ok(sum) = crate::watchface_bin::inspect(&bytes) {
@@ -789,9 +909,19 @@ pub async fn video_job_fetch(
             }
         }
     }
-    if let Some(pb) = v["preview_b64"].as_str().filter(|s| !s.trim().is_empty()) {
-        if let Ok(png) = b64d(pb) {
-            let _ = std::fs::write(pdir.join("preview.png"), png);
+    if let Ok(r) = http_long()?
+        .get(format!(
+            "{}/v1/video/jobs/{job_id}/preview",
+            base.trim_end_matches('/')
+        ))
+        .bearer_auth(&t)
+        .send()
+        .await
+    {
+        if r.status().is_success() {
+            if let Ok(png) = r.bytes().await {
+                let _ = std::fs::write(pdir.join("preview.png"), png);
+            }
         }
     }
     let sealed =
@@ -809,6 +939,8 @@ pub async fn video_job_fetch(
     if let Some(obj) = meta.as_object_mut() {
         obj.insert("job_status".into(), json!("done"));
         obj.insert("result_size".into(), json!(bytes.len()));
+        // 记下「bin.enc 对应哪个任务」：这是本地判断成品是否已下载的唯一依据
+        obj.insert("bin_job_id".into(), json!(job_id));
     }
     touch(&mut meta);
     write_meta(&pdir, &meta)?;

@@ -1,0 +1,58 @@
+/*
+ * 字号刻度（design.md §2.2）
+ * ========================
+ * 全站字号只允许走本文件的变量与 `pf-fs-*` 类，组件里不再写 `text-[Npx]`。
+ * 一个因子 `--pf-fs-scale` 管三档（设置 › 外观 › 字号）：
+ *   小 0.9 · 标准 1 · 大 1.1
+ * 档位由 font.ts 写到 <html> 的内联样式上；这里所有档位都用 calc 乘这个因子。
+ *
+ * 例外：表盘编辑页里那块「模拟表盘」预览（208×248 基准 + mockScale 缩放）
+ * 是内容不是界面，保留裸 px，不随 App 字号缩放，否则预览会和真机不一致。
+ *
+ * 角色对照（design.md §2.2）：
+ *   32 页面标题 · 24 主数值/文件主标题 · 22 卡片主标题 · 18 弹层/列表标题
+ *   17 正文/主按钮 · 16 设置行/控件 · 13 说明 · 12 标签/角标
+ *   10/11/14/15/19/20/25/26/30/34 是历史档位，尚未收敛，先原样保留。
+ */
+
+:root {
+  --pf-fs-scale: 1;
+
+  --pf-fs-10: calc(10px * var(--pf-fs-scale)); /* 角标（图表轴标、缩略图角标） */
+  --pf-fs-11: calc(11px * var(--pf-fs-scale));
+  --pf-fs-12: calc(12px * var(--pf-fs-scale)); /* 标签/角标 */
+  --pf-fs-13: calc(13px * var(--pf-fs-scale)); /* 说明 */
+  --pf-fs-14: calc(14px * var(--pf-fs-scale));
+  --pf-fs-15: calc(15px * var(--pf-fs-scale));
+  --pf-fs-16: calc(16px * var(--pf-fs-scale)); /* 设置行/控件 */
+  --pf-fs-17: calc(17px * var(--pf-fs-scale)); /* 正文/主按钮 */
+  --pf-fs-18: calc(18px * var(--pf-fs-scale)); /* 弹层/列表标题 */
+  --pf-fs-19: calc(19px * var(--pf-fs-scale));
+  --pf-fs-20: calc(20px * var(--pf-fs-scale));
+  --pf-fs-22: calc(22px * var(--pf-fs-scale)); /* 卡片主标题 */
+  --pf-fs-24: calc(24px * var(--pf-fs-scale)); /* 主数值/文件主标题 */
+  --pf-fs-25: calc(25px * var(--pf-fs-scale));
+  --pf-fs-26: calc(26px * var(--pf-fs-scale));
+  --pf-fs-30: calc(30px * var(--pf-fs-scale));
+  --pf-fs-32: calc(32px * var(--pf-fs-scale)); /* 页面标题 */
+  --pf-fs-34: calc(34px * var(--pf-fs-scale));
+}
+
+.pf-fs-10 { font-size: var(--pf-fs-10); }
+.pf-fs-11 { font-size: var(--pf-fs-11); }
+.pf-fs-12 { font-size: var(--pf-fs-12); }
+.pf-fs-13 { font-size: var(--pf-fs-13); }
+.pf-fs-14 { font-size: var(--pf-fs-14); }
+.pf-fs-15 { font-size: var(--pf-fs-15); }
+.pf-fs-16 { font-size: var(--pf-fs-16); }
+.pf-fs-17 { font-size: var(--pf-fs-17); }
+.pf-fs-18 { font-size: var(--pf-fs-18); }
+.pf-fs-19 { font-size: var(--pf-fs-19); }
+.pf-fs-20 { font-size: var(--pf-fs-20); }
+.pf-fs-22 { font-size: var(--pf-fs-22); }
+.pf-fs-24 { font-size: var(--pf-fs-24); }
+.pf-fs-25 { font-size: var(--pf-fs-25); }
+.pf-fs-26 { font-size: var(--pf-fs-26); }
+.pf-fs-30 { font-size: var(--pf-fs-30); }
+.pf-fs-32 { font-size: var(--pf-fs-32); }
+.pf-fs-34 { font-size: var(--pf-fs-34); }

@@ -48,7 +48,7 @@ export function DragSlider(props: {
     <div className={`flex-1 min-w-0 h-10 flex items-center ${disabled ? "opacity-45" : ""}`}>
       <div
         ref={trackRef}
-        className={`relative w-full h-1.5 rounded-full ${className || "bg-black/10"}`}
+        className={`relative w-full h-1.5 rounded-full ${className || "bg-[var(--pf-bg-10)]"}`}
         style={trackStyle}
       >
         <div
@@ -91,8 +91,8 @@ export function DragSlider(props: {
           }}
         >
           <div
-            className={`w-5 h-5 rounded-full bg-white border-2 shadow-[0_1px_4px_rgba(0,0,0,0.2)] transition-colors ${
-              active ? "border-[#4361EE]" : "border-black/15"
+            className={`w-5 h-5 rounded-full bg-[var(--pf-card)] border-2 shadow-[0_1px_4px_rgba(0,0,0,0.2)] transition-colors ${
+              active ? "border-[var(--pf-primary)]" : "border-[var(--pf-bd-15)]"
             }`}
           />
         </div>
@@ -118,9 +118,9 @@ export function GenSlider(props: {
   const { icon, label, value, ctl, text, onChange, disabled } = props;
   return (
     <div className="flex items-center gap-2.5 h-10">
-      <div className="flex items-center gap-1 w-[52px] shrink-0 text-black/45 whitespace-nowrap">
+      <div className="flex items-center gap-1 w-[52px] shrink-0 text-[var(--pf-i-45)] whitespace-nowrap">
         {icon}
-        <span className="text-[12px] font-medium">{label}</span>
+        <span className="pf-fs-12 font-medium">{label}</span>
       </div>
       <DragSlider
         value={value}
@@ -130,7 +130,7 @@ export function GenSlider(props: {
         onChange={onChange}
         disabled={disabled}
       />
-      <span className="text-[12px] font-mono font-medium text-black/55 w-[44px] text-right shrink-0">
+      <span className="pf-fs-12 font-mono font-medium text-[var(--pf-i-55)] w-[44px] text-right shrink-0">
         {text}
       </span>
     </div>

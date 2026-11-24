@@ -68,11 +68,24 @@ import {
 import { DragSlider, GenSlider } from "./Slider";
 import VideoWatchface from "./VideoWatchface";
 import {
+  applyTheme,
+  readThemeMode,
+  saveThemeMode,
+  watchSystemTheme,
+  type ThemeMode
+} from "./theme";
+import {
+  applyFontSize,
+  readFontSizeMode,
+  saveFontSizeMode,
+  type FontSizeMode
+} from "./font";
+import {
   Lightning, CaretRight, FolderOpen, Check, House, SlidersHorizontal, Watch,
   CircleNotch, CaretLeft, X, ArrowsClockwise, Flame, Heart,
-  Footprints, CaretDown, Plus, GearSix, ArrowsDownUp, ArrowSquareOut,
+  Footprints, CaretDown, Plus, GearSix, ArrowSquareOut,
   Info, ShieldCheck, FileText, Scroll, Code, DotsThree, ArrowClockwise,
-  ArrowCounterClockwise, MagnifyingGlassPlus, MagnifyingGlass, SunDim, Drop, IconContext,
+  ArrowCounterClockwise, MagnifyingGlassPlus, MagnifyingGlass, SunDim, Palette, Drop, IconContext,
   LockSimple, VideoCamera, Ticket,
   User, Storefront, Copy
 } from "@phosphor-icons/react";
@@ -135,8 +148,8 @@ function GenToggle(props: { label: string; on: boolean; onClick: () => void }) {
     <button
       type="button"
       onClick={props.onClick}
-      className={`flex-1 h-10 rounded-xl text-[12px] font-semibold active:scale-95 transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
-        props.on ? "bg-[#4361EE] text-white" : "bg-black/5 text-black/60"
+      className={`flex-1 h-10 rounded-xl pf-fs-12 font-semibold active:scale-95 transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+        props.on ? "bg-[var(--pf-primary-solid)] text-white" : "bg-[var(--pf-bg-5)] text-[var(--pf-i-60)]"
       }`}
     >
       {props.label}
@@ -247,7 +260,7 @@ function GenSwatchGrid(props: {
             onClick={() => onPick(it.key)}
             title={it.name || it.color}
             className={`w-10 h-10 rounded-full transition-transform duration-150 cursor-pointer active:scale-90 ${
-              it.on ? "ring-2 ring-[#4361EE] ring-offset-1 ring-offset-white" : "ring-1 ring-black/10"
+              it.on ? "ring-2 ring-[var(--pf-primary)] ring-offset-1 ring-offset-white" : "ring-1 ring-[var(--pf-bd-10)]"
             }`}
             style={{ background: it.color }}
           />
@@ -290,10 +303,10 @@ function GenCustomColorPanel(props: {
 
   return (
     <div>
-      <div className="h-12 rounded-2xl border border-black/5 mb-3" style={{ background: value }} />
+      <div className="h-12 rounded-2xl border border-[var(--pf-bd-5)] mb-3" style={{ background: value }} />
 
       <div className="flex items-center gap-2.5 h-10">
-        <span className="text-[12px] font-medium text-black/45 w-[52px] shrink-0 whitespace-nowrap">
+        <span className="pf-fs-12 font-medium text-[var(--pf-i-45)] w-[52px] shrink-0 whitespace-nowrap">
           颜色
         </span>
         <DragSlider
@@ -307,7 +320,7 @@ function GenCustomColorPanel(props: {
       </div>
 
       <div className="flex items-center gap-2.5 h-10">
-        <span className="text-[12px] font-medium text-black/45 w-[52px] shrink-0 whitespace-nowrap">
+        <span className="pf-fs-12 font-medium text-[var(--pf-i-45)] w-[52px] shrink-0 whitespace-nowrap">
           深浅
         </span>
         <DragSlider
@@ -319,7 +332,7 @@ function GenCustomColorPanel(props: {
           trackStyle={{ background: shadeTrack }}
         />
       </div>
-      <div className="flex justify-between text-[10px] font-medium text-black/35 px-1 -mt-1">
+      <div className="flex justify-between pf-fs-10 font-medium text-[var(--pf-i-35)] px-1 -mt-1">
         <span className="w-[52px]">黑</span>
         <span>白</span>
       </div>
@@ -350,7 +363,7 @@ function formatEta(seconds: number): string {
   return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`;
 }
 
-type FlowStep = "welcome" | "vivo_scan" | "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "install_confirm" | "photo_generator" | "settings_account" | "settings_device" | "market_detail" | "video_watchface";
+type FlowStep = "welcome" | "vivo_scan" | "login" | "device_select" | "main" | "paid_bind" | "paid_dials" | "redeem_installing" | "redeem_success" | "connect_help" | "onboarding_guide" | "dial_edit" | "about_app" | "about_developer" | "open_source_licenses" | "install_confirm" | "photo_generator" | "settings_account" | "settings_device" | "settings_appearance" | "market_detail" | "video_watchface";
 
 /** 逐包更新状态（服务端 packages + App 安装快照逐包比较后补上 needs_update/new） */
 interface PaidPackageStatus {
@@ -646,18 +659,71 @@ const TAB_TITLES: Record<TabKey, string | null> = {
 
 /**
  * 折叠标题的几何口径（参考微信顶栏：标题离状态栏/挖孔留一段，但不把顶栏抬太高）：
- *   顶栏高 70；内容起点 = 顶栏高 + 12 = 82；收起后标题顶 = 42（19px 字，下沿 61）。
+ *   顶栏高 82；内容起点 = 顶栏高 + 12 = 94；收起后小标题顶 = 54（19px 字，下沿 73）。
+ * 2026-11-24：整体下移 12px，给系统状态栏多留一点距离。
+ * 标题只有两态：大标题在起点、小标题在顶部居中；中间不做位移与缩放。
  * 不用 env(safe-area-inset-top)：这台机器的 WebView 会把它报成整个状态栏高度，
  * 叠加后会多出一大截空白（2026-10-30 试过，页面被顶下去太多）。
  */
-const HEADER_H = 70;
+const HEADER_H = 82;
 const TITLE_START_TOP = HEADER_H + 12;
 const TITLE_START_LEFT = 28;
-const TITLE_END_TOP = 42;
-const TITLE_FONT = 32;
-const TITLE_END_SCALE = 19 / 32;
-/** 滚到多少 px 完成折叠 */
-const TITLE_COLLAPSE_DISTANCE = 72;
+const TITLE_END_TOP = 54;
+/** 滚动超过这个距离就切到小标题（不带中间态，避免停在半途的畸形标题） */
+const TITLE_SWITCH_AT = 10;
+
+/**
+ * 二级页统一顶栏：渲染在页面滚动容器**外面**（App 根层的绝对定位覆盖层），
+ * 因此滚动、overscroll 回弹都不会带走它。内容顶部由 subpage-top 留出 94px。
+ * 渐进模糊底 + 左侧返回 + 屏幕正中 17px 标题（与一级页折叠后的小标题同一水平线）。
+ */
+function SubPageTopBar({ title, onBack }: { title: string; onBack: () => void }) {
+  return (
+    <div className="absolute top-0 left-0 right-0 z-40 pointer-events-none" style={{ height: HEADER_H }}>
+      <div className="pf-topbar-blur" style={{ height: HEADER_H }} aria-hidden="true">
+        <span className="pf-frost pf-frost-1" />
+        <span className="pf-frost pf-frost-2" />
+        <span className="pf-frost pf-frost-3" />
+        <span className="pf-frost pf-frost-4" />
+        <span className="pf-frost pf-frost-5" />
+        <span className="pf-topbar-tint" />
+      </div>
+      <div className="relative z-40 h-full px-6" style={{ paddingTop: 42 }}>
+        <div className="relative flex h-11 items-center">
+          <button
+            type="button"
+            onClick={onBack}
+            aria-label="返回"
+            className="pointer-events-auto w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-[var(--pf-i-80)] hover:bg-[var(--pf-bg-5)] active:scale-95 transition-all cursor-pointer shrink-0"
+          >
+            <CaretLeft className="w-6 h-6 stroke-[2]" />
+          </button>
+          <span className="pointer-events-none absolute inset-x-0 text-center pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-none">
+            {title}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 二级页标题与返回目标：顶栏是全局层，靠这张表决定当前页显示什么 */
+const SECONDARY_PAGES: Record<string, { title: string; back: string }> = {
+  vivo_scan: { title: "连接 VIVO 手表", back: "welcome" },
+  login: { title: "连接小米设备", back: "welcome" },
+  settings_appearance: { title: "个性化", back: "main/settings" },
+  settings_account: { title: "账号", back: "main/settings" },
+  settings_device: { title: "设备与连接", back: "main/settings" },
+  connect_help: { title: "怎么连上手环", back: "main/home" },
+  onboarding_guide: { title: "使用指引", back: "main/home" },
+  paid_bind: { title: "绑定爱发电", back: "main/home" },
+  paid_dials: { title: "我的表盘", back: "main/home" },
+  market_detail: { title: "表盘详情", back: "main/market" },
+  install_confirm: { title: "确认安装", back: "main/home" },
+  about_app: { title: "关于应用", back: "main/settings" },
+  about_developer: { title: "关于开发者", back: "about" },
+  open_source_licenses: { title: "开源许可与致谢", back: "about" }
+};
 
 /** 界面态持久化的键（登录凭证由 Rust 侧本地文件持久化，这里只存界面） */
 const UI_STORE_KEY = "panfang.ui";
@@ -755,6 +821,7 @@ const ROUTES = {
   "paid/dials": { step: "paid_dials", tab: "home", persist: true },
   "settings/account": { step: "settings_account", tab: "settings", persist: true },
   "settings/device": { step: "settings_device", tab: "settings", persist: true },
+  "settings/appearance": { step: "settings_appearance", tab: "settings", persist: true },
   "connect-help": { step: "connect_help", tab: "home", persist: true },
   guide: { step: "onboarding_guide", tab: "home", persist: true },
   // 安装是瞬时过程：重启后回到进来之前那一页才是对的
@@ -1118,18 +1185,18 @@ function DeviceCard({
   const status = isConnecting ? "正在连接" : isConnected ? "已连接" : "未连接";
   // 状态色按用户要求：未连接红、已连接绿（连接中给蓝，跟转圈同一个色）
   const statusColor = isConnecting
-    ? "text-[#4361EE]"
+    ? "text-[var(--pf-primary)]"
     : isConnected
-      ? "text-[#34C759]"
-      : "text-[#FF3B30]";
+      ? "text-[var(--pf-ok)]"
+      : "text-[var(--pf-danger)]";
   const surfaceClass =
     surface === "page"
-      ? "bg-white shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
-      : "bg-[#F5F6F9]";
+      ? "bg-[var(--pf-card)] pf-card-border shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+      : "bg-[var(--pf-page)]";
   return (
     <div
       className={`w-full rounded-2xl px-4 py-3.5 transition-colors ${
-        isCurrent ? "bg-[#EEF1FE] ring-1 ring-[#4361EE]/25" : surfaceClass
+        isCurrent ? "bg-[var(--pf-primary-5)] ring-1 ring-[var(--pf-primary-25)]" : surfaceClass
       }`}
     >
       <div className="flex items-start gap-3">
@@ -1140,33 +1207,33 @@ function DeviceCard({
           className="min-w-0 flex-1 text-left cursor-pointer active:opacity-60 transition-opacity"
         >
           {isCurrent && (
-            <span className="block text-[12px] font-bold mb-1">
-              <span className="text-black/45">当前设备 / </span>
+            <span className="block pf-fs-12 font-bold mb-1">
+              <span className="text-[var(--pf-i-45)]">当前设备 / </span>
               <span className={statusColor}>{status}</span>
             </span>
           )}
           <span
-            className={`block truncate text-[16px] font-bold tracking-tight ${
-              isConnected ? "text-[#4361EE]" : "text-black"
+            className={`block truncate pf-fs-16 font-bold tracking-tight ${
+              isConnected ? "text-[var(--pf-primary)]" : "text-[var(--pf-ink)]"
             }`}
           >
             {device.name}
           </span>
           {addr && (
-            <span className="block mt-1 text-[12px] font-medium tracking-wide text-black/35">
+            <span className="block mt-1 pf-fs-12 font-medium tracking-wide text-[var(--pf-i-35)]">
               {addr}
             </span>
           )}
         </button>
 
         {isConnecting ? (
-          <CircleNotch className="w-4 h-4 mt-1.5 shrink-0 animate-spin text-[#4361EE]" />
+          <CircleNotch className="w-4 h-4 mt-1.5 shrink-0 animate-spin text-[var(--pf-primary)]" />
         ) : (
           <button
             type="button"
             onClick={event => onMore(device, event.currentTarget)}
             aria-label={`${device.name}：更多操作`}
-            className="w-8 h-8 -mr-1.5 -mt-0.5 shrink-0 rounded-full flex items-center justify-center text-black/30 hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
+            className="w-8 h-8 -mr-1.5 -mt-0.5 shrink-0 rounded-full flex items-center justify-center text-[var(--pf-i-30)] hover:bg-[var(--pf-bg-5)] active:scale-95 transition-all cursor-pointer"
           >
             <DotsThree className="w-5 h-5" strokeWidth={2.5} />
           </button>
@@ -1348,16 +1415,16 @@ function useRubberBand() {
 function WebViewGateScreen({ major, onContinue }: { major: number; onContinue: () => void }) {
   return (
     <IconContext.Provider value={{ weight: "bold" }}>
-      <div className="min-h-screen bg-[#F5F6F9] md:bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
-        <div className="w-full md:max-w-[400px] h-[100dvh] md:h-[844px] bg-[#F5F6F9] md:rounded-[44px] relative flex flex-col overflow-hidden">
+      <div className="min-h-screen bg-[var(--pf-page)] md:bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
+        <div className="w-full md:max-w-[400px] h-[100dvh] md:h-[844px] bg-[var(--pf-page)] md:rounded-[44px] relative flex flex-col overflow-hidden">
           <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12">
             <div />
             <div className="flex flex-col items-center text-center">
-              <div className="w-14 h-14 rounded-2xl bg-black/5 flex items-center justify-center">
-                <ArrowsClockwise size={26} className="text-black/40" />
+              <div className="w-14 h-14 rounded-2xl bg-[var(--pf-bg-5)] flex items-center justify-center">
+                <ArrowsClockwise size={26} className="text-[var(--pf-i-40)]" />
               </div>
-              <h2 className="text-[18px] font-bold text-black mt-4">系统组件版本过旧</h2>
-              <p className="text-[13px] font-medium text-black/45 leading-relaxed mt-2 max-w-[280px]">
+              <h2 className="pf-fs-18 font-bold text-[var(--pf-ink)] mt-4">系统组件版本过旧</h2>
+              <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] leading-relaxed mt-2 max-w-[280px]">
                 这台手机的系统 WebView 版本较低（Chrome {major}），盘坊的界面可能显示不全。
                 更新手机系统后重新打开盘坊。
               </p>
@@ -1366,14 +1433,14 @@ function WebViewGateScreen({ major, onContinue }: { major: number; onContinue: (
               <button
                 type="button"
                 onClick={() => openWebViewSettings()}
-                className="w-full h-[44px] rounded-full bg-[#4361EE] text-white font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer"
+                className="w-full h-[44px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer"
               >
                 去更新系统 WebView
               </button>
               <button
                 type="button"
                 onClick={onContinue}
-                className="w-full h-[44px] rounded-full bg-black/5 text-black/60 font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer"
+                className="w-full h-[44px] rounded-full bg-[var(--pf-bg-5)] text-[var(--pf-i-60)] font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer"
               >
                 仍然继续（界面可能异常）
               </button>
@@ -1409,8 +1476,31 @@ export default function App() {
   // 当前页面：从恢复出来的页面栈顶开始（恢复不了就是登录页）
   const [currentStep, setCurrentStep] = useState<FlowStep>(boot.step);
 
-  // 状态栏/导航栏图标颜色：所有页面（含制作壁纸页）都是浅底 → 深色图标（由原生侧默认值保证，
-  // 这里不再按页切换；原来的深色裁剪页已下线）。
+  // 主题：默认跟随系统，可在「设置 › 外观」里锁定浅色/深色。
+  // 首帧由 main.tsx 在渲染前应用；这里负责后续切换与系统主题联动。
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
+  useEffect(() => {
+    applyTheme(themeMode);
+    if (themeMode !== "system") return;
+    return watchSystemTheme(() => applyTheme("system"));
+  }, [themeMode]);
+
+  const changeThemeMode = (mode: ThemeMode) => {
+    setThemeMode(mode);
+    saveThemeMode(mode);
+  };
+
+  // 字号：三档（小 / 标准 / 大），落在 <html> 的 --pf-fs-scale 上，刻度在 type.css。
+  // 首帧由 main.tsx 在渲染前应用；这里负责后续切换。
+  const [fontSizeMode, setFontSizeMode] = useState<FontSizeMode>(() => readFontSizeMode());
+  useEffect(() => {
+    applyFontSize(fontSizeMode);
+  }, [fontSizeMode]);
+
+  const changeFontSizeMode = (mode: FontSizeMode) => {
+    setFontSizeMode(mode);
+    saveFontSizeMode(mode);
+  };
 
   /**
    * 系统 WebView 版本门禁（安卓）：产物按 Tailwind v4 的基线打包，界面在旧内核上不是
@@ -1914,23 +2004,25 @@ export default function App() {
   const [installPreparing, setInstallPreparing] = useState<string | null>(null);
 
   // —— 全局折叠标题 ——
-  // 直接用 ref 改 transform，不走 setState：滚动每帧都 setState 会让这个上万行的组件重渲染。
+  // 只切两态（大标题 / 小标题），直接用 ref 改 data 属性，不走 setState。
   const collapseTitleRef = useRef<HTMLDivElement | null>(null);
-  const collapseWidthRef = useRef(0);
+  const collapseSmallRef = useRef<HTMLDivElement | null>(null);
+  /** 当前是不是「小标题」态：只在翻转时写一次 DOM */
+  const collapseCollapsedRef = useRef(false);
   const collapseScrollRef = useRef(0);
   const collapseRafRef = useRef<number | null>(null);
 
-  /** 按滚动距离把大标题缩小、滑到顶部居中（p=0 原位，p=1 居中 19px） */
+  /** 滚动离开顶部 → 大标题淡出、小标题在顶部淡入；回到顶部则反过来。中间不做位移/缩放。
+      两个阈值做迟滞：切过去要 10px、切回来只要 4px，手指在临界点轻微抖动不会来回闪。 */
   const applyCollapse = (top: number) => {
-    const el = collapseTitleRef.current;
-    if (!el) return;
-    const p = Math.max(0, Math.min(1, top / TITLE_COLLAPSE_DISTANCE));
-    const scale = 1 - (1 - TITLE_END_SCALE) * p;
-    const hostW = el.parentElement?.clientWidth || window.innerWidth;
-    const w = collapseWidthRef.current || el.offsetWidth;
-    const dx = (hostW / 2 - TITLE_START_LEFT - (w * scale) / 2) * p;
-    const dy = (TITLE_END_TOP - TITLE_START_TOP) * p;
-    el.style.transform = `translate3d(${dx}px, ${dy}px, 0) scale(${scale})`;
+    const wasCollapsed = collapseCollapsedRef.current;
+    const collapsed = wasCollapsed ? top > 4 : top > TITLE_SWITCH_AT;
+    if (collapsed === wasCollapsed) return;
+    collapseCollapsedRef.current = collapsed;
+    const big = collapseTitleRef.current;
+    const small = collapseSmallRef.current;
+    if (big) big.dataset.hide = collapsed ? "1" : "0";
+    if (small) small.dataset.show = collapsed ? "1" : "0";
   };
 
   const handleTabScroll = (e: React.UIEvent<HTMLDivElement>) => {
@@ -1942,14 +2034,15 @@ export default function App() {
     });
   };
 
-  // 切 Tab / 回到主界面 / 安全区变化时重新量一次标题宽度并复位（标题文案会变）
+  // 切 Tab / 回到主界面：标题复位到「大标题在起点」
   useEffect(() => {
     if (currentStep !== "main") return;
-    const el = collapseTitleRef.current;
-    if (!el) return;
-    el.style.transform = "none";
-    collapseWidthRef.current = el.offsetWidth;
-    applyCollapse(0);
+    collapseScrollRef.current = 0;
+    collapseCollapsedRef.current = false;
+    const big = collapseTitleRef.current;
+    const small = collapseSmallRef.current;
+    if (big) big.dataset.hide = "0";
+    if (small) small.dataset.show = "0";
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, currentStep]);
 
@@ -3181,9 +3274,9 @@ export default function App() {
    * 放抽屉里时必须位于列表上方：列表长，卡片在列表下方会被挤出可视区（2026-10-07 踩过）。
    */
   const connectGuideCard = connectError ? (
-    <div className="bg-[#F5F6F9] rounded-2xl p-4 mb-3">
+    <div className="bg-[var(--pf-page)] rounded-2xl p-4 mb-3">
       <div className="flex items-start gap-3">
-        <div className="w-8 h-8 rounded-full bg-[#FF3B30]/10 text-[#FF3B30] flex items-center justify-center shrink-0">
+        <div className="w-8 h-8 rounded-full bg-[var(--pf-danger-10)] text-[var(--pf-danger)] flex items-center justify-center shrink-0">
           <svg
             viewBox="0 0 24 24"
             className="w-4 h-4"
@@ -3197,10 +3290,10 @@ export default function App() {
           </svg>
         </div>
         <div className="flex-1 min-w-0">
-          <p className="text-[16px] font-bold text-black leading-tight">
+          <p className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
             没连上{failedDevice?.name ? `「${failedDevice.name}」` : ""}
           </p>
-          <p className="text-[13px] font-medium text-black/45 mt-1 leading-snug">
+          <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1 leading-snug">
             {failedDevice?.model ? `${failedDevice.model}，` : ""}先让手环进入「连接新手机」模式，再重新连接
           </p>
         </div>
@@ -3212,14 +3305,14 @@ export default function App() {
             helpFromDrawer.current = true; // 返回时把浮窗还回去
             pushRoute("connect-help");
           }}
-          className="flex-1 h-[40px] rounded-full bg-[#4361EE] text-white font-bold text-[13px] active:scale-[0.98] transition-all cursor-pointer"
+          className="flex-1 h-[40px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-13 active:scale-[0.98] transition-all cursor-pointer"
         >
           看怎么连
         </button>
         <button
           type="button"
           onClick={() => failedDevice && handleSelectDevice(failedDevice)}
-          className="flex-1 h-[40px] rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all cursor-pointer"
+          className="flex-1 h-[40px] rounded-full bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] text-[var(--pf-i-75)] font-bold pf-fs-13 active:scale-95 transition-all cursor-pointer"
         >
           重试
         </button>
@@ -3229,7 +3322,7 @@ export default function App() {
           type="button"
           disabled={diagBusy}
           onClick={() => void exportDiag()}
-          className="text-[12px] font-bold text-black/40 hover:text-black/60 transition-colors cursor-pointer disabled:opacity-50"
+          className="pf-fs-12 font-bold text-[var(--pf-i-40)] hover:text-[var(--pf-i-60)] transition-colors cursor-pointer disabled:opacity-50"
         >
           {diagBusy ? "正在导出…" : "导出诊断包"}
         </button>
@@ -6776,9 +6869,9 @@ export default function App() {
 
   return (
     <IconContext.Provider value={{ weight: "bold" }}>
-    <div className="min-h-screen bg-[#F5F6F9] md:bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
+    <div className="min-h-screen bg-[var(--pf-page)] md:bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
       {/* 手机容器：400px 上限只给桌面预览（手机视口比 400 宽时留黑边，见 411dp 的小米机型） */}
-      <div className="w-full md:max-w-[400px] h-[100dvh] md:h-[844px] bg-[#F5F6F9] md:rounded-[44px] relative flex flex-col overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.3)]">
+      <div className="w-full md:max-w-[400px] h-[100dvh] md:h-[844px] bg-[var(--pf-page)] md:rounded-[44px] relative flex flex-col overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.3)]">
         
         {/* 核心内容视口容器（普通滚动，不再有全局拖拽形变；顶部假 iOS 状态栏已删） */}
         <div className="flex-1 flex flex-col overflow-hidden relative">
@@ -6787,10 +6880,10 @@ export default function App() {
           {currentStep === "welcome" && (
             <div className="flex-1 flex flex-col px-6 safe-top pb-10 page-enter-anim">
               <div className="pt-10">
-                <h1 className="text-[34px] font-bold text-black tracking-tight leading-tight">
+                <h1 className="pf-fs-34 font-bold text-[var(--pf-ink)] tracking-tight leading-tight">
                   连接手表
                 </h1>
-                <p className="text-[16px] font-medium text-black/45 mt-2">
+                <p className="pf-fs-16 font-medium text-[var(--pf-i-45)] mt-2">
                   先告诉我你戴的是哪一种
                 </p>
               </div>
@@ -6803,27 +6896,24 @@ export default function App() {
                     // 推入而不是替换：登录页左上角返回 / 侧滑都回到首屏
                     pushRoute("login");
                   }}
-                  className="relative w-full h-[200px] text-left rounded-[30px] p-6 bg-white overflow-hidden flex flex-col border border-white/60 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02)] cursor-pointer active:scale-[0.985] transition-transform duration-200"
+                  className="relative w-full h-[200px] text-left rounded-[30px] p-6 bg-[var(--pf-card)] pf-card-border overflow-hidden flex flex-col shadow-[inset_0_1px_0_var(--pf-card-hi),0_2px_4px_rgba(0,0,0,0.03),0_16px_38px_rgba(0,0,0,0.09)] cursor-pointer active:scale-[0.985] transition-transform duration-200"
                 >
                   {/* 品牌淡渐变铺满整卡：角部径向光 + 对角线性底色，单色相、峰值叠加约 20% */}
                   <div
                     className="pointer-events-none absolute inset-0"
-                    style={{
-                      background:
-                        "radial-gradient(72% 62% at 0% 0%, rgba(255,106,0,0.12) 0%, rgba(255,106,0,0) 78%), linear-gradient(140deg, rgba(255,106,0,0.10) 0%, rgba(255,106,0,0.045) 48%, rgba(255,106,0,0.015) 100%)"
-                    }}
+                    style={{ background: "var(--pf-tint-xiaomi)" }}
                     aria-hidden="true"
                   />
                   <div className="relative">
-                    <div className="font-brand-serif text-[25px] text-black leading-tight">
+                    <div className="font-brand-serif pf-fs-25 text-[var(--pf-ink)] leading-tight">
                       我是小米用户
                     </div>
-                    <div className="text-[13px] font-medium text-black/45 mt-1">
+                    <div className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1">
                       从小米账号连接设备
                     </div>
                   </div>
-                  <div className="relative mt-auto self-end w-8 h-8 rounded-full bg-white/75 shadow-[0_1px_2px_rgba(0,0,0,0.06)] flex items-center justify-center">
-                    <CaretRight className="w-4 h-4 text-black/30" />
+                  <div className="relative mt-auto self-end w-9 h-9 rounded-full bg-[var(--pf-bg-5)] flex items-center justify-center">
+                    <CaretRight className="w-4 h-4 text-[var(--pf-i-45)]" />
                   </div>
                 </button>
 
@@ -6834,26 +6924,23 @@ export default function App() {
                     // 进专门的连接引导页：先讲两步准备，再开始搜索
                     pushRoute("vivo-scan");
                   }}
-                  className="relative w-full h-[200px] text-left rounded-[30px] p-6 bg-white overflow-hidden flex flex-col border border-white/60 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02)] cursor-pointer active:scale-[0.985] transition-transform duration-200"
+                  className="relative w-full h-[200px] text-left rounded-[30px] p-6 bg-[var(--pf-card)] pf-card-border overflow-hidden flex flex-col shadow-[inset_0_1px_0_var(--pf-card-hi),0_2px_4px_rgba(0,0,0,0.03),0_16px_38px_rgba(0,0,0,0.09)] cursor-pointer active:scale-[0.985] transition-transform duration-200"
                 >
                   <div
                     className="pointer-events-none absolute inset-0"
-                    style={{
-                      background:
-                        "radial-gradient(72% 62% at 0% 0%, rgba(65,95,255,0.12) 0%, rgba(65,95,255,0) 78%), linear-gradient(140deg, rgba(65,95,255,0.10) 0%, rgba(65,95,255,0.045) 48%, rgba(65,95,255,0.015) 100%)"
-                    }}
+                    style={{ background: "var(--pf-tint-vivo)" }}
                     aria-hidden="true"
                   />
                   <div className="relative">
-                    <div className="font-brand-serif text-[25px] text-black leading-tight">
+                    <div className="font-brand-serif pf-fs-25 text-[var(--pf-ink)] leading-tight">
                       我是 VIVO 用户
                     </div>
-                    <div className="text-[13px] font-medium text-black/45 mt-1">
+                    <div className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1">
                       搜索附近的设备
                     </div>
                   </div>
-                  <div className="relative mt-auto self-end w-8 h-8 rounded-full bg-white/75 shadow-[0_1px_2px_rgba(0,0,0,0.06)] flex items-center justify-center">
-                    <CaretRight className="w-4 h-4 text-black/30" />
+                  <div className="relative mt-auto self-end w-9 h-9 rounded-full bg-[var(--pf-bg-5)] flex items-center justify-center">
+                    <CaretRight className="w-4 h-4 text-[var(--pf-i-45)]" />
                   </div>
                 </button>
               </div>
@@ -6867,7 +6954,7 @@ export default function App() {
                   onClick={(e) => {
                     openLink(e, BEIAN_URL);
                   }}
-                  className="inline-flex items-center gap-1 text-[12px] font-medium text-black/35 hover:text-[#4361EE] transition-colors cursor-pointer"
+                  className="inline-flex items-center gap-1 pf-fs-12 font-medium text-[var(--pf-i-35)] hover:text-[var(--pf-primary)] transition-colors cursor-pointer"
                 >
                   <span>{APP_BEIAN_NO}</span>
                   <ArrowSquareOut className="w-3 h-3 stroke-[2]" />
@@ -6878,49 +6965,38 @@ export default function App() {
 
           {/* 0b. vivo 连接引导：先讲两步准备，再开始搜索 */}
           {currentStep === "vivo_scan" && (
-            <div className="flex-1 flex flex-col px-6 safe-top pb-10 page-enter-anim">
-              <button
-                type="button"
-                onClick={() => goBackOr("welcome")}
-                aria-label="返回"
-                className="w-11 h-11 -ml-2.5 mt-1 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
-              >
-                <CaretLeft className="w-6 h-6 stroke-[2]" />
-              </button>
+            <div className="flex-1 flex flex-col px-6 pb-10 page-enter-anim subpage-top">
 
-              <div className="pt-4">
-                <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
-                  连接 VIVO 手表
-                </h1>
-                <p className="text-[17px] font-medium text-black/45 mt-2">
+              <div>
+                <p className="pf-fs-17 font-medium text-[var(--pf-i-45)]">
                   先做两步准备，再来搜索
                 </p>
               </div>
 
-              <div className="bg-white rounded-3xl p-5 mt-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+              <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 mt-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
                 <div className="flex gap-3.5">
-                  <div className="w-7 h-7 rounded-full bg-[#4361EE]/10 text-[#4361EE] text-[13px] font-bold flex items-center justify-center shrink-0">
+                  <div className="w-7 h-7 rounded-full bg-[var(--pf-primary-10)] text-[var(--pf-primary)] pf-fs-13 font-bold flex items-center justify-center shrink-0">
                     1
                   </div>
                   <div className="min-w-0">
-                    <p className="text-[16px] font-bold text-black leading-tight">
+                    <p className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                       退出「vivo 健康」
                     </p>
-                    <p className="text-[13px] font-medium text-black/40 mt-1 leading-relaxed">
+                    <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1 leading-relaxed">
                       从最近任务里把它划掉，别让它占着手表
                     </p>
                   </div>
                 </div>
-                <div className="h-px bg-black/[0.06] my-4 ml-[42px]" />
+                <div className="h-px bg-[var(--pf-bg-6)] my-4 ml-[42px]" />
                 <div className="flex gap-3.5">
-                  <div className="w-7 h-7 rounded-full bg-[#4361EE]/10 text-[#4361EE] text-[13px] font-bold flex items-center justify-center shrink-0">
+                  <div className="w-7 h-7 rounded-full bg-[var(--pf-primary-10)] text-[var(--pf-primary)] pf-fs-13 font-bold flex items-center justify-center shrink-0">
                     2
                   </div>
                   <div className="min-w-0">
-                    <p className="text-[16px] font-bold text-black leading-tight">
+                    <p className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                       手表进入「连接新手机」
                     </p>
-                    <p className="text-[13px] font-medium text-black/40 mt-1 leading-relaxed">
+                    <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1 leading-relaxed">
                       手表「设置」→「系统管理」→「连接新手机」
                     </p>
                   </div>
@@ -6929,19 +7005,19 @@ export default function App() {
 
               <div className="mt-5">
                 {vivoScanning && !vivoFound.length ? (
-                  <div className="w-full h-[52px] rounded-full bg-[#4361EE]/10 text-[#4361EE] font-bold text-[17px] flex items-center justify-center gap-2">
+                  <div className="w-full h-[52px] rounded-full bg-[var(--pf-primary-10)] text-[var(--pf-primary)] font-bold pf-fs-17 flex items-center justify-center gap-2">
                     <CircleNotch className="w-5 h-5 animate-spin" />
                     正在搜索附近的手表…
                   </div>
                 ) : vivoFound.length ? null : vivoSearched ? (
                   <>
-                    <p className="text-[13px] font-medium text-black/40 text-center leading-relaxed mb-3">
+                    <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] text-center leading-relaxed mb-3">
                       没有发现手表。确认两步都做好后，再搜一次
                     </p>
                     <button
                       type="button"
                       onClick={startVivoScan}
-                      className="w-full h-[52px] rounded-full bg-[#4361EE] text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer"
+                      className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer"
                     >
                       重新搜索
                     </button>
@@ -6950,7 +7026,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={startVivoScan}
-                    className="w-full h-[52px] rounded-full bg-[#4361EE] text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer"
+                    className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer"
                   >
                     开始搜索
                   </button>
@@ -6959,7 +7035,7 @@ export default function App() {
 
               {vivoFound.length > 0 && (
                 <div className="mt-6 flex flex-col gap-2.5">
-                  <p className="text-[17px] font-medium text-black/45">
+                  <p className="pf-fs-17 font-medium text-[var(--pf-i-45)]">
                     发现 {vivoFound.length} 台，点按连接
                   </p>
                   {vivoFound.map(v => (
@@ -6967,21 +7043,21 @@ export default function App() {
                       key={v.id}
                       type="button"
                       onClick={() => handlePickVivoDevice(v)}
-                      className="w-full bg-white rounded-2xl px-4 py-3.5 flex items-center justify-between gap-3 text-left cursor-pointer active:scale-[0.99] transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                      className="w-full bg-[var(--pf-card)] pf-card-border rounded-2xl px-4 py-3.5 flex items-center justify-between gap-3 text-left cursor-pointer active:scale-[0.99] transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
                     >
                       <div className="min-w-0">
-                        <div className="text-[16px] font-bold text-black truncate">{v.name}</div>
-                        <div className="text-[13px] font-medium text-black/40 mt-0.5">
+                        <div className="pf-fs-16 font-bold text-[var(--pf-ink)] truncate">{v.name}</div>
+                        <div className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5">
                           {connectingId === v.id ? "正在连接…" : v.id}
                         </div>
                       </div>
-                      <CaretRight className="w-5 h-5 shrink-0 text-black/20" />
+                      <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-20)]" />
                     </button>
                   ))}
                   <button
                     type="button"
                     onClick={startVivoScan}
-                    className="mt-1 h-[44px] rounded-full bg-black/5 text-black/75 font-semibold text-[16px] active:scale-95 transition-all cursor-pointer"
+                    className="mt-1 h-[44px] rounded-full bg-[var(--pf-bg-5)] text-[var(--pf-i-75)] font-semibold pf-fs-16 active:scale-95 transition-all cursor-pointer"
                   >
                     重新搜索
                   </button>
@@ -6992,26 +7068,15 @@ export default function App() {
 
           {/* 1. 登录页 */}
           {currentStep === "login" && (
-            <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim">
-              <div className="pt-4">
-                <button
-                  type="button"
-                  onClick={() => goBackOr("welcome")}
-                  aria-label="返回"
-                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
-                >
-                  <CaretLeft className="w-6 h-6 stroke-[2]" />
-                </button>
-                <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight mt-2">
-                  连接小米设备
-                </h1>
-                <p className="text-[17px] font-medium text-black/45 mt-2">
+            <div className="flex-1 flex flex-col justify-between px-7 pb-12 page-enter-anim subpage-top">
+              <div>
+                <p className="pf-fs-17 font-medium text-[var(--pf-i-45)]">
                   登录小米账号以连接手环
                 </p>
               </div>
 
               <form onSubmit={handleLogin} className="flex flex-col my-auto">
-                <div className="bg-white rounded-3xl p-2 flex flex-col divide-y divide-black/5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-2 flex flex-col divide-y divide-[var(--pf-bd-5)] shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
                   <div className="px-5 py-4">
                     <input
                       type="text"
@@ -7021,7 +7086,7 @@ export default function App() {
                         if (loginError) setLoginError(null);
                       }}
                       placeholder="小米账号 / 手机号 / 邮箱"
-                      className="w-full text-[17px] font-medium text-black placeholder:text-black/25 outline-none bg-transparent"
+                      className="w-full pf-fs-17 font-medium text-[var(--pf-ink)] placeholder:text-[var(--pf-i-25)] outline-none bg-transparent"
                     />
                   </div>
                   <div className="px-5 py-4">
@@ -7033,7 +7098,7 @@ export default function App() {
                         if (loginError) setLoginError(null);
                       }}
                       placeholder="密码"
-                      className="w-full text-[17px] font-medium text-black placeholder:text-black/25 outline-none bg-transparent"
+                      className="w-full pf-fs-17 font-medium text-[var(--pf-ink)] placeholder:text-[var(--pf-i-25)] outline-none bg-transparent"
                     />
                   </div>
                 </div>
@@ -7042,21 +7107,21 @@ export default function App() {
                 <button
                   type="submit"
                   disabled={!account.trim() || !password.trim() || isLoggingIn}
-                  className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/10 disabled:text-black/25 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 mt-5 tracking-tight"
+                  className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] disabled:bg-[var(--pf-bg-10)] disabled:text-[var(--pf-i-25)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 mt-5 tracking-tight"
                 >
                   <span>{loginButtonText}</span>
                 </button>
 
                 {/* 状态 C · 错误（行内提示，不弹窗，13px，#FF3B30） */}
                 {loginError && (
-                  <p className="text-[13px] text-[#FF3B30] text-center font-bold mt-3 animate-in fade-in">
+                  <p className="pf-fs-13 text-[var(--pf-danger)] text-center font-bold mt-3 animate-in fade-in">
                     {loginError}
                   </p>
                 )}
 
                 {/* 状态 B · 异常兜底（平时不可见，只有异常才出现，一行行内次级动作） */}
                 {showLoginFallback && (
-                  <div className="flex items-center justify-center gap-3 mt-3.5 text-[13px] font-bold text-black/80 animate-in fade-in">
+                  <div className="flex items-center justify-center gap-3 mt-3.5 pf-fs-13 font-bold text-[var(--pf-i-80)] animate-in fade-in">
                     <button
                       type="button"
                       onClick={() => {
@@ -7089,7 +7154,7 @@ export default function App() {
                           }, 1000);
                         }, 800);
                       }}
-                      className="text-[#4361EE] font-bold hover:underline cursor-pointer active:scale-95 transition-all"
+                      className="text-[var(--pf-primary)] font-bold hover:underline cursor-pointer active:scale-95 transition-all"
                     >
                       重新验证
                     </button>
@@ -7103,7 +7168,7 @@ export default function App() {
                     // 首屏 → 连接引导页（返回键回到首屏）
                     resetStackTo("welcome", "vivo-scan");
                   }}
-                  className="mt-5 text-[13px] font-semibold text-[#4361EE] text-center cursor-pointer active:scale-95 transition-all"
+                  className="mt-5 pf-fs-13 font-semibold text-[var(--pf-primary)] text-center cursor-pointer active:scale-95 transition-all"
                 >
                   我是 VIVO 用户
                 </button>
@@ -7111,12 +7176,12 @@ export default function App() {
 
               <div className="text-center space-y-2">
                 {/* 取得同意的落点：登录前必须能看到协议与政策（也放进「关于应用」页） */}
-                <p className="text-[12px] font-medium text-black/35 leading-relaxed">
+                <p className="pf-fs-12 font-medium text-[var(--pf-i-35)] leading-relaxed">
                   登录即表示同意
                   <button
                     type="button"
                     onClick={(e) => { openLink(e, `${LEGAL_BASE}/terms`); }}
-                    className="text-[#4361EE] font-bold cursor-pointer"
+                    className="text-[var(--pf-primary)] font-bold cursor-pointer"
                   >
                     《用户协议》
                   </button>
@@ -7124,7 +7189,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={(e) => { openLink(e, `${LEGAL_BASE}/privacy`); }}
-                    className="text-[#4361EE] font-bold cursor-pointer"
+                    className="text-[var(--pf-primary)] font-bold cursor-pointer"
                   >
                     《隐私政策》
                   </button>
@@ -7137,25 +7202,25 @@ export default function App() {
           {currentStep === "device_select" && (
             <div className="flex-1 flex flex-col min-h-0 px-7 safe-top pb-8 page-enter-anim">
               <div className="shrink-0 pt-1">
-                <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
+                <h1 className="pf-fs-32 font-bold text-[var(--pf-ink)] tracking-tight leading-tight">
                   选择设备
                 </h1>
-                <p className="text-[13px] font-medium text-black/40 mt-1.5">
+                <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1.5">
                   点按连接腕上设备
                 </p>
               </div>
 
               <div className="flex-1 min-h-0 overflow-hidden mt-6 -mx-1">
                 <div
-                  data-rb="y"
-                  data-rb-always="1"
+                  data-rb="y" data-rb-always="1"
+                 
                   className="h-full overflow-y-auto no-scrollbar px-1"
                 >
                   <div className="flex flex-col gap-3 pb-6">
                   {mockDevicesList.length === 0 ? (
                     /* C5. 空态样例 1：无设备 */
-                    <div className="bg-white rounded-3xl p-5 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
-                      <p className="text-[13px] font-medium text-black/40 leading-relaxed mb-4">
+                    <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                      <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] leading-relaxed mb-4">
                         {userProfile.nickname
                           ? "账号下暂无设备，可以重新导入小米账号设备"
                           : "还没有设备，点下方扫描附近的 vivo 手表即可连接"}
@@ -7182,7 +7247,7 @@ export default function App() {
                             }
                             setMockDevicesList(MOCK_DEVICES);
                           }}
-                          className="h-[44px] px-5 rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold text-[16px] cursor-pointer active:scale-95 transition-all"
+                          className="h-[44px] px-5 rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold pf-fs-16 cursor-pointer active:scale-95 transition-all"
                         >
                           重新导入小米设备
                         </button>
@@ -7211,7 +7276,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={startVivoScan}
-                      className="w-full h-[52px] rounded-2xl border border-dashed border-black/15 text-black/60 font-bold text-[16px] flex items-center justify-center gap-2 cursor-pointer active:scale-[0.99] transition-all"
+                      className="w-full h-[52px] rounded-2xl border border-dashed border-[var(--pf-bd-15)] text-[var(--pf-i-60)] font-bold pf-fs-16 flex items-center justify-center gap-2 cursor-pointer active:scale-[0.99] transition-all"
                     >
                       <Watch className="w-4 h-4" />
                       扫描附近的手表
@@ -7227,7 +7292,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => pushRoute("login")}
-                    className="h-11 px-5 rounded-full bg-white border border-black/5 text-[16px] font-bold text-[#4361EE] shadow-[0_1px_3px_rgba(0,0,0,0.02)] cursor-pointer active:scale-95 transition-all"
+                    className="h-11 px-5 rounded-full bg-[var(--pf-card)] border border-[var(--pf-bd-5)] pf-fs-16 font-bold text-[var(--pf-primary)] shadow-[0_1px_3px_rgba(0,0,0,0.02)] cursor-pointer active:scale-95 transition-all"
                   >
                     切换小米账号
                   </button>
@@ -7240,22 +7305,36 @@ export default function App() {
           {currentStep === "main" && (
             <div className="flex-1 flex flex-col overflow-hidden relative">
 
-              {/* 全局顶栏：状态栏底色（56px）+ 折叠标题。标题不在滚动容器里，
-                  靠 transform 跟着滚动缩小并滑到顶部居中，所以不会被顶栏裁掉。 */}
-              <div
-                className="absolute top-0 left-0 right-0 bg-[#F5F6F9] z-30 pointer-events-none"
-                style={{ height: HEADER_H }}
-                aria-hidden="true"
-              />
+              {/* 全局顶栏：Miuix 式渐进模糊（5 层递进 + 独立着色渐变，见 index.css）。
+                  标题不在滚动容器里，靠 transform 跟着滚动缩小并滑到顶部居中，所以不会被顶栏裁掉。 */}
+              <div className="pf-topbar-blur" style={{ height: HEADER_H }} aria-hidden="true">
+                <span className="pf-frost pf-frost-1" />
+                <span className="pf-frost pf-frost-2" />
+                <span className="pf-frost pf-frost-3" />
+                <span className="pf-frost pf-frost-4" />
+                <span className="pf-frost pf-frost-5" />
+                <span className="pf-topbar-tint" />
+              </div>
               {TAB_TITLES[activeTab] && (
-                <div
-                  key={activeTab}
-                  ref={collapseTitleRef}
-                  className="absolute z-30 pointer-events-none origin-top-left whitespace-nowrap text-[32px] font-bold text-black tracking-tight leading-none"
-                  style={{ left: TITLE_START_LEFT, top: TITLE_START_TOP, willChange: "transform" }}
-                >
-                  {TAB_TITLES[activeTab]}
-                </div>
+                <>
+                  {/* 大标题：只在页面顶部出现 */}
+                  <div
+                    key={`big-${activeTab}`}
+                    ref={collapseTitleRef}
+                    className="pf-title-big absolute z-30 pointer-events-none whitespace-nowrap pf-fs-32 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
+                    style={{ left: TITLE_START_LEFT, top: TITLE_START_TOP }}
+                  >
+                    {TAB_TITLES[activeTab]}
+                  </div>
+                  {/* 小标题：固定在顶部居中，滚动后淡入 */}
+                  <div
+                    ref={collapseSmallRef}
+                    className="pf-title-small absolute z-30 pointer-events-none whitespace-nowrap pf-fs-19 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
+                    style={{ top: TITLE_END_TOP, left: "50%", transform: "translateX(-50%)" }}
+                  >
+                    {TAB_TITLES[activeTab]}
+                  </div>
+                </>
               )}
               
               {/* Tab 1: 首页 */}
@@ -7267,40 +7346,40 @@ export default function App() {
                     <button
                       type="button"
                       onClick={openDeviceDrawer}
-                      className={`inline-flex items-center gap-2 px-3.5 h-[40px] bg-white rounded-full cursor-pointer active:scale-95 transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/5 ${
-                        isDeviceSwitchingAnim ? "ring-2 ring-[#4361EE] scale-105" : ""
+                      className={`inline-flex items-center gap-2 px-3.5 h-[40px] bg-[var(--pf-card)] rounded-full cursor-pointer active:scale-95 transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-[var(--pf-bd-5)] ${
+                        isDeviceSwitchingAnim ? "ring-2 ring-[var(--pf-primary)] scale-105" : ""
                       }`}
                     >
                       {/* 连接状态：绿点=已连接，红点=未连接；掉线自动重连中显示「重连中…」 */}
-                      <span className={`w-2 h-2 rounded-full ${isDeviceConnected ? "bg-[#34C759]" : linkRetrying ? "bg-[#D4973B]" : "bg-[#FF3B30]"}`} />
-                      <span className="text-[13px] font-bold text-black tracking-tight">
+                      <span className={`w-2 h-2 rounded-full ${isDeviceConnected ? "bg-[var(--pf-ok-solid)]" : linkRetrying ? "bg-[var(--pf-amber-solid)]" : "bg-[var(--pf-danger-solid)]"}`} />
+                      <span className="pf-fs-13 font-bold text-[var(--pf-ink)] tracking-tight">
                         {isDeviceConnected ? selectedDevice.name : linkRetrying ? "重连中…" : "未连接设备"}
                       </span>
-                      <div className="flex items-center gap-1 pl-0.5 text-[12px] font-bold text-black/40">
-                        <Lightning className="w-3.5 h-3.5 text-[#D4973B] fill-[#D4973B]" />
+                      <div className="flex items-center gap-1 pl-0.5 pf-fs-12 font-bold text-[var(--pf-i-40)]">
+                        <Lightning className="w-3.5 h-3.5 text-[var(--pf-amber)] fill-[var(--pf-amber)]" />
                         <span>{isDeviceConnected ? `${fmtBattery(selectedDevice.battery)}%` : "--%"}</span>
                       </div>
-                      <CaretRight className="w-3.5 h-3.5 text-black/25 stroke-[2] ml-0.5" />
+                      <CaretRight className="w-3.5 h-3.5 text-[var(--pf-i-25)] stroke-[2] ml-0.5" />
                     </button>
                     </div>
                   </div>
 
                   {/* 第一次用：4 步上手（看过一次就不再出现；设置里可随时打开） */}
                   {!onboardingSeen && !(isDeviceConnected && paidBound && dials.length > 0) && (
-                    <div className="mt-4 flex items-center bg-white rounded-2xl border border-black/5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                    <div className="mt-4 flex items-center bg-[var(--pf-card)] pf-card-border rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
                       <button
                         type="button"
                         onClick={openOnboardingGuide}
-                        className="flex-1 min-w-0 flex items-center gap-3 px-4 py-3 text-left active:bg-black/[0.02] rounded-l-2xl transition-colors cursor-pointer"
+                        className="flex-1 min-w-0 flex items-center gap-3 px-4 py-3 text-left active:bg-[var(--pf-bg-2)] rounded-l-2xl transition-colors cursor-pointer"
                       >
-                        <span className="w-8 h-8 shrink-0 rounded-full bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center">
+                        <span className="w-8 h-8 shrink-0 rounded-full bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center">
                           <Scroll className="w-4.5 h-4.5 stroke-[2]" />
                         </span>
                         <span className="min-w-0">
-                          <span className="block text-[13px] font-bold text-black leading-tight">
+                          <span className="block pf-fs-13 font-bold text-[var(--pf-ink)] leading-tight">
                             第一次用？4 步上手
                           </span>
-                          <span className="block text-[12px] font-medium text-black/45 mt-0.5 truncate">
+                          <span className="block pf-fs-12 font-medium text-[var(--pf-i-45)] mt-0.5 truncate">
                             连设备、登录爱发电、安装已购表盘
                           </span>
                         </span>
@@ -7312,7 +7391,7 @@ export default function App() {
                           setOnboardingSeen(true);
                           storeFlag(ONBOARDING_FLAG, true);
                         }}
-                        className="shrink-0 w-10 h-10 mr-1 rounded-full flex items-center justify-center text-black/25 hover:bg-black/5 cursor-pointer"
+                        className="shrink-0 w-10 h-10 mr-1 rounded-full flex items-center justify-center text-[var(--pf-i-25)] hover:bg-[var(--pf-bg-5)] cursor-pointer"
                       >
                         <X className="w-4 h-4 stroke-[2]" />
                       </button>
@@ -7327,18 +7406,18 @@ export default function App() {
                         <button
                           type="button"
                           onClick={handleLocalInstall}
-                          className="w-full text-left bg-white rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col justify-between min-h-[168px]"
+                          className="w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col justify-between min-h-[168px]"
                         >
                           <div>
-                            <h2 className="text-[22px] font-bold text-black tracking-tight leading-tight">
+                            <h2 className="pf-fs-22 font-bold text-[var(--pf-ink)] tracking-tight leading-tight">
                               本地资源安装
                             </h2>
-                            <p className="text-[13px] font-medium text-black/45 mt-1.5">
+                            <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5">
                               选择表盘或者快应用文件
                             </p>
                           </div>
                           <div className="flex justify-end">
-                            <span className="w-8 h-8 rounded-full bg-black/[0.04] text-black/30 flex items-center justify-center group-hover:bg-black/[0.06] group-hover:translate-x-0.5 transition-all">
+                            <span className="w-8 h-8 rounded-full bg-[var(--pf-bg-4)] text-[var(--pf-i-30)] flex items-center justify-center group-hover:bg-[var(--pf-bg-6)] group-hover:translate-x-0.5 transition-all">
                               <CaretRight className="w-4 h-4" />
                             </span>
                           </div>
@@ -7348,20 +7427,20 @@ export default function App() {
                           <button
                             type="button"
                             onClick={openPaidFlow}
-                            className="w-full flex items-center justify-between px-5 h-[52px] rounded-2xl bg-white active:scale-[0.98] transition-all text-black/80 cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                            className="w-full flex items-center justify-between px-5 h-[52px] rounded-2xl bg-[var(--pf-card)] pf-card-border active:scale-[0.98] transition-all text-[var(--pf-i-80)] cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
                           >
                             <div className="flex items-center gap-3">
-                              <Ticket className="w-5 h-5 text-black/40 stroke-[2]" />
-                              <span className="text-[16px] font-bold text-black/80">
+                              <Ticket className="w-5 h-5 text-[var(--pf-i-40)] stroke-[2]" />
+                              <span className="pf-fs-16 font-bold text-[var(--pf-i-80)]">
                                 安装已购表盘
                               </span>
                             </div>
                             {paidUpdateCount > 0 ? (
-                              <span className="shrink-0 text-[13px] font-bold text-[#D4973B]">
+                              <span className="shrink-0 pf-fs-13 font-bold text-[var(--pf-amber)]">
                                 {paidUpdateCount} 个可更新
                               </span>
                             ) : (
-                              <span className="text-[13px] font-medium text-black/40">
+                              <span className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
                                 爱发电
                               </span>
                             )}
@@ -7374,19 +7453,19 @@ export default function App() {
                         <button
                           type="button"
                           onClick={openPaidFlow}
-                          className="relative w-full text-left bg-white rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col justify-between min-h-[168px]"
+                          className="relative w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col justify-between min-h-[168px]"
                         >
                           {paidUpdateCount > 0 && (
-                            <span className="absolute right-5 top-5 min-w-[20px] h-5 px-1 rounded-full bg-[#D4973B] text-white text-[12px] font-bold flex items-center justify-center">
+                            <span className="absolute right-5 top-5 min-w-[20px] h-5 px-1 rounded-full bg-[var(--pf-amber-solid)] text-white pf-fs-12 font-bold flex items-center justify-center">
                               {paidUpdateCount}
                             </span>
                           )}
 
                           <div>
-                            <h2 className="text-[22px] font-bold text-black tracking-tight leading-tight">
+                            <h2 className="pf-fs-22 font-bold text-[var(--pf-ink)] tracking-tight leading-tight">
                               安装已购表盘
                             </h2>
-                            <p className="text-[13px] font-medium text-black/45 mt-1.5 pr-8">
+                            <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5 pr-8">
                               {paidUpdateCount > 0
                                 ? `有 ${paidUpdateCount} 个表盘可更新`
                                 : "绑定爱发电，同步你买过的表盘"}
@@ -7394,7 +7473,7 @@ export default function App() {
                           </div>
 
                           <div className="flex justify-end">
-                            <span className="w-8 h-8 rounded-full bg-black/[0.04] text-black/30 flex items-center justify-center group-hover:bg-black/[0.06] group-hover:translate-x-0.5 transition-all">
+                            <span className="w-8 h-8 rounded-full bg-[var(--pf-bg-4)] text-[var(--pf-i-30)] flex items-center justify-center group-hover:bg-[var(--pf-bg-6)] group-hover:translate-x-0.5 transition-all">
                               <CaretRight className="w-4 h-4" />
                             </span>
                           </div>
@@ -7406,15 +7485,15 @@ export default function App() {
                             <button
                               type="button"
                               onClick={handleLocalInstall}
-                              className="w-full flex items-center justify-between px-5 h-[52px] rounded-2xl bg-white active:scale-[0.98] transition-all text-black/80 cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                              className="w-full flex items-center justify-between px-5 h-[52px] rounded-2xl bg-[var(--pf-card)] pf-card-border active:scale-[0.98] transition-all text-[var(--pf-i-80)] cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
                             >
                               <div className="flex items-center gap-3">
-                                <FolderOpen className="w-5 h-5 text-black/40 stroke-[2]" />
-                                <span className="text-[16px] font-bold text-black/80">
+                                <FolderOpen className="w-5 h-5 text-[var(--pf-i-40)] stroke-[2]" />
+                                <span className="pf-fs-16 font-bold text-[var(--pf-i-80)]">
                                   本地资源安装
                                 </span>
                               </div>
-                              <span className="text-[13px] font-medium text-black/40">
+                              <span className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
                                 表盘 / 快应用
                               </span>
                             </button>
@@ -7428,15 +7507,15 @@ export default function App() {
                       <button
                         type="button"
                         onClick={openVideoFlow}
-                        className="mt-3 w-full flex items-center justify-between px-5 h-[52px] rounded-2xl bg-white active:scale-[0.98] transition-all text-black/80 cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                        className="mt-3 w-full flex items-center justify-between px-5 h-[52px] rounded-2xl bg-[var(--pf-card)] pf-card-border active:scale-[0.98] transition-all text-[var(--pf-i-80)] cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
                       >
                         <div className="flex items-center gap-3">
-                          <VideoCamera className="w-5 h-5 text-black/40 stroke-[2]" />
-                          <span className="text-[16px] font-bold text-black/80">
+                          <VideoCamera className="w-5 h-5 text-[var(--pf-i-40)] stroke-[2]" />
+                          <span className="pf-fs-16 font-bold text-[var(--pf-i-80)]">
                             制作视频表盘
                           </span>
                         </div>
-                        <span className="text-[13px] font-medium text-black/40">
+                        <span className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
                           上传视频生成
                         </span>
                       </button>
@@ -7457,20 +7536,20 @@ export default function App() {
                   {/* 搜索框 + 设备胶囊 + 标签胶囊：上面搜索，下面两颗胶囊共用一行 */}
                   <div className="mb-5 shrink-0">
                     <div className="relative mb-1.5">
-                      <MagnifyingGlass className="w-4 h-4 text-black/25 stroke-[2] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <MagnifyingGlass className="w-4 h-4 text-[var(--pf-i-25)] stroke-[2] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
                       <input
                         value={marketQuery}
                         onChange={e => setMarketQuery(e.target.value)}
                         placeholder="搜索表盘"
                         inputMode="search"
                         enterKeyHint="search"
-                        className="w-full h-11 pl-11 pr-11 rounded-full bg-white border border-black/5 text-[16px] font-medium text-black placeholder:text-black/30 outline-none"
+                        className="w-full h-11 pl-11 pr-11 rounded-full bg-[var(--pf-card)] border border-[var(--pf-bd-5)] pf-fs-16 font-medium text-[var(--pf-ink)] placeholder:text-[var(--pf-i-30)] outline-none"
                       />
                       {marketQuery.length > 0 && (
                         <button
                           type="button"
                           onClick={() => setMarketQuery("")}
-                          className="absolute right-2.5 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full bg-black/[0.06] flex items-center justify-center text-black/40 active:scale-95 transition-transform cursor-pointer"
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full bg-[var(--pf-bg-6)] flex items-center justify-center text-[var(--pf-i-40)] active:scale-95 transition-transform cursor-pointer"
                         >
                           <X className="w-3.5 h-3.5 stroke-[2.4]" />
                         </button>
@@ -7481,26 +7560,26 @@ export default function App() {
                       <button
                         type="button"
                         onClick={openDeviceDrawer}
-                        className={`flex-1 min-w-0 flex items-center justify-center gap-2 h-11 px-4 bg-white rounded-full cursor-pointer active:scale-[0.98] transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/5 ${
-                          isDeviceSwitchingAnim ? "ring-2 ring-[#4361EE]" : ""
+                        className={`flex-1 min-w-0 flex items-center justify-center gap-2 h-11 px-4 bg-[var(--pf-card)] rounded-full cursor-pointer active:scale-[0.98] transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-[var(--pf-bd-5)] ${
+                          isDeviceSwitchingAnim ? "ring-2 ring-[var(--pf-primary)]" : ""
                         }`}
                       >
-                        <span className={`w-2 h-2 rounded-full shrink-0 ${isDeviceConnected ? "bg-[#34C759]" : linkRetrying ? "bg-[#D4973B]" : "bg-[#FF3B30]"}`} />
-                        <span className="text-[13px] font-bold text-black tracking-tight truncate">
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${isDeviceConnected ? "bg-[var(--pf-ok-solid)]" : linkRetrying ? "bg-[var(--pf-amber-solid)]" : "bg-[var(--pf-danger-solid)]"}`} />
+                        <span className="pf-fs-13 font-bold text-[var(--pf-ink)] tracking-tight truncate">
                           {isDeviceConnected ? selectedDevice.name : linkRetrying ? "重连中…" : "未连接设备"}
                         </span>
-                        <CaretRight className="w-3.5 h-3.5 text-black/25 stroke-[2] shrink-0" />
+                        <CaretRight className="w-3.5 h-3.5 text-[var(--pf-i-25)] stroke-[2] shrink-0" />
                       </button>
 
                       {!marketError && marketLoaded && marketTagOptions(marketFaces).length > 0 && (
                         <button
                           type="button"
                           onClick={() => setMarketTagMenu(v => !v)}
-                          className="shrink-0 min-w-[76px] h-11 px-2.5 rounded-full bg-white border border-black/5 flex items-center justify-center gap-1.5 text-[13px] font-bold text-black tracking-tight shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.98] transition-all cursor-pointer"
+                          className="shrink-0 min-w-[76px] h-11 px-2.5 rounded-full bg-[var(--pf-card)] border border-[var(--pf-bd-5)] flex items-center justify-center gap-1.5 pf-fs-13 font-bold text-[var(--pf-ink)] tracking-tight shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.98] transition-all cursor-pointer"
                         >
                           <span className="truncate">{marketTag ?? "全部"}</span>
                           <CaretDown
-                            className={`w-3.5 h-3.5 text-black/30 stroke-[2] shrink-0 transition-transform duration-200 ${
+                            className={`w-3.5 h-3.5 text-[var(--pf-i-30)] stroke-[2] shrink-0 transition-transform duration-200 ${
                               marketTagMenu ? "rotate-180" : ""
                             }`}
                           />
@@ -7510,7 +7589,7 @@ export default function App() {
 
                     {/* 展开的标签菜单：整行宽度铺在卡片下面，三列网格 */}
                     {!marketError && marketLoaded && marketTagMenu && marketTagOptions(marketFaces).length > 0 && (
-                      <div className="mt-3 bg-white rounded-2xl border border-black/5 p-3.5 grid grid-cols-3 gap-2 page-enter-anim">
+                      <div className="mt-3 bg-[var(--pf-card)] pf-card-border rounded-2xl p-3.5 grid grid-cols-3 gap-2 page-enter-anim">
                         {[null as string | null, ...marketTagOptions(marketFaces)].map(tag => {
                           const active = marketTag === tag;
                           return (
@@ -7521,10 +7600,10 @@ export default function App() {
                                 setMarketTag(tag);
                                 setMarketTagMenu(false);
                               }}
-                              className={`h-9 w-full rounded-full text-[13px] font-bold transition-colors active:scale-95 cursor-pointer ${
+                              className={`h-9 w-full rounded-full pf-fs-13 font-bold transition-colors active:scale-95 cursor-pointer ${
                                 active
-                                  ? "bg-[#4361EE] text-white"
-                                  : "bg-black/[0.04] text-black/60"
+                                  ? "bg-[var(--pf-primary-solid)] text-white"
+                                  : "bg-[var(--pf-bg-4)] text-[var(--pf-i-60)]"
                               }`}
                             >
                               {tag ?? "全部"}
@@ -7555,7 +7634,7 @@ export default function App() {
                             key={b.id}
                             type="button"
                             onClick={e => openMarketBanner(e, b)}
-                            className="shrink-0 w-full snap-center rounded-3xl overflow-hidden bg-black/5 cursor-pointer active:scale-[0.99] transition-transform"
+                            className="shrink-0 w-full snap-center rounded-3xl overflow-hidden bg-[var(--pf-bg-5)] cursor-pointer active:scale-[0.99] transition-transform"
                           >
                             <div className="w-full aspect-[2.35/1]">
                               <img
@@ -7574,7 +7653,7 @@ export default function App() {
                             <span
                               key={b.id}
                               className={`h-1.5 rounded-full transition-all duration-200 ${
-                                i === marketBannerIndex ? "w-4 bg-[#4361EE]" : "w-1.5 bg-black/15"
+                                i === marketBannerIndex ? "w-4 bg-[var(--pf-primary-solid)]" : "w-1.5 bg-[var(--pf-bg-15)]"
                               }`}
                             />
                           ))}
@@ -7584,16 +7663,16 @@ export default function App() {
                   )}
 
                   {marketLoading && !marketLoaded && (
-                    <p className="text-[13px] font-medium text-black/40 text-center py-10">正在加载…</p>
+                    <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] text-center py-10">正在加载…</p>
                   )}
 
                   {marketError && (
                     <div className="px-1 py-8 text-center">
-                      <p className="text-[13px] font-bold text-[#FF3B30]">{marketError}</p>
+                      <p className="pf-fs-13 font-bold text-[var(--pf-danger)]">{marketError}</p>
                       <button
                         type="button"
                         onClick={() => void loadMarket()}
-                        className="mt-3 h-[40px] px-5 rounded-full bg-black/5 text-black/75 font-bold text-[13px] active:scale-95 transition-all cursor-pointer"
+                        className="mt-3 h-[40px] px-5 rounded-full bg-[var(--pf-bg-5)] text-[var(--pf-i-75)] font-bold pf-fs-13 active:scale-95 transition-all cursor-pointer"
                       >
                         重试
                       </button>
@@ -7602,7 +7681,7 @@ export default function App() {
 
                   {!marketError && marketLoaded && filterMarketFaces(marketFaces, marketTag, marketQuery).length === 0 && (
                     <div className="py-16 text-center">
-                      <p className="text-[16px] font-medium text-black/40">
+                      <p className="pf-fs-16 font-medium text-[var(--pf-i-40)]">
                         {marketQuery.trim()
                           ? "没有找到相关表盘"
                           : marketTag
@@ -7648,15 +7727,15 @@ export default function App() {
                                 className="w-full h-full block"
                               />
                               {face.has_update && (
-                                <span className="absolute top-1 right-1 h-5 px-1.5 rounded-full bg-white text-[10px] font-bold text-[#D4973B] shadow-[0_1px_3px_rgba(0,0,0,0.10)] flex items-center">
+                                <span className="absolute top-1 right-1 h-5 px-1.5 rounded-full bg-[var(--pf-card)] pf-card-border pf-fs-10 font-bold text-[var(--pf-amber)] shadow-[0_1px_3px_rgba(0,0,0,0.10)] flex items-center">
                                   可更新
                                 </span>
                               )}
                             </div>
-                            <div className="mt-1.5 w-full text-[14px] font-semibold text-black leading-snug truncate">
+                            <div className="mt-1.5 w-full pf-fs-14 font-semibold text-[var(--pf-ink)] leading-snug truncate">
                               {face.name}
                             </div>
-                            <div className="text-[13px] font-medium text-black/40">
+                            <div className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
                               {marketPriceLabel(face)}
                             </div>
                           </button>
@@ -7678,33 +7757,33 @@ export default function App() {
                     <button
                       type="button"
                       onClick={openDeviceDrawer}
-                      className={`w-full text-left bg-white rounded-3xl p-5 cursor-pointer active:scale-[0.98] transition-all flex items-center justify-between shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/5 ${
-                        isDeviceSwitchingAnim ? "ring-2 ring-[#4361EE] scale-[1.01]" : ""
+                      className={`w-full text-left bg-[var(--pf-card)] rounded-3xl p-5 cursor-pointer active:scale-[0.98] transition-all flex items-center justify-between shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-[var(--pf-bd-5)] ${
+                        isDeviceSwitchingAnim ? "ring-2 ring-[var(--pf-primary)] scale-[1.01]" : ""
                       }`}
                     >
                       <div className="flex items-center gap-3.5">
-                        <div className="w-11 h-11 rounded-xl bg-[#F5F6F9] flex items-center justify-center text-black/80 shrink-0">
+                        <div className="w-11 h-11 rounded-xl bg-[var(--pf-page)] flex items-center justify-center text-[var(--pf-i-80)] shrink-0">
                           <Watch className="w-5 h-5 stroke-[2]" />
                         </div>
                         <div>
                           {/* 两行同构：图标列统一 8px（状态点/闪电居中），文字列统一从 16px 起 —— 上下左对齐 */}
                           <div className="flex items-center gap-2">
-                            <span className={`w-2 h-2 rounded-full shrink-0 ${isDeviceConnected ? "bg-[#34C759]" : linkRetrying ? "bg-[#D4973B]" : "bg-[#FF3B30]"}`} />
-                            <h3 className="text-[17px] font-bold text-black leading-snug tracking-tight">
+                            <span className={`w-2 h-2 rounded-full shrink-0 ${isDeviceConnected ? "bg-[var(--pf-ok-solid)]" : linkRetrying ? "bg-[var(--pf-amber-solid)]" : "bg-[var(--pf-danger-solid)]"}`} />
+                            <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] leading-snug tracking-tight">
                               {isDeviceConnected ? selectedDevice.name : linkRetrying ? "重连中…" : "未连接设备"}
                             </h3>
                           </div>
-                          <div className="flex items-center gap-2 text-[13px] font-medium text-black/40 mt-0.5">
+                          <div className="flex items-center gap-2 pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5">
                             <span className="w-2 shrink-0 flex justify-center">
-                              <Lightning className="w-3 h-3 text-[#D4973B] fill-[#D4973B]" />
+                              <Lightning className="w-3 h-3 text-[var(--pf-amber)] fill-[var(--pf-amber)]" />
                             </span>
                             <span>电量 {isDeviceConnected ? `${fmtBattery(selectedDevice.battery)}%，已连接` : "--%"}</span>
                           </div>
                         </div>
                       </div>
 
-                      <div className="flex items-center text-black/25">
-                        <CaretRight className="w-5 h-5 text-black/25 stroke-[2]" />
+                      <div className="flex items-center text-[var(--pf-i-25)]">
+                        <CaretRight className="w-5 h-5 text-[var(--pf-i-25)] stroke-[2]" />
                       </div>
                     </button>
                   </div>
@@ -7712,7 +7791,7 @@ export default function App() {
                   {!isDeviceConnected ? (
                     /* 未连接设备：不显示任何表盘卡片（也没有预设假数据）；提示放在屏幕正中 */
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                      <p className="text-[13px] font-medium text-black/40">
+                      <p className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
                         请连接设备后再查看表盘列表
                       </p>
                     </div>
@@ -7722,8 +7801,8 @@ export default function App() {
                   }`}>
                     {dials.length === 0 ? (
                       /* C5. 空态样例 2：无表盘 */
-                      <div className="col-span-2 bg-white rounded-3xl p-5 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.02)] my-8">
-                        <p className="text-[13px] font-medium text-black/40 mb-4">
+                      <div className="col-span-2 bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.02)] my-8">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mb-4">
                           设备上还没有表盘
                         </p>
                         <button
@@ -7734,7 +7813,7 @@ export default function App() {
                               void refreshDials(connected.current.addr);
                             }
                           }}
-                          className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] cursor-pointer active:scale-95 transition-all"
+                          className="h-[44px] px-5 rounded-full bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] text-[var(--pf-i-75)] font-bold pf-fs-13 cursor-pointer active:scale-95 transition-all"
                         >
                           重新拉取表盘列表
                         </button>
@@ -7753,11 +7832,11 @@ export default function App() {
                           <div
                             key={dial.id}
                             onClick={() => handleOpenDialEdit(dial)}
-                            className={`rounded-3xl p-4 cursor-pointer active:scale-[0.96] transition-all flex flex-col justify-between min-h-[142px] bg-white border-2 shadow-[0_1px_3px_rgba(0,0,0,0.02)] relative group ${
+                            className={`rounded-3xl p-4 cursor-pointer active:scale-[0.96] transition-all flex flex-col justify-between min-h-[142px] bg-[var(--pf-card)] border-2 shadow-[0_1px_3px_rgba(0,0,0,0.02)] relative group ${
                               isMenuOpen ? "z-40" : "z-0"
                             } ${
                               dial.isCurrent
-                                ? "border-[#4361EE]"
+                                ? "border-[var(--pf-primary)]"
                                 : "border-transparent"
                             }`}
                           >
@@ -7774,7 +7853,7 @@ export default function App() {
                                       const hit = paidUpdateDials.get(dial.id);
                                       if (hit) runPaidInstall(hit.product, hit.variant);
                                     }}
-                                    className="shrink-0 whitespace-nowrap text-[12px] font-bold text-[#D4973B] bg-[#D4973B]/15 rounded-full px-2 py-0.5 cursor-pointer active:scale-95 transition-all"
+                                    className="shrink-0 whitespace-nowrap pf-fs-12 font-bold text-[var(--pf-amber)] bg-[var(--pf-amber-15)] rounded-full px-2 py-0.5 cursor-pointer active:scale-95 transition-all"
                                   >
                                     可更新
                                   </button>
@@ -7786,21 +7865,21 @@ export default function App() {
                                       const hit = marketUpdateDials.get(dial.id);
                                       if (hit) startMarketInstall(hit);
                                     }}
-                                    className="shrink-0 whitespace-nowrap text-[12px] font-bold text-[#D4973B] bg-[#D4973B]/15 rounded-full px-2 py-0.5 cursor-pointer active:scale-95 transition-all"
+                                    className="shrink-0 whitespace-nowrap pf-fs-12 font-bold text-[var(--pf-amber)] bg-[var(--pf-amber-15)] rounded-full px-2 py-0.5 cursor-pointer active:scale-95 transition-all"
                                   >
                                     可更新
                                   </button>
                                 ) : dial.isCurrent ? (
-                                  <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-[12px] font-bold text-[#4361EE]">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-[#4361EE]" />
+                                  <span className="inline-flex items-center gap-1.5 whitespace-nowrap pf-fs-12 font-bold text-[var(--pf-primary)]">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--pf-primary-solid)]" />
                                     使用中
                                   </span>
                                 ) : videoDialProjects[dial.id] ? (
-                                  <span className="whitespace-nowrap text-[12px] font-bold px-2 py-0.5 bg-[#4361EE]/10 text-[#4361EE] rounded-full">
+                                  <span className="whitespace-nowrap pf-fs-12 font-bold px-2 py-0.5 bg-[var(--pf-primary-10)] text-[var(--pf-primary)] rounded-full">
                                     视频
                                   </span>
                                 ) : dial.isPhotoDial ? (
-                                  <span className="whitespace-nowrap text-[12px] font-bold px-2 py-0.5 bg-black/5 text-black/40 rounded-full">
+                                  <span className="whitespace-nowrap pf-fs-12 font-bold px-2 py-0.5 bg-[var(--pf-bg-5)] text-[var(--pf-i-40)] rounded-full">
                                     照片
                                   </span>
                                 ) : null}
@@ -7817,7 +7896,7 @@ export default function App() {
                                     );
                                   }}
                                   aria-label="更多操作"
-                                  className="w-11 h-11 -mr-2 -mt-2 rounded-full flex items-center justify-center text-black/25 hover:text-black/80 hover:bg-black/5 active:scale-95 transition-all cursor-pointer relative z-40"
+                                  className="w-11 h-11 -mr-2 -mt-2 rounded-full flex items-center justify-center text-[var(--pf-i-25)] hover:text-[var(--pf-i-80)] hover:bg-[var(--pf-bg-5)] active:scale-95 transition-all cursor-pointer relative z-40"
                                 >
                                   <DotsThree className="w-6 h-6 stroke-[2]" />
                                 </button>
@@ -7827,7 +7906,7 @@ export default function App() {
                                 {isMenuOpen && (
                                   <div
                                       onClick={(e) => e.stopPropagation()}
-                                      className="absolute right-0 top-9 w-36 bg-white/95 backdrop-blur-2xl rounded-2xl shadow-[0_8px_24px_rgba(0,0,0,0.10)] border border-black/10 p-1.5 z-50 flex flex-col gap-0.5 animate-in fade-in zoom-in-95 origin-top-right duration-150"
+                                      className="absolute right-0 top-9 w-36 bg-[var(--pf-sheet)] backdrop-blur-2xl rounded-2xl shadow-[0_8px_24px_rgba(0,0,0,0.10)] border border-[var(--pf-bd-10)] p-1.5 z-50 flex flex-col gap-0.5 animate-in fade-in zoom-in-95 origin-top-right duration-150"
                                     >
                                       {!dial.isCurrent && (
                                         <button
@@ -7856,7 +7935,7 @@ export default function App() {
                                             }
                                             showToast(`已将「${dial.name}」设为当前手环表盘`);
                                           }}
-                                          className="w-full px-3 py-2 text-left text-[13px] font-bold text-black hover:bg-black/5 rounded-xl transition-colors cursor-pointer"
+                                          className="w-full px-3 py-2 text-left pf-fs-13 font-bold text-[var(--pf-ink)] hover:bg-[var(--pf-bg-5)] rounded-xl transition-colors cursor-pointer"
                                         >
                                           设为当前
                                         </button>
@@ -7870,7 +7949,7 @@ export default function App() {
                                             setActiveActionSheetDial(null);
                                             handleOpenDialEdit(dial);
                                           }}
-                                          className="w-full px-3 py-2 text-left text-[13px] font-bold text-black hover:bg-black/5 rounded-xl transition-colors cursor-pointer"
+                                          className="w-full px-3 py-2 text-left pf-fs-13 font-bold text-[var(--pf-ink)] hover:bg-[var(--pf-bg-5)] rounded-xl transition-colors cursor-pointer"
                                         >
                                           编辑表盘
                                         </button>
@@ -7882,7 +7961,7 @@ export default function App() {
                                           setActiveActionSheetDial(null);
                                           setUninstallConfirmDial(dial);
                                         }}
-                                        className="w-full px-3 py-2 text-left text-[13px] font-bold text-[#FF3B30] hover:bg-[#FF3B30]/10 rounded-xl transition-colors cursor-pointer"
+                                        className="w-full px-3 py-2 text-left pf-fs-13 font-bold text-[var(--pf-danger)] hover:bg-[var(--pf-danger-10)] rounded-xl transition-colors cursor-pointer"
                                       >
                                         卸载表盘
                                       </button>
@@ -7892,15 +7971,15 @@ export default function App() {
                             </div>
 
                             <div className="my-auto py-1">
-                              <h4 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                              <h4 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                                 {dial.name}
                               </h4>
                             </div>
 
-                            <div className="flex items-center justify-between pt-2 border-t border-black/5 text-[12px] font-medium text-black/25">
+                            <div className="flex items-center justify-between pt-2 border-t border-[var(--pf-bd-5)] pf-fs-12 font-medium text-[var(--pf-i-25)]">
                               <span>{luaIds.current[dial.id] ? "Lua 表盘" : "轻触编辑"}</span>
                               {!luaIds.current[dial.id] && (
-                                <CaretRight className="w-3.5 h-3.5 text-black/25 stroke-[2]" />
+                                <CaretRight className="w-3.5 h-3.5 text-[var(--pf-i-25)] stroke-[2]" />
                               )}
                             </div>
                           </div>
@@ -7919,112 +7998,48 @@ export default function App() {
                     {/* 大标题在全局顶栏里（折叠动画）；这里只留高度 */}
                     <div className="h-[60px] shrink-0" aria-hidden="true" />
 
-                    {/* 使用指引（4 步上手）：置顶，买家第一眼就能看到（用户 2026-10-17 要求） */}
-                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
+                    {/* 使用指引（4 步上手）：做成与「安装已购表盘」同尺寸的大卡，第一眼就能看到 */}
+                    <div className="mb-3">
                       <button
                         type="button"
                         onClick={openOnboardingGuide}
-                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                        className="w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.97] transition-all duration-200 cursor-pointer group flex flex-col justify-between min-h-[168px]"
                       >
-                        <div className="flex items-center gap-3.5 min-w-0">
-                          <div className="w-10 h-10 rounded-xl bg-[#4361EE] text-white flex items-center justify-center shrink-0">
-                            <Scroll className="w-5 h-5 stroke-[2]" />
-                          </div>
-                          <div className="min-w-0">
-                            <h4 className="text-[16px] font-bold text-black leading-tight">
-                              使用指引
-                            </h4>
-                            <p className="text-[13px] font-medium text-black/40 mt-0.5">
-                              4 步把已购表盘装上设备
-                            </p>
-                          </div>
+                        <div>
+                          <h2 className="pf-fs-22 font-bold text-[var(--pf-ink)] tracking-tight leading-tight">
+                            使用指引
+                          </h2>
+                          <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5">
+                            4 步把已购表盘装上设备
+                          </p>
                         </div>
-                        <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/45 transition-colors" />
+                        <div className="flex justify-end">
+                          <span className="w-8 h-8 rounded-full bg-[var(--pf-bg-4)] text-[var(--pf-i-30)] flex items-center justify-center group-hover:bg-[var(--pf-bg-6)] group-hover:translate-x-0.5 transition-all">
+                            <CaretRight className="w-4 h-4" />
+                          </span>
+                        </div>
                       </button>
                     </div>
 
-                    {/* 功能设置组 */}
-                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-black/5">
-                      {/* 1. 本地资源安装开关：52×30 · 开 #34C759 · 关 black/10 */}
-                      <div className="py-[18px] px-5 flex items-center justify-between">
-                        <div className="pr-3">
-                          <h4 className="text-[16px] font-bold text-black leading-tight">
-                            本地资源安装
-                          </h4>
-                          <p className="text-[13px] font-medium text-black/40 mt-1">
-                            开启后首页显示表盘和快应用安装入口
-                          </p>
-                        </div>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const next = !enableLocalInstall;
-                            setEnableLocalInstall(next);
-                            storeFlag("panfang.enableLocalInstall", next);
-                            if (!next && isPrimaryLocal) {
-                              setIsPrimaryLocal(false);
-                              storeFlag("panfang.primaryLocal", false);
-                            }
-                          }}
-                          className={`w-[52px] h-[30px] rounded-full p-1 transition-colors duration-200 cursor-pointer flex items-center shrink-0 ${
-                            enableLocalInstall ? "bg-[#34C759]" : "bg-black/10"
-                          }`}
-                        >
-                          <div
-                            className={`w-[22px] h-[22px] rounded-full bg-white shadow-xs transition-transform duration-200 ${
-                              enableLocalInstall ? "translate-x-[22px]" : "translate-x-0"
-                            }`}
-                          />
-                        </button>
-                      </div>
-
-                      {/* 2. 切换主次卡片按钮（在开启本地表盘后可用） */}
-                      {enableLocalInstall && (
-                        <div className="py-[18px] px-5 flex items-center justify-between">
-                          <div className="pr-3">
-                            <h4 className="text-[16px] font-bold text-black leading-tight">
-                              首页卡片主次切换
-                            </h4>
-                            <p className="text-[13px] font-medium text-black/40 mt-1">
-                              当前主卡片：{isPrimaryLocal ? "本地资源安装" : "安装已购表盘"}
-                            </p>
-                          </div>
-
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setIsPrimaryLocal(!isPrimaryLocal);
-                              storeFlag("panfang.primaryLocal", !isPrimaryLocal);
-                            }}
-                            className="flex items-center gap-1.5 px-3.5 h-[32px] rounded-full bg-black/5 hover:bg-black/10 active:bg-black/15 text-black font-bold text-[13px] cursor-pointer transition-all active:scale-95 shrink-0"
-                          >
-                            <ArrowsDownUp className="w-3.5 h-3.5 text-black/40 stroke-[2]" />
-                            <span>切换</span>
-                          </button>
-                        </div>
-                      )}
-                    </div>
-
                     {/* 账号：二级页（爱发电账号 / 小米账号 / 退出登录） */}
-                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
+                    <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
                       <button
                         type="button"
                         onClick={() => pushRoute("settings/account")}
-                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                        className="w-full py-[15px] px-5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
                       >
-                        <div className="flex items-center gap-3.5 min-w-0">
-                          <div className="w-10 h-10 rounded-xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center shrink-0">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-9 h-9 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
                             <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                               <circle cx="12" cy="8" r="4" />
                               <path d="M4 21a8 8 0 0 1 16 0" />
                             </svg>
                           </div>
                           <div className="min-w-0">
-                            <h4 className="text-[16px] font-bold text-black leading-tight">
+                            <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                               账号
                             </h4>
-                            <p className="text-[13px] font-medium text-black/40 mt-0.5 truncate">
+                            <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
                               {paidBound
                                 ? userProfile.nickname
                                   ? "爱发电、小米已绑定"
@@ -8035,26 +8050,26 @@ export default function App() {
                             </p>
                           </div>
                         </div>
-                        <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/45 transition-colors" />
+                        <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-45)] transition-colors" />
                       </button>
                     </div>
 
                     {/* 设备与连接：二级页（当前设备 / 重新导入 / 后台保持连接） */}
-                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
+                    <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
                       <button
                         type="button"
                         onClick={() => pushRoute("settings/device")}
-                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                        className="w-full py-[15px] px-5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
                       >
-                        <div className="flex items-center gap-3.5 min-w-0">
-                          <div className="w-10 h-10 rounded-xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center shrink-0">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-9 h-9 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
                             <Watch className="w-5 h-5 stroke-[2]" />
                           </div>
                           <div className="min-w-0">
-                            <h4 className="text-[16px] font-bold text-black leading-tight">
+                            <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                               设备与连接
                             </h4>
-                            <p className="text-[13px] font-medium text-black/40 mt-0.5 truncate">
+                            <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
                               {isDeviceConnected
                                 ? `已连接：${selectedDevice.name}`
                                 : linkRetrying
@@ -8063,31 +8078,55 @@ export default function App() {
                             </p>
                           </div>
                         </div>
-                        <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/45 transition-colors" />
+                        <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-45)] transition-colors" />
+                      </button>
+                    </div>
+
+                    {/* 个性化：外观 / 字号 / 本地资源安装 */}
+                    <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
+                      <button
+                        type="button"
+                        onClick={() => pushRoute("settings/appearance")}
+                        className="w-full py-[15px] px-5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-9 h-9 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
+                            <Palette className="w-5 h-5 stroke-[2]" />
+                          </div>
+                          <div className="min-w-0">
+                            <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
+                              个性化
+                            </h4>
+                            <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
+                              主题、字号、本地安装
+                            </p>
+                          </div>
+                        </div>
+                        <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-45)] transition-colors" />
                       </button>
                     </div>
 
                     {/* 关于应用 */}
-                    <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4">
+                    <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
                       <button
                         type="button"
                         onClick={() => pushRoute("about")}
-                        className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                        className="w-full py-[15px] px-5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
                       >
-                        <div className="flex items-center gap-3.5 min-w-0">
-                          <div className="w-10 h-10 rounded-xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center shrink-0">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-9 h-9 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
                             <Info className="w-5 h-5 stroke-[2]" />
                           </div>
                           <div className="min-w-0">
-                            <h4 className="text-[16px] font-bold text-black leading-tight">
+                            <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                               关于应用
                             </h4>
-                            <p className="text-[13px] font-medium text-black/40 mt-0.5">
+                            <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5">
                               开源许可与开发者
                             </p>
                           </div>
                         </div>
-                        <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/45 transition-colors" />
+                        <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-45)] transition-colors" />
                       </button>
                     </div>
 
@@ -8095,8 +8134,8 @@ export default function App() {
 
                   {/* 最底下一行版本号小字 */}
                   <div className="text-center pt-6 pb-2">
-                    <p className="text-[12px] font-medium text-black/40 tracking-wide">
-                      盘坊 v{appVersion ?? "0.4.2"}
+                    <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] tracking-wide">
+                      盘坊 v{appVersion ?? "0.4.5"}
                     </p>
                     {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
                     <a
@@ -8106,7 +8145,7 @@ export default function App() {
                       onClick={(e) => {
                         openLink(e, BEIAN_URL);
                       }}
-                      className="inline-block mt-1.5 text-[12px] font-medium text-black/30 hover:text-[#4361EE] transition-colors cursor-pointer"
+                      className="inline-block mt-1.5 pf-fs-12 font-medium text-[var(--pf-i-30)] hover:text-[var(--pf-primary)] transition-colors cursor-pointer"
                     >
                       {APP_BEIAN_NO}
                     </a>
@@ -8116,27 +8155,136 @@ export default function App() {
             </div>
           )}
 
+          {/* 3.39 设置 › 个性化（二级页）：外观 / 字号 / 本地资源安装 */}
+          {currentStep === "settings_appearance" && (
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
+              <div>
+
+                {/* 外观：跟随系统 / 深色 / 浅色 */}
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] divide-y divide-[var(--pf-bd-5)] mt-5">
+                  <div className="px-5 pt-3 pb-2">
+                    <h2 className="pf-fs-16 font-bold text-[var(--pf-ink)]">外观</h2>
+                  </div>
+                  {([
+                    { key: "system", label: "跟随系统" },
+                    { key: "dark", label: "深色" },
+                    { key: "light", label: "浅色" }
+                  ] as const).map(row => (
+                    <button
+                      key={row.key}
+                      type="button"
+                      onClick={() => changeThemeMode(row.key)}
+                      className="w-full px-5 py-[12px] flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer"
+                    >
+                      <span className="pf-fs-15 font-medium text-[var(--pf-ink)]">{row.label}</span>
+                      {themeMode === row.key && (
+                        <Check className="w-5 h-5 shrink-0 text-[var(--pf-primary)] stroke-[2.4]" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                {/* 字号 */}
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] divide-y divide-[var(--pf-bd-5)] mt-3">
+                  <div className="px-5 pt-3 pb-2">
+                    <h2 className="pf-fs-16 font-bold text-[var(--pf-ink)]">字号</h2>
+                  </div>
+                  {([
+                    { key: "small", label: "小" },
+                    { key: "standard", label: "标准" },
+                    { key: "large", label: "大" }
+                  ] as const).map(row => (
+                    <button
+                      key={row.key}
+                      type="button"
+                      onClick={() => changeFontSizeMode(row.key)}
+                      className="w-full px-5 py-[12px] flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer"
+                    >
+                      <span className="pf-fs-15 font-medium text-[var(--pf-ink)]">{row.label}</span>
+                      {fontSizeMode === row.key && (
+                        <Check className="w-5 h-5 shrink-0 text-[var(--pf-primary)] stroke-[2.4]" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                {/* 本地资源安装：开关（原设置页那一组，挪到这里） */}
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] divide-y divide-[var(--pf-bd-5)] mt-3">
+                  <div className="px-5 py-[12px] flex items-center justify-between">
+                    <div className="pr-3 min-w-0">
+                      <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
+                        本地资源安装
+                      </h4>
+                      <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5">
+                        开启后可勾选首页主卡片
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = !enableLocalInstall;
+                        setEnableLocalInstall(next);
+                        storeFlag("panfang.enableLocalInstall", next);
+                        if (!next && isPrimaryLocal) {
+                          setIsPrimaryLocal(false);
+                          storeFlag("panfang.primaryLocal", false);
+                        }
+                      }}
+                      className={`w-[52px] h-[30px] rounded-full p-1 transition-colors duration-200 cursor-pointer flex items-center shrink-0 ${
+                        enableLocalInstall ? "bg-[var(--pf-ok-solid)]" : "bg-[var(--pf-bg-10)]"
+                      }`}
+                    >
+                      <div
+                        className={`w-[22px] h-[22px] rounded-full bg-white shadow-xs transition-transform duration-200 ${
+                          enableLocalInstall ? "translate-x-[22px]" : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {enableLocalInstall && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsPrimaryLocal(false);
+                          storeFlag("panfang.primaryLocal", false);
+                        }}
+                        className="w-full px-5 py-[12px] flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer"
+                      >
+                        <span className="pf-fs-15 font-medium text-[var(--pf-ink)]">付费资源</span>
+                        {!isPrimaryLocal && (
+                          <Check className="w-5 h-5 shrink-0 text-[var(--pf-primary)] stroke-[2.4]" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsPrimaryLocal(true);
+                          storeFlag("panfang.primaryLocal", true);
+                        }}
+                        className="w-full px-5 py-[12px] flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer"
+                      >
+                        <span className="pf-fs-15 font-medium text-[var(--pf-ink)]">本地资源安装</span>
+                        {isPrimaryLocal && (
+                          <Check className="w-5 h-5 shrink-0 text-[var(--pf-primary)] stroke-[2.4]" />
+                        )}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* 3.4 设置 › 账号（二级页）：爱发电账号 / 小米账号 / 退出登录 */}
           {currentStep === "settings_account" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
               <div>
-                <button
-                  type="button"
-                  onClick={() => goBackOr("main/settings")}
-                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                >
-                  <CaretLeft className="w-6 h-6 stroke-[2]" />
-                </button>
-
-                <div className="px-1 pt-6 pb-7">
-                  <h1 className="text-[32px] font-bold text-black tracking-tight leading-none">
-                    账号
-                  </h1>
-                </div>
 
                 {/* ① 爱发电账号：所有用户都要绑，放在最上面、做得最醒目（用户 2026-11-15 要求）。
                     买家报障时截这一张图，卖家就能把人对上。 */}
-                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
                   <div className="px-5 pt-6 pb-5">
                     <div className="flex items-center gap-2.5">
                       {/* 爱发电 brand 图标（Figma 里画的真商标：紫底 + 白色 logo） */}
@@ -8145,35 +8293,35 @@ export default function App() {
                         alt=""
                         className="w-8 h-8 shrink-0 rounded-xl"
                       />
-                      <p className="text-[13px] font-bold text-black/40">爱发电账号</p>
+                      <p className="pf-fs-13 font-bold text-[var(--pf-i-40)]">爱发电账号</p>
                     </div>
                     {paidBound ? (
                       <>
-                        <p className="text-[22px] font-bold text-black mt-3 truncate">
+                        <p className="pf-fs-22 font-bold text-[var(--pf-ink)] mt-3 truncate">
                           {paidAfdianName || "已绑定"}
                         </p>
                         {/* 昵称可能重名、也可能是空的，唯一的这个才是卖家能查的 */}
                         {(paidAfdianId || paidDisplay) && (
-                          <p className="text-[12px] font-medium text-black/30 mt-1 break-all">
+                          <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-1 break-all">
                             爱发电 ID {paidAfdianId || `…${paidDisplay}`}
                           </p>
                         )}
-                        <p className="text-[12px] font-medium text-black/30 mt-1">
+                        <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-1">
                           买过的表盘都会同步到这里
                         </p>
                       </>
                     ) : (
                       <>
-                        <p className="text-[22px] font-bold text-black mt-3">未绑定</p>
-                        <p className="text-[12px] font-medium text-black/30 mt-1">
+                        <p className="pf-fs-22 font-bold text-[var(--pf-ink)] mt-3">未绑定</p>
+                        <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-1">
                           绑定后同步你在爱发电买过的表盘
                         </p>
                       </>
                     )}
                   </div>
                   <div
-                    className={`border-t border-black/5 ${
-                      paidBound ? "grid grid-cols-2 divide-x divide-black/5" : ""
+                    className={`border-t border-[var(--pf-bd-5)] ${
+                      paidBound ? "grid grid-cols-2 divide-x divide-[var(--pf-bd-5)]" : ""
                     }`}
                   >
                     {paidBound ? (
@@ -8181,14 +8329,14 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => setPaidAccountConfirm("switch")}
-                          className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                          className="py-3.5 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                         >
                           重新绑定
                         </button>
                         <button
                           type="button"
                           onClick={() => setPaidAccountConfirm("logout")}
-                          className="py-3.5 text-[16px] font-bold text-[#FF3B30] active:bg-black/5 transition-colors cursor-pointer"
+                          className="py-3.5 pf-fs-16 font-bold text-[var(--pf-danger)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                         >
                           退出绑定
                         </button>
@@ -8197,7 +8345,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => goPaidBindPage()}
-                        className="w-full py-3.5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
+                        className="w-full py-3.5 pf-fs-16 font-bold text-[var(--pf-primary)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                       >
                         绑定爱发电账号
                       </button>
@@ -8207,43 +8355,43 @@ export default function App() {
 
                 {/* ② 小米账号（可选）：只为连接小米设备。放在爱发电下面、做成紧凑卡，
                     vivo 用户不会误以为「必须登录小米账号」（用户 2026-11-15 反馈）。 */}
-                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
                   <div className="px-5 pt-4 pb-3.5">
                     <div className="flex items-center gap-2.5">
-                      <div className="w-7 h-7 shrink-0 rounded-lg bg-black/5 flex items-center justify-center">
-                        <User className="w-4 h-4 text-black/45 stroke-[2]" />
+                      <div className="w-7 h-7 shrink-0 rounded-lg bg-[var(--pf-bg-5)] flex items-center justify-center">
+                        <User className="w-4 h-4 text-[var(--pf-i-45)] stroke-[2]" />
                       </div>
-                      <p className="text-[13px] font-bold text-black/40">小米账号</p>
-                      <span className="ml-auto text-[12px] font-bold text-black/25">可选</span>
+                      <p className="pf-fs-13 font-bold text-[var(--pf-i-40)]">小米账号</p>
+                      <span className="ml-auto pf-fs-12 font-bold text-[var(--pf-i-25)]">可选</span>
                     </div>
-                    <p className="text-[16px] font-bold text-black mt-2 truncate">
+                    <p className="pf-fs-16 font-bold text-[var(--pf-ink)] mt-2 truncate">
                       {userProfile.nickname || "未登录"}
                     </p>
                     {/* 小米 ID：卖家在订单表里就是按这个（miUserId）认人的 */}
                     {miUserId && (
-                      <p className="text-[12px] font-medium text-black/30 mt-0.5 break-all">
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-0.5 break-all">
                         小米 ID {miUserId}
                       </p>
                     )}
                     {!userProfile.nickname && (
-                      <p className="text-[12px] font-medium text-black/30 mt-0.5">
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-0.5">
                         仅连接小米手环 / 手表时需要
                       </p>
                     )}
                   </div>
                   {userProfile.nickname ? (
-                    <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+                    <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                       <button
                         type="button"
                         onClick={() => pushRoute("login")} // 登录页压在账号页上，返回能回账号页
-                        className="py-3 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                        className="py-3 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                       >
                         切换账号
                       </button>
                       <button
                         type="button"
                         onClick={() => setShowLogoutConfirm(true)}
-                        className="py-3 text-[16px] font-bold text-[#FF3B30] active:bg-black/5 transition-colors cursor-pointer"
+                        className="py-3 pf-fs-16 font-bold text-[var(--pf-danger)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                       >
                         退出登录
                       </button>
@@ -8252,7 +8400,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => pushRoute("login")}
-                      className="w-full py-3 text-[16px] font-bold text-[#4361EE] border-t border-black/5 active:bg-black/5 transition-colors cursor-pointer"
+                      className="w-full py-3 pf-fs-16 font-bold text-[var(--pf-primary)] border-t border-[var(--pf-bd-5)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                     >
                       去登录小米账号
                     </button>
@@ -8262,21 +8410,21 @@ export default function App() {
                 {/* ③ VIVO 设备（无需账号）：只在本机记着设备、没有云端账号 —— 对应小米账号的「身份」位置。
                     纯小米用户看不到这张卡，避免多一个选项。 */}
                 {(vivoDeviceList.length > 0 || deviceVendor() === "vivo" || readOnboarding() === "vivo") && (
-                  <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
+                  <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3">
                     <div className="px-5 pt-4 pb-3.5">
                       <div className="flex items-center gap-2.5">
-                        <div className="w-7 h-7 shrink-0 rounded-lg bg-[#4361EE]/10 flex items-center justify-center">
-                          <Watch className="w-4 h-4 text-[#4361EE] stroke-[2]" />
+                        <div className="w-7 h-7 shrink-0 rounded-lg bg-[var(--pf-primary-10)] flex items-center justify-center">
+                          <Watch className="w-4 h-4 text-[var(--pf-primary)] stroke-[2]" />
                         </div>
-                        <p className="text-[13px] font-bold text-black/40">VIVO 设备</p>
-                        <span className="ml-auto text-[12px] font-bold text-black/25">无需账号</span>
+                        <p className="pf-fs-13 font-bold text-[var(--pf-i-40)]">VIVO 设备</p>
+                        <span className="ml-auto pf-fs-12 font-bold text-[var(--pf-i-25)]">无需账号</span>
                       </div>
-                      <p className="text-[16px] font-bold text-black mt-2 truncate">
+                      <p className="pf-fs-16 font-bold text-[var(--pf-ink)] mt-2 truncate">
                         {vivoDeviceList.length > 0
                           ? vivoDeviceList.map(d => d.name).join("、")
                           : "还没有连接过"}
                       </p>
-                      <p className="text-[12px] font-medium text-black/30 mt-0.5">
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-0.5">
                         {vivoDeviceList.length > 0
                           ? `已绑定 ${vivoDeviceList.length} 台，扫描即可连接新的手表`
                           : "扫描附近的设备即可连接"}
@@ -8285,7 +8433,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => pushRoute("vivo-scan")}
-                      className="w-full py-3 text-[16px] font-bold text-[#4361EE] border-t border-black/5 active:bg-black/5 transition-colors cursor-pointer"
+                      className="w-full py-3 pf-fs-16 font-bold text-[var(--pf-primary)] border-t border-[var(--pf-bd-5)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                     >
                       {vivoDeviceList.length > 0 ? "扫描新的手表" : "扫描附近的设备"}
                     </button>
@@ -8297,34 +8445,21 @@ export default function App() {
 
           {/* 3.45 设置 › 设备与连接（二级页）：当前设备 / 重新导入 / 后台保持连接 */}
           {currentStep === "settings_device" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
               <div>
-                <button
-                  type="button"
-                  onClick={() => goBackOr("main/settings")}
-                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                >
-                  <CaretLeft className="w-6 h-6 stroke-[2]" />
-                </button>
 
-                <div className="px-1 pt-6 pb-7">
-                  <h1 className="text-[32px] font-bold text-black tracking-tight leading-none">
-                    设备与连接
-                  </h1>
-                </div>
-
-                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-black/5">
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-[var(--pf-bd-5)]">
                   {/* 当前设备：点按打开设备浮窗（全局覆盖层，返回只关浮窗） */}
                   <button
                     type="button"
                     onClick={openDeviceDrawer}
-                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer"
                   >
                     <div className="min-w-0">
-                      <h4 className="text-[16px] font-bold text-black leading-tight">
+                      <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                         当前设备
                       </h4>
-                      <p className="text-[13px] font-medium text-black/40 mt-1 truncate">
+                      <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1 truncate">
                         {isDeviceConnected
                           ? `已连接：${selectedDevice.name}`
                           : linkRetrying
@@ -8332,29 +8467,29 @@ export default function App() {
                             : "未连接"}
                       </p>
                     </div>
-                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                    <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2]" />
                   </button>
 
                   {/* vivo 绑定状态：型号/固件、绑到哪台手机、上次成功通道（失败静默，不占页面） */}
                   {deviceVendor() === "vivo" && (vivoBindState || vivoDeviceInfo) && (
                     <div className="px-5 py-3.5 space-y-1.5">
                       <div className="flex items-center justify-between gap-3">
-                        <span className="text-[13px] font-medium text-black/40">型号 / 固件</span>
-                        <span className="text-[13px] font-bold text-black/70 text-right truncate">
+                        <span className="pf-fs-13 font-medium text-[var(--pf-i-40)]">型号 / 固件</span>
+                        <span className="pf-fs-13 font-bold text-[var(--pf-i-70)] text-right truncate">
                           {[vivoDeviceInfo?.model, vivoDeviceInfo?.firmwareVersion]
                             .filter(Boolean)
                             .join("，") || "—"}
                         </span>
                       </div>
                       <div className="flex items-center justify-between gap-3">
-                        <span className="text-[13px] font-medium text-black/40">绑定状态</span>
-                        <span className="text-[13px] font-bold text-black/70 text-right">
+                        <span className="pf-fs-13 font-medium text-[var(--pf-i-40)]">绑定状态</span>
+                        <span className="pf-fs-13 font-bold text-[var(--pf-i-70)] text-right">
                           {vivoBindState?.label || "未知"}
                         </span>
                       </div>
                       <div className="flex items-center justify-between gap-3">
-                        <span className="text-[13px] font-medium text-black/40">连接通道</span>
-                        <span className="text-[13px] font-bold text-black/70 text-right">
+                        <span className="pf-fs-13 font-medium text-[var(--pf-i-40)]">连接通道</span>
+                        <span className="pf-fs-13 font-bold text-[var(--pf-i-70)] text-right">
                           {vivoBindState?.channel === "ble"
                             ? "BLE"
                             : vivoBindState?.channel === "spp"
@@ -8388,17 +8523,17 @@ export default function App() {
                         setMockDevicesList(MOCK_DEVICES);
                         openDeviceDrawer();
                       }}
-                      className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                      className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer"
                     >
                       <div className="pr-3">
-                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                           重新导入小米设备
                         </h4>
-                        <p className="text-[13px] font-medium text-black/40 mt-1">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1">
                           从小米账号重新拉取设备列表
                         </p>
                       </div>
-                      <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                      <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2]" />
                     </button>
                   )}
 
@@ -8407,17 +8542,17 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => pushRoute("vivo-scan")}
-                      className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                      className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer"
                     >
                       <div className="pr-3">
-                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                           扫描附近的 vivo 手表
                         </h4>
-                        <p className="text-[13px] font-medium text-black/40 mt-1">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1">
                           无需账号，手表进「连接新手机」即可连上
                         </p>
                       </div>
-                      <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                      <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2]" />
                     </button>
                   )}
 
@@ -8451,17 +8586,17 @@ export default function App() {
                           showToast("请在系统设置里允许盘坊后台运行", "error");
                         });
                     }}
-                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer"
+                    className="w-full py-[18px] px-5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer"
                   >
                     <div className="pr-3">
-                      <h4 className="text-[16px] font-bold text-black leading-tight">
+                      <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                         后台保持连接
                       </h4>
-                      <p className="text-[13px] font-medium text-black/40 mt-1">
+                      <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1">
                         打开系统的电池设置，允许盘坊在后台运行
                       </p>
                     </div>
-                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2]" />
+                    <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2]" />
                   </button>
                 </div>
               </div>
@@ -8515,81 +8650,69 @@ export default function App() {
               }
             ];
             return (
-              <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim overflow-y-auto no-scrollbar">
-                <div>
-                  <button
-                    type="button"
-                    onClick={() => goBackOr("main/home")}
-                    className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                  >
-                    <CaretLeft className="w-6 h-6 stroke-[2]" />
-                  </button>
-
-                  <div className="pt-6 pb-5">
-                    <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
-                      怎么连上手环
-                    </h1>
-                    <p className="text-[13px] font-medium text-black/45 mt-2">
-                      连不上多半是因为{devWord}还没进入「连接新手机」模式
-                    </p>
-                  </div>
-
-                  <div className="space-y-3">
-                    {steps.map((s, i) => (
-                      <div
-                        key={i}
-                        className="bg-white rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex items-start gap-4"
-                      >
-                        <div className="w-9 h-9 rounded-full bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center shrink-0">
-                          {s.icon}
+              <div className="flex-1 flex flex-col min-h-0 page-enter-anim">
+                <div
+                  data-rb="y" data-rb-always="1"
+                  className="flex-1 overflow-y-auto no-scrollbar px-7 subpage-top"
+                >
+                  <div className="min-h-full flex flex-col justify-center py-4">
+                    <div className="space-y-3">
+                      {steps.map((s, i) => (
+                        <div
+                          key={i}
+                          className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex items-start gap-3.5"
+                        >
+                          <span className="w-8 h-8 rounded-full bg-[var(--pf-primary-10)] text-[var(--pf-primary)] pf-fs-14 font-bold flex items-center justify-center shrink-0">
+                            {i + 1}
+                          </span>
+                          <div className="flex-1 min-w-0">
+                            <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
+                              {s.title}
+                            </h3>
+                            <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1 leading-snug">
+                              {s.desc}
+                            </p>
+                          </div>
                         </div>
-                        <div className="flex-1 min-w-0">
-                          <h3 className="text-[16px] font-bold text-black leading-tight">
-                            {i + 1}. {s.title}
-                          </h3>
-                          <p className="text-[13px] font-medium text-black/45 mt-1">{s.desc}</p>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
 
-                  <p className="text-[13px] font-medium text-black/40 mt-4 leading-snug">
-                    不同系统版本的菜单名称可能略有差异，找到「连接新手机」即可。
-                  </p>
-
-                  {connectError && (
-                    <p className="text-[13px] font-bold text-[#FF3B30] mt-4">
-                      还是没连上，请确认{devWord}正处于「连接新手机」界面
+                    <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-4 leading-snug">
+                      不同系统版本的菜单名称可能略有差异，找到「连接新手机」即可。
                     </p>
-                  )}
+
+                    {connectError && (
+                      <p className="pf-fs-13 font-bold text-[var(--pf-danger)] mt-4">
+                        还是没连上，请确认{devWord}正处于「连接新手机」界面
+                      </p>
+                    )}
+
+                    {diagText && (
+                      <textarea
+                        readOnly
+                        value={diagText}
+                        rows={Math.min(8, diagText.split("\n").length + 1)}
+                        className="w-full mt-3 pf-fs-12 font-medium text-[var(--pf-i-55)] bg-[var(--pf-bg-3)] rounded-2xl p-3 outline-none resize-none select-text leading-relaxed"
+                      />
+                    )}
+                  </div>
                 </div>
 
-                <div className="pt-6">
-                  <button
-                    type="button"
-                    disabled={connecting || !failedDevice}
-                    onClick={() => failedDevice && handleSelectDevice(failedDevice)}
-                    className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/10 disabled:text-black/25 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
-                  >
-                    {connecting ? "正在连接…" : "我已设置好，重新连接"}
-                  </button>
-                  <div className="flex justify-center mt-4">
+                <div className="shrink-0 bg-[var(--pf-page)] px-7 pt-2 pb-6 safe-bottom">
+                  <div className="flex items-center justify-center gap-5 mb-4">
                     <button
                       type="button"
                       onClick={(e) => {
                         openLink(e, paidShopUrl || "https://afdian.com/a/Hobjl");
                       }}
-                      className="text-[13px] font-bold text-black/45 hover:text-black/70 transition-colors cursor-pointer"
+                      className="pf-fs-13 font-bold text-[var(--pf-primary)] active:opacity-60 transition-opacity cursor-pointer"
                     >
-                      还是连不上？联系开发者 ›
+                      联系开发者
                     </button>
-                  </div>
-                  {/* 找开发者之前先把「版本 + 机型 + 最近问题」复制好：省掉来回问现象 */}
-                  <div className="flex justify-center items-center gap-4 mt-3">
                     <button
                       type="button"
                       onClick={() => void copyDiag()}
-                      className="text-[13px] font-bold text-[#4361EE]/80 hover:text-[#4361EE] transition-colors cursor-pointer"
+                      className="pf-fs-13 font-bold text-[var(--pf-primary)] active:opacity-60 transition-opacity cursor-pointer"
                     >
                       复制诊断信息
                     </button>
@@ -8597,19 +8720,19 @@ export default function App() {
                       type="button"
                       disabled={diagBusy}
                       onClick={() => void exportDiag()}
-                      className="text-[13px] font-bold text-[#4361EE]/80 hover:text-[#4361EE] transition-colors cursor-pointer disabled:opacity-50"
+                      className="pf-fs-13 font-bold text-[var(--pf-primary)] active:opacity-60 transition-opacity cursor-pointer disabled:opacity-50"
                     >
                       {diagBusy ? "正在导出…" : "导出诊断包"}
                     </button>
                   </div>
-                  {diagText && (
-                    <textarea
-                      readOnly
-                      value={diagText}
-                      rows={Math.min(8, diagText.split("\n").length + 1)}
-                      className="w-full mt-3 text-[12px] font-medium text-black/55 bg-black/[0.03] rounded-2xl p-3 outline-none resize-none select-text leading-relaxed"
-                    />
-                  )}
+                  <button
+                    type="button"
+                    disabled={connecting || !failedDevice}
+                    onClick={() => failedDevice && handleSelectDevice(failedDevice)}
+                    className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] disabled:bg-[var(--pf-bg-10)] disabled:text-[var(--pf-i-25)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
+                  >
+                    {connecting ? "正在连接…" : "我已设置好，重新连接"}
+                  </button>
                 </div>
               </div>
             );
@@ -8667,85 +8790,72 @@ export default function App() {
               }
             ];
             return (
-              <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim overflow-y-auto no-scrollbar">
-                <div>
-                  <button
-                    type="button"
-                    onClick={() => goBackOr("main/home")}
-                    className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                  >
-                    <CaretLeft className="w-6 h-6 stroke-[2]" />
-                  </button>
-
-                  <div className="pt-5 pb-4">
-                    <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
-                      4 步上手
-                    </h1>
-                    <p className="text-[13px] font-medium text-black/45 mt-2">
-                      第一次用盘坊？按顺序做完这四步就能装好第一块表盘。
-                    </p>
-                  </div>
-
-                  <div className="space-y-3">
+              <div className="flex-1 flex flex-col min-h-0 page-enter-anim">
+                <div
+                  data-rb="y" data-rb-always="1"
+                  className="flex-1 overflow-y-auto no-scrollbar px-7 subpage-top"
+                >
+                  <div className="min-h-full flex flex-col justify-center py-1">
+                  <div className="space-y-2.5">
                     {steps.map((s, i) => (
                       <button
                         key={i}
                         type="button"
                         onClick={s.onAction}
-                        className="w-full text-left bg-white rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex items-start gap-3.5 active:scale-[0.99] transition-all cursor-pointer"
+                        className="w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-3.5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex items-start gap-3.5 active:scale-[0.99] transition-all cursor-pointer"
                       >
                         <span
                           className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${
                             s.done
-                              ? "bg-[#34C759]/12 text-[#34C759]"
-                              : "bg-[#4361EE]/10 text-[#4361EE]"
+                              ? "bg-[#34C759]/12 text-[var(--pf-ok)]"
+                              : "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
                           }`}
                         >
                           {s.done ? (
                             <Check className="w-4.5 h-4.5 stroke-[2.5]" />
                           ) : (
-                            <span className="text-[16px] font-bold">{i + 1}</span>
+                            <span className="pf-fs-16 font-bold">{i + 1}</span>
                           )}
                         </span>
                         <span className="flex-1 min-w-0">
                           <span className="flex items-center gap-2">
-                            <span className="text-[16px] font-bold text-black leading-tight">
+                            <span className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                               {s.title}
                             </span>
                             {s.done && (
-                              <span className="text-[12px] font-bold text-[#34C759]">
+                              <span className="pf-fs-12 font-bold text-[var(--pf-ok)]">
                                 {s.doneText}
                               </span>
                             )}
                           </span>
-                          <span className="block text-[13px] font-medium text-black/45 mt-0.5 leading-snug">
+                          <span className="block pf-fs-13 font-medium text-[var(--pf-i-45)] mt-0.5 leading-snug">
                             {s.desc}
                           </span>
-                          <span className="inline-block mt-1.5 text-[13px] font-bold text-[#4361EE]">
+                          <span className="inline-block mt-1.5 pf-fs-13 font-bold text-[var(--pf-primary)]">
                             {s.action} ›
                           </span>
                         </span>
                       </button>
                     ))}
                   </div>
+                  </div>
+                </div>
 
-                  <p className="text-[13px] font-medium text-black/40 mt-4 leading-snug">
+                <div className="shrink-0 bg-[var(--pf-page)] px-7 pt-2 pb-4 safe-bottom">
+                  <p className="text-center pf-fs-13 font-medium text-[var(--pf-i-40)] mb-4">
                     连不上手环？
                     <button
                       type="button"
                       onClick={() => pushRoute("connect-help")}
-                      className="ml-1 font-bold text-[#4361EE] cursor-pointer"
+                      className="ml-1 font-bold text-[var(--pf-primary)] cursor-pointer"
                     >
                       看怎么连
                     </button>
                   </p>
-                </div>
-
-                <div className="pt-6">
                   <button
                     type="button"
                     onClick={() => goBackOr("main/home")}
-                    className="w-full h-[52px] rounded-full bg-[#4361EE] text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
+                    className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
                   >
                     开始使用
                   </button>
@@ -8756,21 +8866,8 @@ export default function App() {
 
           {/* 4. 绑定爱发电（付费表盘入口） */}
           {currentStep === "paid_bind" && (
-            <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim">
+            <div className="flex-1 flex flex-col justify-between px-7 pb-12 page-enter-anim subpage-top">
               <div>
-                <button
-                  type="button"
-                  onClick={() => goBackOr("main/home")}
-                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                >
-                  <CaretLeft className="w-6 h-6 stroke-[2]" />
-                </button>
-
-                <div className="pt-6">
-                  <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
-                    绑定爱发电
-                  </h1>
-                </div>
               </div>
 
               <div className="my-auto flex flex-col items-center text-center">
@@ -8784,26 +8881,26 @@ export default function App() {
 
                 {paidBound ? (
                   <>
-                    <h2 className="text-[22px] font-bold text-black tracking-tight">
+                    <h2 className="pf-fs-22 font-bold text-[var(--pf-ink)] tracking-tight">
                       已绑定
                     </h2>
-                    <p className="text-[13px] font-medium text-black/45 mt-1.5">
+                    <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5">
                       爱发电账号{paidAfdianName ? `（${paidAfdianName}）` : ""}
                     </p>
                     {paidAfdianId && (
-                      <p className="text-[12px] font-medium text-black/30 mt-1.5 break-all max-w-[280px]">
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-1.5 break-all max-w-[280px]">
                         ID {paidAfdianId}
                       </p>
                     )}
                   </>
                 ) : (
                   <>
-                    <h2 className="text-[22px] font-bold text-black tracking-tight">
+                    <h2 className="pf-fs-22 font-bold text-[var(--pf-ink)] tracking-tight">
                       同步已购表盘
                     </h2>
                     {/* 等待授权期间这段就是状态说明：别把解释塞到按钮下面，
                         那里只留操作，底部才不至于两行灰字贴在一起。 */}
-                    <p className="text-[13px] font-medium text-black/45 mt-1.5 max-w-[260px]">
+                    <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5 max-w-[260px]">
                       {paidOauthUrl
                         ? "页面没反应或跳转失败，就复制授权链接，手动粘到浏览器里打开"
                         : "绑定你在爱发电买过的表盘，之后每次购买也会自动到账"}
@@ -8812,7 +8909,7 @@ export default function App() {
                 )}
 
                 {paidError && (
-                  <p className="text-[13px] text-[#FF3B30] font-bold mt-4">{paidError}</p>
+                  <p className="pf-fs-13 text-[var(--pf-danger)] font-bold mt-4">{paidError}</p>
                 )}
               </div>
 
@@ -8832,7 +8929,7 @@ export default function App() {
                         ? restartPaidOauth
                         : handlePaidPrimary
                   }
-                  className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/10 disabled:text-black/25 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
+                  className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] disabled:bg-[var(--pf-bg-10)] disabled:text-[var(--pf-i-25)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
                 >
                   {paidMode === "oauth" && paidOauthUrl && !paidBound
                     ? "重新发起绑定"
@@ -8849,7 +8946,7 @@ export default function App() {
                             : "去绑定爱发电"}
                 </button>
                 {!paidBound && paidMode === "oauth" && !paidOauthUrl && (
-                  <p className="text-[12px] font-medium text-black/35 text-center mt-3 leading-snug">
+                  <p className="pf-fs-12 font-medium text-[var(--pf-i-35)] text-center mt-3 leading-snug">
                     会打开爱发电的授权页，登录自己的账号即可
                   </p>
                 )}
@@ -8859,10 +8956,10 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => void copyPaidOauthUrl()}
-                    className="mt-3 w-full h-[52px] rounded-full bg-black/5 text-black/70 font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 tracking-tight"
+                    className="mt-3 w-full h-[52px] rounded-full bg-[var(--pf-bg-5)] text-[var(--pf-i-70)] font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 tracking-tight"
                   >
                     {paidOauthCopied ? (
-                      <Check className="w-[18px] h-[18px] text-[#34C759] stroke-[3]" />
+                      <Check className="w-[18px] h-[18px] text-[var(--pf-ok)] stroke-[3]" />
                     ) : (
                       <Copy className="w-[18px] h-[18px]" />
                     )}
@@ -8870,12 +8967,12 @@ export default function App() {
                   </button>
                 )}
                 {/* 取得同意的落点（付费页）：购买与使用即表示接受用户协议 */}
-                <p className="text-[12px] font-medium text-black/35 text-center mt-2 leading-snug">
+                <p className="pf-fs-12 font-medium text-[var(--pf-i-35)] text-center mt-2 leading-snug">
                   购买与使用即表示同意
                   <button
                     type="button"
                     onClick={(e) => { openLink(e, `${LEGAL_BASE}/terms`); }}
-                    className="text-[#4361EE] font-bold cursor-pointer"
+                    className="text-[var(--pf-primary)] font-bold cursor-pointer"
                   >
                     《用户协议》
                   </button>
@@ -8886,30 +8983,17 @@ export default function App() {
 
           {/* 4.5 我的表盘（已购资源列表） */}
           {currentStep === "paid_dials" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-7 safe-top pb-12 page-enter-anim">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-7 pb-12 page-enter-anim subpage-top">
               <div>
-                <button
-                  type="button"
-                  onClick={() => goBackOr("main/home")}
-                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                >
-                  <CaretLeft className="w-6 h-6 stroke-[2]" />
-                </button>
-
-                <div className="pt-6 pb-5">
-                  <h1 className="text-[32px] font-bold text-black tracking-tight leading-tight">
-                    我的表盘
-                  </h1>
-                </div>
               </div>
 
               {paidError && (
-                <div className="bg-white rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
-                  <p className="text-[13px] text-[#FF3B30] font-bold">{paidError}</p>
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                  <p className="pf-fs-13 text-[var(--pf-danger)] font-bold">{paidError}</p>
                   <button
                     type="button"
                     onClick={() => void loadPaidList()}
-                    className="mt-3 h-[40px] px-4 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all"
+                    className="mt-3 h-[40px] px-4 rounded-full bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] text-[var(--pf-i-75)] font-bold pf-fs-13 active:scale-95 transition-all"
                   >
                     重试
                   </button>
@@ -8917,12 +9001,12 @@ export default function App() {
               )}
 
               {!paidError && !paidLoaded && (
-                <p className="text-[13px] font-medium text-black/40 text-center mt-10">正在同步…</p>
+                <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] text-center mt-10">正在同步…</p>
               )}
 
               {!paidError && paidLoaded && paidProducts.length === 0 && (
                 <div className="my-auto flex flex-col items-center text-center pb-16">
-                  <div className="w-14 h-14 rounded-2xl bg-black/5 text-black/25 flex items-center justify-center mb-6">
+                  <div className="w-14 h-14 rounded-2xl bg-[var(--pf-bg-5)] text-[var(--pf-i-25)] flex items-center justify-center mb-6">
                     {/* 空盒子（线性） */}
                     <svg
                       viewBox="0 0 24 24"
@@ -8938,10 +9022,10 @@ export default function App() {
                       <path d="M10 12h4" />
                     </svg>
                   </div>
-                  <h2 className="text-[22px] font-bold text-black tracking-tight">
+                  <h2 className="pf-fs-22 font-bold text-[var(--pf-ink)] tracking-tight">
                     还没有可安装的表盘
                   </h2>
-                  <p className="text-[13px] font-medium text-black/45 mt-1.5">
+                  <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5">
                     去爱发电看看有没有喜欢的
                   </p>
                   {paidShopUrl && (
@@ -8949,7 +9033,7 @@ export default function App() {
                       href={paidShopUrl}
                       target="_blank"
                       rel="noreferrer"
-                      className="mt-6 w-full h-[52px] rounded-full bg-[#4361EE] text-white font-bold text-[17px] active:scale-[0.98] transition-all flex items-center justify-center tracking-tight"
+                      className="mt-6 w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all flex items-center justify-center tracking-tight"
                     >
                       去爱发电看看
                     </a>
@@ -8965,25 +9049,25 @@ export default function App() {
                     return (
                       <div
                         key={p.product_id}
-                        className="bg-white rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3"
+                        className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3"
                       >
                         <div className="flex items-baseline justify-between">
                           <div className="flex items-center gap-2 min-w-0">
-                            <h3 className={`text-[17px] font-bold tracking-tight ${v ? "text-black" : "text-black/40"}`}>
+                            <h3 className={`pf-fs-17 font-bold tracking-tight ${v ? "text-[var(--pf-ink)]" : "text-[var(--pf-i-40)]"}`}>
                               {p.name}
                             </h3>
                             {/* 有新版本：装过这行才可能标出来（没装过就是「安装」） */}
                             {v?.has_update && (
-                              <span className="shrink-0 text-[12px] font-bold text-[#D4973B] bg-[#D4973B]/15 rounded-full px-2 py-[3px] leading-none">
+                              <span className="shrink-0 pf-fs-12 font-bold text-[var(--pf-amber)] bg-[var(--pf-amber-15)] rounded-full px-2 py-[3px] leading-none">
                                 可更新
                               </span>
                             )}
                           </div>
-                          <span className="shrink-0 text-[13px] font-medium text-black/40">
+                          <span className="shrink-0 pf-fs-13 font-medium text-[var(--pf-i-40)]">
                             {v?.latest_version ?? ""}
                           </span>
                         </div>
-                        <p className="text-[13px] font-medium text-black/40 mt-1">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1">
                           {v
                             ? `适配 ${v.name}${v.installed && v.installed_version ? `，已装 ${v.installed_version}` : ""}`
                             : m.screenKnown || isDeviceConnected
@@ -8995,8 +9079,8 @@ export default function App() {
                             type="button"
                             disabled={installPreparing === p.product_id}
                             onClick={() => runPaidInstall(p, v)}
-                            className={`mt-4 w-full h-[44px] rounded-full text-white font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer ${
-                              installPreparing === p.product_id ? "bg-[#4361EE]/60" : "bg-[#4361EE]"
+                            className={`mt-4 w-full h-[44px] rounded-full text-white font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer ${
+                              installPreparing === p.product_id ? "bg-[var(--pf-primary-60)]" : "bg-[var(--pf-primary-solid)]"
                             }`}
                           >
                             {installPreparing === p.product_id
@@ -9006,7 +9090,7 @@ export default function App() {
                                 : "安装"}
                           </button>
                         ) : (
-                          <div className="mt-4 h-[44px] rounded-full bg-black/5 text-black/25 font-bold text-[16px] flex items-center justify-center">
+                          <div className="mt-4 h-[44px] rounded-full bg-[var(--pf-bg-5)] text-[var(--pf-i-25)] font-bold pf-fs-16 flex items-center justify-center">
                             {isDeviceConnected ? "暂不可安装" : "先连接设备"}
                           </div>
                         )}
@@ -9050,20 +9134,8 @@ export default function App() {
               Math.round((face.screen[0] * previewH) / face.screen[1])
             );
             return (
-              <div className="relative flex-1 flex flex-col bg-[#F5F6F9] overflow-hidden page-enter-anim">
-                <div className="px-6 safe-top pb-2 flex items-center justify-between shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => goBackOr("main/market")}
-                    className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
-                  >
-                    <CaretLeft className="w-6 h-6 stroke-[2]" />
-                  </button>
-                  <span className="text-[17px] font-bold text-black tracking-tight">表盘详情</span>
-                  <div className="w-11 h-11" />
-                </div>
-
-                <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto no-scrollbar px-6 pb-32">
+              <div className="relative flex-1 flex flex-col bg-[var(--pf-page)] overflow-hidden page-enter-anim">
+                <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto no-scrollbar px-6 pb-32 subpage-top">
                   <div className="flex justify-center pt-2 pb-6">
                     <img
                       src={face.coverUrl}
@@ -9077,18 +9149,18 @@ export default function App() {
                     />
                   </div>
 
-                  <h1 className="text-[26px] font-bold text-black tracking-tight leading-tight text-center">
+                  <h1 className="pf-fs-26 font-bold text-[var(--pf-ink)] tracking-tight leading-tight text-center">
                     {face.name}
                   </h1>
 
                   {(face.has_update || face.installed) && (
                     <div className="flex items-center justify-center gap-2 mt-2.5">
                       {face.has_update ? (
-                        <span className="h-6 px-2.5 rounded-full bg-[#D4973B]/15 text-[12px] font-bold text-[#D4973B] flex items-center">
+                        <span className="h-6 px-2.5 rounded-full bg-[var(--pf-amber-15)] pf-fs-12 font-bold text-[var(--pf-amber)] flex items-center">
                           可更新
                         </span>
                       ) : (
-                        <span className="h-6 px-2.5 rounded-full bg-black/5 text-[12px] font-bold text-black/40 flex items-center">
+                        <span className="h-6 px-2.5 rounded-full bg-[var(--pf-bg-5)] pf-fs-12 font-bold text-[var(--pf-i-40)] flex items-center">
                           已安装
                         </span>
                       )}
@@ -9100,7 +9172,7 @@ export default function App() {
                       {face.tags.map(tag => (
                         <span
                           key={tag}
-                          className="h-7 px-3 rounded-full bg-black/5 text-[12px] font-semibold text-black/45 flex items-center"
+                          className="h-7 px-3 rounded-full bg-[var(--pf-bg-5)] pf-fs-12 font-semibold text-[var(--pf-i-45)] flex items-center"
                         >
                           {tag}
                         </span>
@@ -9109,7 +9181,7 @@ export default function App() {
                   )}
 
                   {face.description && (
-                    <p className="text-[16px] font-medium text-black/45 leading-relaxed mt-5 whitespace-pre-wrap">
+                    <p className="pf-fs-16 font-medium text-[var(--pf-i-45)] leading-relaxed mt-5 whitespace-pre-wrap">
                       {face.description}
                     </p>
                   )}
@@ -9117,17 +9189,17 @@ export default function App() {
 
                 <div
                   data-pf-bottombar
-                  className="absolute bottom-0 left-0 right-0 bg-white border-t border-black/5 px-6 pt-3 safe-bottom-panel z-20"
+                  className="absolute bottom-0 left-0 right-0 bg-[var(--pf-card)] border-t border-[var(--pf-bd-5)] px-6 pt-3 safe-bottom-panel z-20"
                 >
                   {blockedHere ? (
-                    <div className="w-full h-[52px] rounded-full bg-black/10 text-black/25 font-bold text-[17px] flex items-center justify-center tracking-tight">
+                    <div className="w-full h-[52px] rounded-full bg-[var(--pf-bg-10)] text-[var(--pf-i-25)] font-bold pf-fs-17 flex items-center justify-center tracking-tight">
                       不支持小米手环 9 Pro
                     </div>
                   ) : isPaid && !canInstall ? (
                     <a
                       href={buyUrl}
                       onClick={e => openLink(e, buyUrl)}
-                      className="w-full h-[52px] rounded-full bg-[#4361EE] text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 tracking-tight"
+                      className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 tracking-tight"
                     >
                       <img src={afdianIcon} alt="" className="w-5 h-5 rounded" />
                       去爱发电
@@ -9144,7 +9216,7 @@ export default function App() {
                         }
                         startMarketInstall(face);
                       }}
-                      className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/10 disabled:text-black/25 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
+                      className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] disabled:bg-[var(--pf-bg-10)] disabled:text-[var(--pf-i-25)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
                     >
                       {compatible
                         ? isPaid
@@ -9164,11 +9236,11 @@ export default function App() {
 
           {currentStep === "market_detail" && !marketDetail && (
             <div className="flex-1 flex flex-col items-center justify-center px-6">
-              <p className="text-[16px] font-medium text-black/40">这个表盘已经不在集市里了</p>
+              <p className="pf-fs-16 font-medium text-[var(--pf-i-40)]">这个表盘已经不在集市里了</p>
               <button
                 type="button"
                 onClick={() => resetStackTo("main/market")}
-                className="mt-4 h-[44px] px-5 rounded-full bg-[#4361EE] text-white font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer"
+                className="mt-4 h-[44px] px-5 rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer"
               >
                 返回集市
               </button>
@@ -9188,59 +9260,44 @@ export default function App() {
               p.kind === "quickapp" ? "快应用" : p.kind === "watchface" ? "表盘" : "未识别的文件";
             const TypeIcon = isWatchface ? Watch : FileText;
             return (
-              <div className="flex-1 flex flex-col overflow-hidden bg-[#F5F6F9] page-enter-anim select-none relative">
-                {/* 顶栏：返回 / 标题（与制作壁纸页同一套） */}
-                <div className="relative flex items-center justify-between px-4 safe-top pb-1 z-20 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => goBackOr("main/home")}
-                    className="h-9 px-4 rounded-full bg-black/5 hover:bg-black/10 active:scale-95 transition-all text-black/80 text-[13px] font-semibold cursor-pointer flex items-center justify-center"
-                  >
-                    返回
-                  </button>
-                  <span className="absolute left-1/2 -translate-x-1/2 text-[17px] font-bold tracking-tight text-black">
-                    确认安装
-                  </span>
-                  <span className="w-[60px]" />
-                </div>
-
+              <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
                 {/* 内容整体在中部偏上：min-h-full + 居中，展开复写框时仍可滚动 */}
-                <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto px-5">
+                <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto px-5 subpage-top">
                   <div className="min-h-full flex flex-col justify-center py-4 pb-32">
                     {/* 大卡：文件信息（主视觉）。表盘名做标题放最顶上 */}
-                    <div className="bg-white rounded-2xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/[0.02]">
+                    <div className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
                       <div className="flex items-start gap-3">
                         <div className="min-w-0 flex-1">
-                          <p className="text-[24px] font-bold leading-[1.25] text-black break-words">
+                          <p className="pf-fs-24 font-bold leading-[1.25] text-[var(--pf-ink)] break-words">
                             {p.name}
                           </p>
                           <div className="flex items-center gap-2 mt-2.5">
-                            <span className="inline-flex items-center h-[22px] px-2 rounded-lg bg-[#4361EE]/[0.07] text-[12px] font-semibold text-[#4361EE]">
+                            <span className="inline-flex items-center h-[22px] px-2 rounded-lg bg-[var(--pf-primary-7)] pf-fs-12 font-semibold text-[var(--pf-primary)]">
                               {kindLabel}
                             </span>
-                            <span className="text-[13px] font-medium text-black/45">
+                            <span className="pf-fs-13 font-medium text-[var(--pf-i-45)]">
                               {formatBytes(p.size)}
                             </span>
                           </div>
                         </div>
-                        <div className="w-12 h-12 rounded-2xl bg-[#4361EE]/[0.07] flex items-center justify-center shrink-0">
-                          <TypeIcon className="w-6 h-6 text-[#4361EE]" weight="duotone" />
+                        <div className="w-12 h-12 rounded-2xl bg-[var(--pf-primary-7)] flex items-center justify-center shrink-0">
+                          <TypeIcon className="w-6 h-6 text-[var(--pf-primary)]" weight="duotone" />
                         </div>
                       </div>
 
                       {isWatchface && (
-                        <div className="mt-4 pt-4 border-t border-black/5">
+                        <div className="mt-4 pt-4 border-t border-[var(--pf-bd-5)]">
                           <div className="flex items-center justify-between gap-3">
-                            <span className="text-[13px] font-medium text-black/45">表盘 ID</span>
-                            <span className="text-[13px] font-mono font-semibold tracking-wider text-black/80 truncate">
+                            <span className="pf-fs-13 font-medium text-[var(--pf-i-45)]">表盘 ID</span>
+                            <span className="pf-fs-13 font-mono font-semibold tracking-wider text-[var(--pf-i-80)] truncate">
                               {p.originalId || "读不出来"}
                             </span>
                           </div>
                           {/* 原 ID 已存在：直接装会替换手环上那张（这正是要复写 ID 的场景） */}
                           {originalTaken && !rewriteIdOn && (
-                            <div className="flex items-start gap-2 rounded-xl bg-[#FFF7E8] px-3 py-2.5 mt-3">
-                              <Info className="w-4 h-4 text-[#B7791F] shrink-0 mt-[1px]" weight="fill" />
-                              <p className="text-[12px] font-medium text-[#8A5A12] leading-relaxed">
+                            <div className="flex items-start gap-2 rounded-xl bg-[var(--pf-warn-weak)] px-3 py-2.5 mt-3">
+                              <Info className="w-4 h-4 text-[var(--pf-warn-ink)] shrink-0 mt-[1px]" weight="fill" />
+                              <p className="pf-fs-12 font-medium text-[var(--pf-warn-ink)] leading-relaxed">
                                 手环上已有同 ID 的表盘，直接安装会替换它；不想替换就打开「复写表盘 ID」
                               </p>
                             </div>
@@ -9250,19 +9307,19 @@ export default function App() {
 
                       {/* vivo 快应用：没有表盘 ID，给包名与版本让用户确认装的是哪个应用 */}
                       {p.kind === "quickapp" && (p.appPackage || p.appVersion) && (
-                        <div className="mt-4 pt-4 border-t border-black/5 space-y-2.5">
+                        <div className="mt-4 pt-4 border-t border-[var(--pf-bd-5)] space-y-2.5">
                           {p.appPackage && (
                             <div className="flex items-center justify-between gap-3">
-                              <span className="text-[13px] font-medium text-black/45">包名</span>
-                              <span className="text-[13px] font-mono font-semibold text-black/80 truncate">
+                              <span className="pf-fs-13 font-medium text-[var(--pf-i-45)]">包名</span>
+                              <span className="pf-fs-13 font-mono font-semibold text-[var(--pf-i-80)] truncate">
                                 {p.appPackage}
                               </span>
                             </div>
                           )}
                           {p.appVersion && (
                             <div className="flex items-center justify-between gap-3">
-                              <span className="text-[13px] font-medium text-black/45">版本</span>
-                              <span className="text-[13px] font-semibold text-black/80">
+                              <span className="pf-fs-13 font-medium text-[var(--pf-i-45)]">版本</span>
+                              <span className="pf-fs-13 font-semibold text-[var(--pf-i-80)]">
                                 {p.appVersion}
                               </span>
                             </div>
@@ -9271,9 +9328,9 @@ export default function App() {
                       )}
 
                       {p.kind === "unknown" && (
-                        <div className="flex items-start gap-2 rounded-xl bg-[#FFF7E8] px-3 py-2.5 mt-4">
-                          <Info className="w-4 h-4 text-[#B7791F] shrink-0 mt-[1px]" weight="fill" />
-                          <p className="text-[12px] font-medium text-[#8A5A12] leading-relaxed">
+                        <div className="flex items-start gap-2 rounded-xl bg-[var(--pf-warn-weak)] px-3 py-2.5 mt-4">
+                          <Info className="w-4 h-4 text-[var(--pf-warn-ink)] shrink-0 mt-[1px]" weight="fill" />
+                          <p className="pf-fs-12 font-medium text-[var(--pf-warn-ink)] leading-relaxed">
                             没认出这个文件类型，仍可尝试安装
                           </p>
                         </div>
@@ -9282,11 +9339,11 @@ export default function App() {
 
                     {/* 小卡：复写表盘 ID（只有小米 .bin 表盘才有；快应用与 vivo 表盘都没有这个语义） */}
                     {isWatchface && selectedDevice.brand !== "vivo" && (
-                      <div className="bg-white rounded-2xl p-4 mt-3 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/[0.02]">
+                      <div className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 mt-3 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
                         <div className="flex items-start justify-between gap-4">
                           <div className="min-w-0">
-                            <p className="text-[16px] font-semibold text-black">复写表盘 ID</p>
-                            <p className="text-[12px] font-medium text-black/45 mt-1 leading-relaxed">
+                            <p className="pf-fs-16 font-semibold text-[var(--pf-ink)]">复写表盘 ID</p>
+                            <p className="pf-fs-12 font-medium text-[var(--pf-i-45)] mt-1 leading-relaxed">
                               换一个新 ID 安装，不会覆盖手环上已有的同名表盘
                             </p>
                           </div>
@@ -9298,10 +9355,10 @@ export default function App() {
                             onClick={() => setRewriteIdOn(v => !v)}
                             className={`w-[52px] h-[30px] rounded-full p-1 transition-colors duration-200 flex items-center shrink-0 ${
                               !p.originalId
-                                ? "bg-black/5 opacity-40 cursor-not-allowed"
+                                ? "bg-[var(--pf-bg-5)] opacity-40 cursor-not-allowed"
                                 : rewriteIdOn
-                                  ? "bg-[#34C759] cursor-pointer"
-                                  : "bg-black/10 cursor-pointer"
+                                  ? "bg-[var(--pf-ok-solid)] cursor-pointer"
+                                  : "bg-[var(--pf-bg-10)] cursor-pointer"
                             }`}
                           >
                             <div
@@ -9313,11 +9370,11 @@ export default function App() {
                         </div>
 
                         {!p.originalId ? (
-                          <p className="text-[12px] font-medium text-black/40 mt-2">
+                          <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-2">
                             读不出这个文件的表盘 ID，无法复写
                           </p>
                         ) : rewriteIdOn && (
-                          <div className="mt-3 pt-3 border-t border-black/5">
+                          <div className="mt-3 pt-3 border-t border-[var(--pf-bd-5)]">
                             <div className="flex items-center gap-2 min-w-0">
                               <input
                                 value={rewriteId}
@@ -9329,20 +9386,20 @@ export default function App() {
                                 autoCapitalize="characters"
                                 spellCheck={false}
                                 placeholder="9 或 12 位字母数字"
-                                className="flex-1 min-w-0 h-11 rounded-xl bg-black/[0.04] px-3 text-[16px] font-mono tracking-wider text-black outline-none focus:ring-2 focus:ring-[#4361EE]/25"
+                                className="flex-1 min-w-0 h-11 rounded-xl bg-[var(--pf-bg-4)] px-3 pf-fs-16 font-mono tracking-wider text-[var(--pf-ink)] outline-none focus:ring-2 focus:ring-[var(--pf-primary-25)]"
                               />
                               <button
                                 type="button"
                                 onClick={() => setRewriteId(nextFreeRandomId())}
-                                className="h-11 px-3 rounded-xl bg-[#4361EE]/10 hover:bg-[#4361EE]/15 active:scale-95 transition-all text-[#4361EE] text-[13px] font-semibold flex items-center gap-1 cursor-pointer shrink-0"
+                                className="h-11 px-3 rounded-xl bg-[var(--pf-primary-10)] hover:bg-[var(--pf-primary-15)] active:scale-95 transition-all text-[var(--pf-primary)] pf-fs-13 font-semibold flex items-center gap-1 cursor-pointer shrink-0"
                               >
                                 <ArrowsClockwise className="w-3.5 h-3.5" />
                                 随机
                               </button>
                             </div>
                             <p
-                              className={`text-[12px] font-medium mt-2 ${
-                                idInvalid || idTaken ? "text-[#E63946]" : "text-black/40"
+                              className={`pf-fs-12 font-medium mt-2 ${
+                                idInvalid || idTaken ? "text-[#E63946]" : "text-[var(--pf-i-40)]"
                               }`}
                             >
                               {idInvalid
@@ -9365,16 +9422,16 @@ export default function App() {
                 {/* 底部主按钮：确认后才真正开始推送 */}
                 <div
                   data-pf-bottombar
-                  className="absolute bottom-0 left-0 right-0 p-5 safe-bottom-bar bg-white border-t border-black/5 flex flex-col pt-3 z-30"
+                  className="absolute bottom-0 left-0 right-0 p-5 safe-bottom-bar bg-[var(--pf-card)] border-t border-[var(--pf-bd-5)] flex flex-col pt-3 z-30"
                 >
-                  <p className="text-center text-[12px] font-medium text-black/40 mb-2.5">
+                  <p className="text-center pf-fs-12 font-medium text-[var(--pf-i-40)] mb-2.5">
                     将推送到 {connected.current.name || "手环"}
                   </p>
                   <button
                     type="button"
                     onClick={confirmLocalInstall}
                     disabled={!canInstall}
-                    className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/15 disabled:text-black/40 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center"
+                    className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] disabled:bg-[var(--pf-bg-15)] disabled:text-[var(--pf-i-40)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center"
                   >
                     开始安装
                   </button>
@@ -9388,29 +9445,29 @@ export default function App() {
             <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim">
               <div />
               <div className="flex flex-col items-center text-center">
-                <div className="w-20 h-20 rounded-full bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center mb-8 relative">
-                  <span className="absolute inset-0 rounded-full bg-[#4361EE]/20 animate-ping duration-1000 opacity-60" />
+                <div className="w-20 h-20 rounded-full bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center mb-8 relative">
+                  <span className="absolute inset-0 rounded-full bg-[var(--pf-primary-20)] animate-ping duration-1000 opacity-60" />
                   <Watch className="w-10 h-10 stroke-[2.2] relative z-10" />
                 </div>
 
-                <h2 className="text-[30px] font-bold text-black tracking-tight">
+                <h2 className="pf-fs-30 font-bold text-[var(--pf-ink)] tracking-tight">
                   {dialName}
                 </h2>
-                <p className="text-[17px] font-medium text-black/45 mt-2">
+                <p className="pf-fs-17 font-medium text-[var(--pf-i-45)] mt-2">
                   {progressPhase}
                 </p>
 
                 {/* 规范进度条：高 6 · 全圆角 · 轨道 black/10 · 填充 #4361EE */}
-                <div className="w-full max-w-[280px] h-1.5 bg-black/10 rounded-full mt-10 overflow-hidden">
+                <div className="w-full max-w-[280px] h-1.5 bg-[var(--pf-bg-10)] rounded-full mt-10 overflow-hidden">
                   <div
-                    className="h-full bg-[#4361EE] rounded-full transition-all duration-500 ease-out"
+                    className="h-full bg-[var(--pf-primary-solid)] rounded-full transition-all duration-500 ease-out"
                     style={{ width: `${installProgress}%` }}
                   />
                 </div>
 
                 {/* 剩余时间：按最近十几秒的实测速率外推。样本不够就先不显示，别给个假数字 */}
                 {!installError && installEtaSec != null && installProgress < 100 && (
-                  <p className="text-[13px] font-medium text-black/40 mt-3 tabular-nums">
+                  <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-3 tabular-nums">
                     预计还需 {formatEta(installEtaSec)}
                   </p>
                 )}
@@ -9418,11 +9475,11 @@ export default function App() {
                 {/* C4. 错误态样例 3：安装失败行内错误提示 */}
                 {installError ? (
                   <div className="flex flex-col items-center mt-6">
-                    <p className="text-[13px] text-[#FF3B30] font-bold text-center">
+                    <p className="pf-fs-13 text-[var(--pf-danger)] font-bold text-center">
                       {installError}
                     </p>
                     {installError.includes("安装未确认") && (
-                      <p className="text-[12px] text-black/40 font-medium text-center mt-2 max-w-[280px]">
+                      <p className="pf-fs-12 text-[var(--pf-i-40)] font-medium text-center mt-2 max-w-[280px]">
                         重试会先删除手表上的半成品表盘，再重新安装
                       </p>
                     )}
@@ -9450,7 +9507,7 @@ export default function App() {
                           }
                           setInstallError(null);
                         }}
-                        className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all"
+                        className="h-[44px] px-5 rounded-full bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] text-[var(--pf-i-75)] font-bold pf-fs-13 active:scale-95 transition-all"
                       >
                         重试安装
                       </button>
@@ -9458,7 +9515,7 @@ export default function App() {
                         type="button"
                         disabled={diagBusy}
                         onClick={() => void exportDiag()}
-                        className="h-[44px] px-5 rounded-full bg-[#4361EE]/10 hover:bg-[#4361EE]/15 text-[#4361EE] font-bold text-[13px] active:scale-95 transition-all disabled:opacity-50"
+                        className="h-[44px] px-5 rounded-full bg-[var(--pf-primary-10)] hover:bg-[var(--pf-primary-15)] text-[var(--pf-primary)] font-bold pf-fs-13 active:scale-95 transition-all disabled:opacity-50"
                       >
                         {diagBusy ? "正在导出…" : "导出诊断"}
                       </button>
@@ -9466,10 +9523,10 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="flex flex-col items-center gap-1 mt-3">
-                    <span className="text-[13px] font-medium text-black/40">
+                    <span className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
                       正在安装，请勿退出应用
                     </span>
-                    <span className="text-[13px] font-medium text-black/40">
+                    <span className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
                       保持手环在手机附近
                     </span>
                   </div>
@@ -9508,15 +9565,15 @@ export default function App() {
                 type="button"
                 disabled={installStopRequested}
                 onClick={requestStopPaidInstall}
-                className={`h-[44px] px-6 rounded-full font-bold text-[16px] transition-all flex items-center justify-center ${
+                className={`h-[44px] px-6 rounded-full font-bold pf-fs-16 transition-all flex items-center justify-center ${
                   installStopRequested
-                    ? "bg-black/5 text-black/30"
-                    : "bg-black/[0.07] text-black/75 active:scale-95 cursor-pointer"
+                    ? "bg-[var(--pf-bg-5)] text-[var(--pf-i-30)]"
+                    : "bg-[var(--pf-bg-7)] text-[var(--pf-i-75)] active:scale-95 cursor-pointer"
                 }`}
               >
                 {installStopRequested ? "当前表盘装完即停" : "装完当前就停"}
               </button>
-              <p className="text-[12px] font-medium text-black/35 mt-2 text-center">
+              <p className="pf-fs-12 font-medium text-[var(--pf-i-35)] mt-2 text-center">
                 {installStopRequested ? "已收到，装完这个就不再继续" : "已装的保留，没开始的不会安装"}
               </p>
             </div>
@@ -9527,14 +9584,14 @@ export default function App() {
             <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-10 page-enter-anim">
               <div />
               <div className="flex flex-col items-center text-center">
-                <div className="w-20 h-20 rounded-full bg-[#34C759]/15 text-[#34C759] flex items-center justify-center mb-6">
+                <div className="w-20 h-20 rounded-full bg-[#34C759]/15 text-[var(--pf-ok)] flex items-center justify-center mb-6">
                   <Check className="w-10 h-10 stroke-[2.2]" />
                 </div>
 
-                <h2 className="text-[30px] font-bold text-black tracking-tight">
+                <h2 className="pf-fs-30 font-bold text-[var(--pf-ink)] tracking-tight">
                   {dialName}
                 </h2>
-                <p className="text-[17px] font-medium text-black/45 mt-2">
+                <p className="pf-fs-17 font-medium text-[var(--pf-i-45)] mt-2">
                   {installPartial
                     ? `已安装 ${installPartial.installed}/${installPartial.total} 个，其余已按你的选择停止`
                     : installKindRef.current === "quickapp"
@@ -9549,7 +9606,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={goMakeWallpaper}
-                    className="w-full h-[52px] rounded-full bg-[#4361EE] text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
+                    className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
                   >
                     去做壁纸
                   </button>
@@ -9565,7 +9622,7 @@ export default function App() {
                         : `「${dialName}」已生效`
                     );
                   }}
-                  className="w-full h-[52px] rounded-full bg-black text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
+                  className="w-full h-[52px] rounded-full bg-black text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
                 >
                   完成
                 </button>
@@ -9576,38 +9633,38 @@ export default function App() {
           {/* 7. 表盘编辑页（全功能壁纸预览与快捷切换）。真机上必须先拿到真实留档：
               没有就明确说「不能编辑」，绝不渲染设计稿的演示数据（假表盘）。 */}
           {currentStep === "dial_edit" && editingDial && invoke && dialSessionState !== "ready" && (
-            <div className="flex-1 flex flex-col bg-[#F5F6F9] overflow-hidden page-enter-anim relative">
+            <div className="flex-1 flex flex-col bg-[var(--pf-page)] overflow-hidden page-enter-anim relative">
               <div className="px-6 safe-top pb-2 flex items-center justify-between shrink-0 z-20">
                 <button
                   type="button"
                   onClick={() => goBackOr("main/manage")}
-                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 active:scale-95 transition-all cursor-pointer"
+                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-[var(--pf-i-80)] hover:bg-[var(--pf-bg-5)] active:scale-95 transition-all cursor-pointer"
                 >
                   <CaretLeft className="w-6 h-6 stroke-[2]" />
                 </button>
-                <span className="text-[17px] font-bold text-black tracking-tight">{editingDial.name}</span>
+                <span className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight">{editingDial.name}</span>
                 <div className="w-11 h-11" />
               </div>
               <div className="flex-1 flex items-start justify-center px-6 pt-10">
-                <div className="w-full max-w-[420px] bg-white rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.02)] p-5">
+                <div className="w-full max-w-[420px] bg-[var(--pf-card)] pf-card-border rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.02)] p-5">
                   {dialSessionState === "loading" || dialSessionState === "idle" ? (
                     <>
-                      <div className="text-[16px] font-bold text-black">正在载入表盘…</div>
-                      <div className="text-[13px] font-medium text-black/45 mt-1.5 leading-relaxed">
+                      <div className="pf-fs-16 font-bold text-[var(--pf-ink)]">正在载入表盘…</div>
+                      <div className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5 leading-relaxed">
                         正在读取本机留档，请稍候。
                       </div>
                     </>
                   ) : (
                     <>
-                      <div className="text-[16px] font-bold text-black">这个表盘不能编辑</div>
-                      <div className="text-[13px] font-medium text-black/45 mt-1.5 leading-relaxed">
+                      <div className="pf-fs-16 font-bold text-[var(--pf-ink)]">这个表盘不能编辑</div>
+                      <div className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5 leading-relaxed">
                         本地没有它的留档（不是通过本 App 安装的，或应用数据被清理过）。
                         到「管理」页用本 App 重新安装一次这个表盘，之后就能编辑了。
                       </div>
                       <button
                         type="button"
                         onClick={() => goBackOr("main/manage")}
-                        className="w-full mt-4 h-[44px] rounded-full bg-[#4361EE] text-white font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer"
+                        className="w-full mt-4 h-[44px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer"
                       >
                         返回管理页
                       </button>
@@ -9618,19 +9675,19 @@ export default function App() {
             </div>
           )}
           {currentStep === "dial_edit" && editingDial && (!invoke || dialSessionState === "ready") && (
-            <div className="flex-1 flex flex-col bg-[#F5F6F9] overflow-hidden page-enter-anim relative">
+            <div className="flex-1 flex flex-col bg-[var(--pf-page)] overflow-hidden page-enter-anim relative">
               
               {/* 顶栏返回 */}
               <div className="px-6 safe-top pb-2 flex items-center justify-between shrink-0 z-20 relative">
                 <button
                   type="button"
                   onClick={() => goBackOr("main/manage")}
-                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
+                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-[var(--pf-i-80)] hover:bg-[var(--pf-bg-5)] cursor-pointer active:scale-95 transition-all"
                 >
                   <CaretLeft className="w-6 h-6 stroke-[2]" />
                 </button>
 
-                <span className="text-[17px] font-bold text-black tracking-tight">
+                <span className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight">
                   {editingDial.name}
                 </span>
 
@@ -9639,14 +9696,14 @@ export default function App() {
                 {/* 预览差异提示：悬浮在标题下方（解包渲染的元素位置可能和手环实际显示不同）。
                     × = 本次关掉；「不再显示」= 永久收起（本地记住）。 */}
                 {!editPreviewHintHidden && !editPreviewHintClosed && (
-                  <div className="absolute left-6 right-6 top-full mt-1.5 z-30 rounded-2xl bg-white border border-black/5 shadow-[0_10px_30px_rgba(0,0,0,0.16)] px-4 py-3">
+                  <div className="absolute left-6 right-6 top-full mt-1.5 z-30 rounded-2xl bg-[var(--pf-card)] pf-card-border shadow-[0_10px_30px_rgba(0,0,0,0.16)] px-4 py-3">
                     <div className="flex items-start gap-2.5 pr-6">
-                      <Info className="w-4 h-4 shrink-0 text-[#4361EE] mt-[2px]" />
+                      <Info className="w-4 h-4 shrink-0 text-[var(--pf-primary)] mt-[2px]" />
                       <div className="flex-1 min-w-0">
-                        <div className="text-[13px] font-bold text-black leading-[18px]">
+                        <div className="pf-fs-13 font-bold text-[var(--pf-ink)] leading-[18px]">
                           手机预览可能有差异
                         </div>
-                        <div className="text-[12px] font-medium text-black/40 leading-[18px] mt-0.5">
+                        <div className="pf-fs-12 font-medium text-[var(--pf-i-40)] leading-[18px] mt-0.5">
                           个别元素可能错位，装到手环上就正常了。
                         </div>
                         <button
@@ -9656,7 +9713,7 @@ export default function App() {
                             setEditPreviewHintClosed(true);
                             storeFlag(EDIT_PREVIEW_HINT_FLAG, true);
                           }}
-                          className="-ml-1 mt-0.5 h-6 px-1 text-[12px] font-semibold text-[#4361EE] cursor-pointer active:opacity-60 transition-opacity"
+                          className="-ml-1 mt-0.5 h-6 px-1 pf-fs-12 font-semibold text-[var(--pf-primary)] cursor-pointer active:opacity-60 transition-opacity"
                         >
                           不再显示
                         </button>
@@ -9666,7 +9723,7 @@ export default function App() {
                       type="button"
                       aria-label="关闭提示"
                       onClick={() => setEditPreviewHintClosed(true)}
-                      className="absolute right-2 top-2 w-7 h-7 rounded-full flex items-center justify-center text-black/25 hover:bg-black/5 active:scale-90 transition-all cursor-pointer"
+                      className="absolute right-2 top-2 w-7 h-7 rounded-full flex items-center justify-center text-[var(--pf-i-25)] hover:bg-[var(--pf-bg-5)] active:scale-90 transition-all cursor-pointer"
                     >
                       <X className="w-3.5 h-3.5 stroke-[2]" />
                     </button>
@@ -9714,7 +9771,7 @@ export default function App() {
                         )}
 
                         {selectedStyle.includes("息屏常显") && (
-                          <div className="absolute inset-0 bg-black/80 backdrop-grayscale z-20 flex flex-col items-center justify-center pointer-events-none">
+                          <div className="absolute inset-0 bg-[var(--pf-bg-80)] backdrop-grayscale z-20 flex flex-col items-center justify-center pointer-events-none">
                             <span className="text-[34px] font-bold text-white font-mono tracking-tighter">09:41</span>
                             <span className="text-[11px] text-white/40 font-medium mt-1">AOD 常亮</span>
                           </div>
@@ -9741,13 +9798,13 @@ export default function App() {
                                     : mockTopContainer === "玻璃-粗"
                                     ? "bg-white/25 backdrop-blur-xl rounded-full text-white border border-white/25"
                                     : mockTopContainer === "普通-中"
-                                    ? "bg-[#1C1C1E] rounded-full text-white/85"
+                                    ? "bg-[var(--pf-media)] rounded-full text-white/85"
                                     : "text-white/80"
                                 }`}
                               >
                                 <span className="font-mono text-[10px]">10/06 周二</span>
                                 <div className="flex items-center gap-1">
-                                  <Footprints className="w-3 h-3 text-[#34C759]" />
+                                  <Footprints className="w-3 h-3 text-[var(--pf-ok)]" />
                                   <span className="font-mono text-[10.5px]">6,820</span>
                                 </div>
                               </div>
@@ -9775,12 +9832,12 @@ export default function App() {
                                     : mockBottomContainer === "玻璃-粗"
                                     ? "bg-white/25 backdrop-blur-xl rounded-2xl border border-white/25 text-white"
                                     : mockBottomContainer === "普通-中"
-                                    ? "bg-[#1C1C1E] rounded-2xl text-white/90"
+                                    ? "bg-[var(--pf-media)] rounded-2xl text-white/90"
                                     : "text-white"
                                 }`}
                               >
                                 <div className="flex items-center gap-1 text-[11px] font-bold">
-                                  <Flame className="w-3 h-3 text-[#D4973B]" />
+                                  <Flame className="w-3 h-3 text-[var(--pf-amber)]" />
                                   <span>420 kcal</span>
                                 </div>
                                 <div className="w-[1px] h-3 bg-white/15" />
@@ -9799,7 +9856,7 @@ export default function App() {
 
                   {/* 表盘与当前设备规格不一致时才给告警（正常情况不占位置） */}
                   {canvasSpecMismatch && (
-                    <div className="text-center text-[12px] font-medium text-[#D4973B] mt-1">
+                    <div className="text-center pf-fs-12 font-medium text-[var(--pf-amber)] mt-1">
                       {`该表盘为 ${canvasSpecMismatch.dial.width}×${canvasSpecMismatch.dial.height}，与当前设备 ${canvasSpecMismatch.device.width}×${canvasSpecMismatch.device.height} 不一致`}
                     </div>
                   )}
@@ -9818,22 +9875,22 @@ export default function App() {
                         setVideoOpenId(editingVideoProject.id);
                         pushRoute("video");
                       }}
-                      className="w-full text-left bg-white rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex items-center justify-between active:scale-[0.99] transition-all cursor-pointer"
+                      className="w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex items-center justify-between active:scale-[0.99] transition-all cursor-pointer"
                     >
                       <div className="min-w-0">
-                        <div className="text-[16px] font-bold text-black tracking-tight">
+                        <div className="pf-fs-16 font-bold text-[var(--pf-ink)] tracking-tight">
                           视频表盘编辑
                         </div>
-                        <p className="text-[13px] font-medium text-black/40 mt-1 truncate">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1 truncate">
                           {editingVideoProject.title || "视频表盘"}
                         </p>
                       </div>
-                      <CaretRight className="w-5 h-5 text-black/25 shrink-0" />
+                      <CaretRight className="w-5 h-5 text-[var(--pf-i-25)] shrink-0" />
                     </button>
                   ) : editingDial.isPhotoDial && (
-                    <div className="bg-white rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex flex-col gap-2.5">
+                    <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)] flex flex-col gap-2.5">
                       <div className="flex items-center justify-between">
-                        <span className="text-[16px] font-bold text-black tracking-tight">
+                        <span className="pf-fs-16 font-bold text-[var(--pf-ink)] tracking-tight">
                           制作壁纸
                         </span>
 
@@ -9841,7 +9898,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={handleAddWallpaper}
-                          className="flex items-center gap-1.5 px-3.5 h-[32px] rounded-full bg-[#4361EE]/10 text-[#4361EE] hover:bg-[#4361EE]/15 active:scale-95 transition-all text-[13px] font-bold cursor-pointer"
+                          className="flex items-center gap-1.5 px-3.5 h-[32px] rounded-full bg-[var(--pf-primary-10)] text-[var(--pf-primary)] hover:bg-[var(--pf-primary-15)] active:scale-95 transition-all pf-fs-13 font-bold cursor-pointer"
                         >
                           <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
                           <span>去制作</span>
@@ -9851,13 +9908,13 @@ export default function App() {
                       {/* 默认照片 + 自己做的壁纸一排；两边都没有时才显示空态 */}
                       {wallpapers.length === 0 && !dialDefaultPhoto && !dialDefaultLoading ? (
                         <div className="py-6 flex flex-col items-center justify-center text-center">
-                          <p className="text-[13px] font-medium text-black/40 mb-3">
+                          <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mb-3">
                             {genPlanError || "还没有壁纸，点下面去做一张"}
                           </p>
                           <button
                             type="button"
                             onClick={handleAddWallpaper}
-                            className="h-[44px] px-5 rounded-full bg-black/5 hover:bg-black/10 text-black/75 font-bold text-[13px] active:scale-95 transition-all cursor-pointer"
+                            className="h-[44px] px-5 rounded-full bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] text-[var(--pf-i-75)] font-bold pf-fs-13 active:scale-95 transition-all cursor-pointer"
                           >
                             去制作壁纸
                           </button>
@@ -9874,8 +9931,8 @@ export default function App() {
                               title="表盘自带的默认照片"
                               className={`relative w-15 h-15 rounded-xl overflow-hidden shrink-0 transition-all cursor-pointer active:scale-95 ${
                                 currentWallpaperIndex === -1
-                                  ? "ring-2 ring-[#4361EE]"
-                                  : "opacity-75 hover:opacity-100 ring-1 ring-black/5"
+                                  ? "ring-2 ring-[var(--pf-primary)]"
+                                  : "opacity-75 hover:opacity-100 ring-1 ring-[var(--pf-bd-5)]"
                               }`}
                             >
                               <img
@@ -9883,7 +9940,7 @@ export default function App() {
                                 alt="默认照片"
                                 className="w-full h-full object-cover"
                               />
-                              <span className="absolute inset-x-0 bottom-0 pt-3 pb-1 bg-gradient-to-t from-black/70 to-transparent text-white text-[10px] font-bold text-center leading-none">
+                              <span className="absolute inset-x-0 bottom-0 pt-3 pb-1 bg-gradient-to-t from-black/70 to-transparent text-white pf-fs-10 font-bold text-center leading-none">
                                 默认
                               </span>
                               {dialDefaultLoading && (
@@ -9893,7 +9950,7 @@ export default function App() {
                           ) : (
                             dialDefaultLoading && (
                               <div
-                                className="w-15 h-15 rounded-xl shrink-0 bg-black/[0.05] animate-pulse"
+                                className="w-15 h-15 rounded-xl shrink-0 bg-[var(--pf-bg-5)] animate-pulse"
                                 aria-hidden="true"
                               />
                             )
@@ -9907,8 +9964,8 @@ export default function App() {
                                 onClick={() => setCurrentWallpaperIndex(idx)}
                                 className={`relative w-15 h-15 rounded-xl overflow-hidden shrink-0 transition-all cursor-pointer active:scale-95 group ${
                                   isSelected
-                                    ? "ring-2 ring-[#4361EE]"
-                                    : "opacity-75 hover:opacity-100 ring-1 ring-black/5"
+                                    ? "ring-2 ring-[var(--pf-primary)]"
+                                    : "opacity-75 hover:opacity-100 ring-1 ring-[var(--pf-bd-5)]"
                                 }`}
                               >
                                 <img
@@ -9922,7 +9979,7 @@ export default function App() {
                                     e.stopPropagation();
                                     handleRemoveWallpaper(idx);
                                   }}
-                                  className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/55 text-white flex items-center justify-center active:scale-90 transition-transform cursor-pointer"
+                                  className="absolute top-1 right-1 w-6 h-6 rounded-full bg-[var(--pf-bg-55)] text-white flex items-center justify-center active:scale-90 transition-transform cursor-pointer"
                                 >
                                   <X className="w-3.5 h-3.5 stroke-[2.5]" />
                                 </span>
@@ -9936,7 +9993,7 @@ export default function App() {
 
                       {/* 只有默认照片、还没做过壁纸：给一句引导，不占大块空态 */}
                       {wallpapers.length === 0 && dialDefaultPhoto && (
-                        <p className="text-[13px] font-medium text-black/35 text-center">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-35)] text-center">
                           还没有自己做的壁纸，点「去制作」做一张
                         </p>
                       )}
@@ -9946,10 +10003,10 @@ export default function App() {
                   {/* 卡片 1：表盘样式 */}
                   <div
                     id="acc-style"
-                    className={`rounded-2xl transition-all duration-300 overflow-hidden ${
+                    className={`pf-card-border rounded-2xl transition-all duration-300 overflow-hidden ${
                       openSection === "style"
-                        ? "bg-white ring-2 ring-[#4361EE]"
-                        : "bg-white shadow-[0_1px_3px_rgba(0,0,0,0.02)] hover:bg-white/90"
+                        ? "bg-[var(--pf-card)] ring-2 ring-[var(--pf-primary)]"
+                        : "bg-[var(--pf-card)] pf-card-border shadow-[0_1px_3px_rgba(0,0,0,0.02)] hover:bg-[var(--pf-sheet)]"
                     }`}
                   >
                     <button
@@ -9958,23 +10015,23 @@ export default function App() {
                       className="w-full text-left p-3.5 flex items-center justify-between cursor-pointer"
                     >
                       <div>
-                        <span className={`text-[12px] font-bold block transition-colors ${
-                          openSection === "style" ? "text-[#4361EE]" : "text-black/45"
+                        <span className={`pf-fs-12 font-bold block transition-colors ${
+                          openSection === "style" ? "text-[var(--pf-primary)]" : "text-[var(--pf-i-45)]"
                         }`}>
                           表盘样式
                         </span>
-                        <h4 className="text-[16px] font-bold text-black mt-0.5">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] mt-0.5">
                           {selectedStyle}
                         </h4>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className={`text-[12px] font-semibold px-2 py-0.5 rounded-full transition-colors ${
-                          openSection === "style" ? "bg-[#4361EE]/10 text-[#4361EE]" : "text-black/35"
+                        <span className={`pf-fs-12 font-semibold px-2 py-0.5 rounded-full transition-colors ${
+                          openSection === "style" ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]" : "text-[var(--pf-i-35)]"
                         }`}>
                           {`${styleOptions.length} 种样式`}
                         </span>
                         <div className={`w-6 h-6 rounded-full flex items-center justify-center transition-transform duration-300 ${
-                          openSection === "style" ? "rotate-180 text-[#4361EE]" : "text-black/30"
+                          openSection === "style" ? "rotate-180 text-[var(--pf-primary)]" : "text-[var(--pf-i-30)]"
                         }`}>
                           <CaretDown className="w-4 h-4 stroke-[2.2]" />
                         </div>
@@ -9982,7 +10039,7 @@ export default function App() {
                     </button>
 
                     {openSection === "style" && (
-                      <div className="px-4.5 pb-4 pt-1 border-t border-black/[0.05] animate-in fade-in slide-in-from-top-2 duration-200">
+                      <div className="px-4.5 pb-4 pt-1 border-t border-[var(--pf-bd-5)] animate-in fade-in slide-in-from-top-2 duration-200">
                         <div data-rb="y" className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
                           {styleOptions.map((st) => {
                             const isSelected = selectedStyle === st;
@@ -10007,10 +10064,10 @@ export default function App() {
                                     }
                                   }
                                 }}
-                                className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[13px] font-semibold transition-all cursor-pointer ${
+                                className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between pf-fs-13 font-semibold transition-all cursor-pointer ${
                                   isSelected
-                                    ? "bg-[#4361EE] text-white"
-                                    : "bg-[#F5F6F9] hover:bg-[#EAEAEF] text-black/80"
+                                    ? "bg-[var(--pf-primary-solid)] text-white"
+                                    : "bg-[var(--pf-page)] hover:bg-[var(--pf-elev)] text-[var(--pf-i-80)]"
                                 }`}
                               >
                                 <span>{st}</span>
@@ -10022,7 +10079,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => setOpenSection(null)}
-                          className="w-full mt-1.5 py-1.5 text-center text-[12px] font-bold text-[#4361EE] hover:bg-[#4361EE]/5 rounded-lg transition-colors cursor-pointer"
+                          className="w-full mt-1.5 py-1.5 text-center pf-fs-12 font-bold text-[var(--pf-primary)] hover:bg-[var(--pf-primary-5)] rounded-lg transition-colors cursor-pointer"
                         >
                           收起选项
                         </button>
@@ -10034,10 +10091,10 @@ export default function App() {
                   {visibleColors.length >= 2 && (
                   <div
                     id="acc-color"
-                    className={`rounded-2xl transition-all duration-300 overflow-hidden ${
+                    className={`pf-card-border rounded-2xl transition-all duration-300 overflow-hidden ${
                       openSection === "color"
-                        ? "bg-white ring-2 ring-[#4361EE]"
-                        : "bg-white shadow-[0_1px_3px_rgba(0,0,0,0.02)] hover:bg-white/90"
+                        ? "bg-[var(--pf-card)] ring-2 ring-[var(--pf-primary)]"
+                        : "bg-[var(--pf-card)] pf-card-border shadow-[0_1px_3px_rgba(0,0,0,0.02)] hover:bg-[var(--pf-sheet)]"
                     }`}
                   >
                     <button
@@ -10046,23 +10103,23 @@ export default function App() {
                       className="w-full text-left p-3.5 flex items-center justify-between cursor-pointer"
                     >
                       <div>
-                        <span className={`text-[12px] font-bold block transition-colors ${
-                          openSection === "color" ? "text-[#4361EE]" : "text-black/45"
+                        <span className={`pf-fs-12 font-bold block transition-colors ${
+                          openSection === "color" ? "text-[var(--pf-primary)]" : "text-[var(--pf-i-45)]"
                         }`}>
                           主题配色
                         </span>
-                        <h4 className="text-[16px] font-bold text-black mt-0.5">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] mt-0.5">
                           {selectedColorName}
                         </h4>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className={`text-[12px] font-semibold px-2 py-0.5 rounded-full transition-colors ${
-                          openSection === "color" ? "bg-[#4361EE]/10 text-[#4361EE]" : "text-black/35"
+                        <span className={`pf-fs-12 font-semibold px-2 py-0.5 rounded-full transition-colors ${
+                          openSection === "color" ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]" : "text-[var(--pf-i-35)]"
                         }`}>
                           {`${visibleColors.length} 种配色`}
                         </span>
                         <div className={`w-6 h-6 rounded-full flex items-center justify-center transition-transform duration-300 ${
-                          openSection === "color" ? "rotate-180 text-[#4361EE]" : "text-black/30"
+                          openSection === "color" ? "rotate-180 text-[var(--pf-primary)]" : "text-[var(--pf-i-30)]"
                         }`}>
                           <CaretDown className="w-4 h-4 stroke-[2.2]" />
                         </div>
@@ -10070,7 +10127,7 @@ export default function App() {
                     </button>
 
                     {openSection === "color" && (
-                      <div className="px-4.5 pb-4 pt-1 border-t border-black/[0.05] animate-in fade-in slide-in-from-top-2 duration-200">
+                      <div className="px-4.5 pb-4 pt-1 border-t border-[var(--pf-bd-5)] animate-in fade-in slide-in-from-top-2 duration-200">
                         <div data-rb="y" className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
                           {visibleColors.map((col) => {
                             const isSelected = selectedColorName === col.name;
@@ -10079,10 +10136,10 @@ export default function App() {
                                 key={col.name}
                                 type="button"
                                 onClick={() => setSelectedColorName(col.name)}
-                                className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[13px] font-semibold transition-all cursor-pointer ${
+                                className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between pf-fs-13 font-semibold transition-all cursor-pointer ${
                                   isSelected
-                                    ? "bg-[#4361EE] text-white"
-                                    : "bg-[#F5F6F9] hover:bg-[#EAEAEF] text-black/80"
+                                    ? "bg-[var(--pf-primary-solid)] text-white"
+                                    : "bg-[var(--pf-page)] hover:bg-[var(--pf-elev)] text-[var(--pf-i-80)]"
                                 }`}
                               >
                                 <span>{col.name}</span>
@@ -10094,7 +10151,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => setOpenSection(null)}
-                          className="w-full mt-1.5 py-1.5 text-center text-[12px] font-bold text-[#4361EE] hover:bg-[#4361EE]/5 rounded-lg transition-colors cursor-pointer"
+                          className="w-full mt-1.5 py-1.5 text-center pf-fs-12 font-bold text-[var(--pf-primary)] hover:bg-[var(--pf-primary-5)] rounded-lg transition-colors cursor-pointer"
                         >
                           收起选项
                         </button>
@@ -10112,10 +10169,10 @@ export default function App() {
                       <div
                         key={`container-${card.slot ?? idx}`}
                         id={`acc-container-${card.slot ?? idx}`}
-                        className={`rounded-2xl transition-all duration-300 overflow-hidden ${
+                        className={`pf-card-border rounded-2xl transition-all duration-300 overflow-hidden ${
                           isOpen
-                            ? "bg-white ring-2 ring-[#4361EE]"
-                            : "bg-white shadow-[0_1px_3px_rgba(0,0,0,0.02)] hover:bg-white/90"
+                            ? "bg-[var(--pf-card)] ring-2 ring-[var(--pf-primary)]"
+                            : "bg-[var(--pf-card)] pf-card-border shadow-[0_1px_3px_rgba(0,0,0,0.02)] hover:bg-[var(--pf-sheet)]"
                         }`}
                       >
                         <button
@@ -10124,23 +10181,23 @@ export default function App() {
                           className="w-full text-left p-3.5 flex items-center justify-between cursor-pointer"
                         >
                           <div>
-                            <span className={`text-[12px] font-bold block transition-colors ${
-                              isOpen ? "text-[#4361EE]" : "text-black/45"
+                            <span className={`pf-fs-12 font-bold block transition-colors ${
+                              isOpen ? "text-[var(--pf-primary)]" : "text-[var(--pf-i-45)]"
                             }`}>
                               {`容器 ${idx + 1}｜${card.label}`}
                             </span>
-                            <h4 className="text-[16px] font-bold text-black mt-0.5">
+                            <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] mt-0.5">
                               {card.selected}
                             </h4>
                           </div>
                           <div className="flex items-center gap-2">
-                            <span className={`text-[12px] font-semibold px-2 py-0.5 rounded-full transition-colors ${
-                              isOpen ? "bg-[#4361EE]/10 text-[#4361EE]" : "text-black/35"
+                            <span className={`pf-fs-12 font-semibold px-2 py-0.5 rounded-full transition-colors ${
+                              isOpen ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]" : "text-[var(--pf-i-35)]"
                             }`}>
                               {`${card.options.length} 种容器`}
                             </span>
                             <div className={`w-6 h-6 rounded-full flex items-center justify-center transition-transform duration-300 ${
-                              isOpen ? "rotate-180 text-[#4361EE]" : "text-black/30"
+                              isOpen ? "rotate-180 text-[var(--pf-primary)]" : "text-[var(--pf-i-30)]"
                             }`}>
                               <CaretDown className="w-4 h-4 stroke-[2.2]" />
                             </div>
@@ -10148,7 +10205,7 @@ export default function App() {
                         </button>
 
                         {isOpen && (
-                          <div className="px-4.5 pb-4 pt-1 border-t border-black/[0.05] animate-in fade-in slide-in-from-top-2 duration-200">
+                          <div className="px-4.5 pb-4 pt-1 border-t border-[var(--pf-bd-5)] animate-in fade-in slide-in-from-top-2 duration-200">
                             <div data-rb="y" className="max-h-[200px] overflow-y-auto no-scrollbar flex flex-col gap-1 py-1">
                               {card.options.map((con, oi) => {
                                 // 选中判定按**动作序号**：两个候选同名时也能各自独立高亮
@@ -10161,10 +10218,10 @@ export default function App() {
                                     key={card.slot != null ? `${card.slot}:${card.ids[oi] ?? oi}` : `${card.label}:${oi}`}
                                     type="button"
                                     onClick={() => selectContainerAt(card.slot, card.label, oi)}
-                                    className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between text-[13px] font-semibold transition-all cursor-pointer ${
+                                    className={`w-full py-2 px-3 rounded-xl text-left flex items-center justify-between pf-fs-13 font-semibold transition-all cursor-pointer ${
                                       isSelected
-                                        ? "bg-[#4361EE] text-white"
-                                        : "bg-[#F5F6F9] hover:bg-[#EAEAEF] text-black/80"
+                                        ? "bg-[var(--pf-primary-solid)] text-white"
+                                        : "bg-[var(--pf-page)] hover:bg-[var(--pf-elev)] text-[var(--pf-i-80)]"
                                     }`}
                                   >
                                     <span>{con}</span>
@@ -10176,7 +10233,7 @@ export default function App() {
                             <button
                               type="button"
                               onClick={() => setOpenSection(null)}
-                              className="w-full mt-1.5 py-1.5 text-center text-[12px] font-bold text-[#4361EE] hover:bg-[#4361EE]/5 rounded-lg transition-colors cursor-pointer"
+                              className="w-full mt-1.5 py-1.5 text-center pf-fs-12 font-bold text-[var(--pf-primary)] hover:bg-[var(--pf-primary-5)] rounded-lg transition-colors cursor-pointer"
                             >
                               收起选项
                             </button>
@@ -10190,12 +10247,12 @@ export default function App() {
               </div>
 
               {/* 3. 底部固定主按钮「应用」（不透明纯色底 + 原有分隔线） */}
-              <div data-pf-bottombar className="absolute bottom-0 left-0 right-0 p-5 safe-bottom-bar bg-white border-t border-black/5 flex flex-col pt-3 z-30">
+              <div data-pf-bottombar className="absolute bottom-0 left-0 right-0 p-5 safe-bottom-bar bg-[var(--pf-card)] border-t border-[var(--pf-bd-5)] flex flex-col pt-3 z-30">
                 <button
                   type="button"
                   onClick={handleApplyDialConfig}
                   disabled={isApplying || appliedSuccess}
-                  className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-[#34C759] text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
+                  className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] disabled:bg-[var(--pf-ok-solid)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2 shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
                 >
                   {isApplying ? (
                     <>
@@ -10252,13 +10309,13 @@ export default function App() {
                   <section
                     key={photo.id}
                     id={`gen-sec-${i}`}
-                    className="bg-white rounded-2xl p-4 flex flex-col gap-3"
+                    className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3"
                   >
                     <div className="flex items-center justify-between">
-                      <h3 className="text-[16px] font-bold text-black">
+                      <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)]">
                         {genSlotLabel(photo, photos.length)}
                       </h3>
-                      <span className="text-[12px] font-medium text-black/35">已固定</span>
+                      <span className="pf-fs-12 font-medium text-[var(--pf-i-35)]">已固定</span>
                     </div>
                     <div className="flex items-center gap-3">
                       <div
@@ -10266,12 +10323,12 @@ export default function App() {
                         style={{ background: lockFill, boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.08)" }}
                       />
                       <div className="flex-1 min-w-0">
-                        <p className="text-[13px] font-semibold text-black/70">该配色下固定为纯色</p>
-                        <p className="text-[12px] font-mono text-black/40 mt-0.5">{lockFill}</p>
+                        <p className="pf-fs-13 font-semibold text-[var(--pf-i-70)]">该配色下固定为纯色</p>
+                        <p className="pf-fs-12 font-mono text-[var(--pf-i-40)] mt-0.5">{lockFill}</p>
                       </div>
-                      <LockSimple weight="bold" className="w-4 h-4 text-black/25 shrink-0" />
+                      <LockSimple weight="bold" className="w-4 h-4 text-[var(--pf-i-25)] shrink-0" />
                     </div>
-                    <p className="text-[12px] text-black/35">换一个相框颜色即可编辑这一层</p>
+                    <p className="pf-fs-12 text-[var(--pf-i-35)]">换一个相框颜色即可编辑这一层</p>
                   </section>
                 );
               }
@@ -10288,29 +10345,29 @@ export default function App() {
                 <section
                   key={photo.id}
                   id={`gen-sec-${i}`}
-                  className="bg-white rounded-2xl p-4 flex flex-col gap-3"
+                  className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3"
                 >
                   <div className="flex items-center justify-between">
-                    <h3 className="text-[16px] font-bold text-black">
+                    <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)]">
                       {genSlotLabel(photo, photos.length)}
                     </h3>
-                    <span className="text-[12px] font-medium text-black/35">
+                    <span className="pf-fs-12 font-medium text-[var(--pf-i-35)]">
                       {isSolid ? "纯色" : layer.full ? "照片" : "未选择"}
                     </span>
                   </div>
 
                   {/* 来源切换（两粒胶囊，整行等分） */}
-                  <div className="flex rounded-full bg-black/5 p-1">
+                  <div className="flex rounded-full bg-[var(--pf-bg-5)] p-1">
                     <button
                       type="button"
                       onClick={() => {
                         setGenActive(i);
                         setGenSolidMode(i, false);
                       }}
-                      className={`flex-1 h-9 rounded-full text-[13px] font-semibold transition-all cursor-pointer ${
+                      className={`flex-1 h-9 rounded-full pf-fs-13 font-semibold transition-all cursor-pointer ${
                         !isSolid
-                          ? "bg-white text-black shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
-                          : "text-black/50"
+                          ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
+                          : "text-[var(--pf-i-50)]"
                       }`}
                     >
                       照片
@@ -10321,10 +10378,10 @@ export default function App() {
                         setGenActive(i);
                         setGenSolidMode(i, true);
                       }}
-                      className={`flex-1 h-9 rounded-full text-[13px] font-semibold transition-all cursor-pointer ${
+                      className={`flex-1 h-9 rounded-full pf-fs-13 font-semibold transition-all cursor-pointer ${
                         isSolid
-                          ? "bg-white text-black shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
-                          : "text-black/50"
+                          ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
+                          : "text-[var(--pf-i-50)]"
                       }`}
                     >
                       纯色
@@ -10339,12 +10396,12 @@ export default function App() {
                           <img
                             src={layer.prev}
                             alt=""
-                            className="w-14 h-14 rounded-xl object-cover bg-black/5 shrink-0"
+                            className="w-14 h-14 rounded-xl object-cover bg-[var(--pf-bg-5)] shrink-0"
                           />
                           <button
                             type="button"
                             onClick={() => pickGenPhoto(i)}
-                            className="flex-1 h-14 rounded-xl bg-black/5 hover:bg-black/10 active:scale-[0.99] transition-all text-[13px] font-semibold text-black/70 cursor-pointer"
+                            className="flex-1 h-14 rounded-xl bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-[0.99] transition-all pf-fs-13 font-semibold text-[var(--pf-i-70)] cursor-pointer"
                           >
                             更换照片
                           </button>
@@ -10414,7 +10471,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => resetGenLayer(i)}
-                          className="w-full h-11 rounded-xl bg-black/5 hover:bg-black/10 active:scale-[0.99] transition-all text-[13px] font-semibold text-black/55 cursor-pointer flex items-center justify-center gap-1.5"
+                          className="w-full h-11 rounded-xl bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-[0.99] transition-all pf-fs-13 font-semibold text-[var(--pf-i-55)] cursor-pointer flex items-center justify-center gap-1.5"
                         >
                           <ArrowCounterClockwise className="w-4 h-4" />
                           恢复默认
@@ -10424,16 +10481,16 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => pickGenPhoto(i)}
-                        className="w-full h-24 rounded-2xl border border-dashed border-black/15 bg-black/[0.02] flex flex-col items-center justify-center gap-1.5 text-black/45 active:scale-[0.99] transition-transform cursor-pointer"
+                        className="w-full h-24 rounded-2xl border border-dashed border-[var(--pf-bd-15)] bg-[var(--pf-bg-2)] flex flex-col items-center justify-center gap-1.5 text-[var(--pf-i-45)] active:scale-[0.99] transition-transform cursor-pointer"
                       >
                         <Plus className="w-6 h-6" />
-                        <span className="text-[13px] font-semibold">选择照片</span>
+                        <span className="pf-fs-13 font-semibold">选择照片</span>
                       </button>
                     )
                   ) : (
                     /* 纯色：直接给自定义色板（色相 + 深浅两根滑杆）。
                        预设色板整块去掉——用户 2026-11-07 明确说那一排圆点不要了。 */
-                    <div className="rounded-2xl bg-black/[0.03] p-3">
+                    <div className="rounded-2xl bg-[var(--pf-bg-3)] p-3">
                       <GenCustomColorPanel
                         value={fillColor || "#FFFFFF"}
                         onChange={hex => {
@@ -10448,7 +10505,7 @@ export default function App() {
             };
 
             return (
-              <div className="flex-1 flex flex-col overflow-hidden bg-[#F5F6F9] page-enter-anim select-none relative">
+              <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
                 {/* 顶部：返回（问是否保存）/ 标题 / 保存 */}
                 <div className="relative flex items-center justify-between px-4 safe-top pb-1 z-20 shrink-0">
                   <button
@@ -10457,18 +10514,18 @@ export default function App() {
                       if (genDirty) setGenExitAsk(true);
                       else goBackOr("main/manage");
                     }}
-                    className="h-9 px-4 rounded-full bg-black/5 hover:bg-black/10 active:scale-95 transition-all text-black/80 text-[13px] font-semibold cursor-pointer flex items-center justify-center"
+                    className="h-9 px-4 rounded-full bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-95 transition-all text-[var(--pf-i-80)] pf-fs-13 font-semibold cursor-pointer flex items-center justify-center"
                   >
                     返回
                   </button>
-                  <span className="absolute left-1/2 -translate-x-1/2 text-[17px] font-bold tracking-tight text-black">
+                  <span className="absolute left-1/2 -translate-x-1/2 pf-fs-17 font-bold tracking-tight text-[var(--pf-ink)]">
                     制作壁纸
                   </span>
                   <button
                     type="button"
                     onClick={() => void saveGenWallpapers()}
                     disabled={genRendering}
-                    className="h-9 px-4 rounded-full bg-[#4361EE]/10 text-[#4361EE] hover:bg-[#4361EE]/15 disabled:text-[#4361EE]/50 active:scale-95 transition-all text-[13px] font-bold cursor-pointer flex items-center justify-center gap-1.5"
+                    className="h-9 px-4 rounded-full bg-[var(--pf-primary-10)] text-[var(--pf-primary)] hover:bg-[var(--pf-primary-15)] disabled:text-[var(--pf-primary-50)] active:scale-95 transition-all pf-fs-13 font-bold cursor-pointer flex items-center justify-center gap-1.5"
                   >
                     {genRendering && genSaving ? <CircleNotch className="w-4 h-4 animate-spin" /> : null}
                     保存
@@ -10536,7 +10593,7 @@ export default function App() {
                   />
                   {missingAssets && (
                     <div className="absolute top-1 left-6 right-6 text-center pointer-events-none">
-                      <p className="text-[12px] font-medium text-[#D4973B]">
+                      <p className="pf-fs-12 font-medium text-[var(--pf-amber)]">
                         相框素材没下齐，请连网重开一次这一页
                       </p>
                     </div>
@@ -10549,10 +10606,10 @@ export default function App() {
 
                   {/* 相框颜色：直接铺在列表底部，不再需要点开浮层 */}
                   {colors.length > 1 && (
-                    <section className="bg-white rounded-2xl p-4 flex flex-col gap-3">
+                    <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
                       <div className="flex items-center justify-between">
-                        <h3 className="text-[16px] font-bold text-black">相框颜色</h3>
-                        <span className="text-[12px] font-medium text-black/35">
+                        <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)]">相框颜色</h3>
+                        <span className="pf-fs-12 font-medium text-[var(--pf-i-35)]">
                           {colors.find(c => c.i === (genColor ?? colors[0]?.i))?.name || ""}
                         </span>
                       </div>
@@ -10572,10 +10629,10 @@ export default function App() {
                 {/* 底部固定：已生成数量 + 生成按钮 */}
                 <div
                   data-pf-bottombar
-                  className="px-4 pt-2 safe-bottom-panel bg-white border-t border-black/5 flex flex-col gap-2 shrink-0 z-30"
+                  className="px-4 pt-2 safe-bottom-panel bg-[var(--pf-card)] border-t border-[var(--pf-bd-5)] flex flex-col gap-2 shrink-0 z-30"
                 >
                   <div className="h-[18px] flex items-center">
-                    <span className="text-[12px] font-medium text-black/40">
+                    <span className="pf-fs-12 font-medium text-[var(--pf-i-40)]">
                       {genSessionMade > 0
                         ? `这次已生成 ${genSessionMade} 张`
                         : wallpapers.length > 0
@@ -10588,7 +10645,7 @@ export default function App() {
                     <button
                       type="button"
                       disabled
-                      className="w-full h-[52px] rounded-full bg-black/10 text-black/35 font-bold text-[17px] flex items-center justify-center"
+                      className="w-full h-[52px] rounded-full bg-[var(--pf-bg-10)] text-[var(--pf-i-35)] font-bold pf-fs-17 flex items-center justify-center"
                     >
                       相框素材没下齐
                     </button>
@@ -10597,7 +10654,7 @@ export default function App() {
                       type="button"
                       onClick={handleGenerateWallpaper}
                       disabled={genRendering}
-                      className="w-full h-[52px] rounded-full bg-[#4361EE] disabled:bg-black/10 disabled:text-black/35 text-white font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
+                      className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] disabled:bg-[var(--pf-bg-10)] disabled:text-[var(--pf-i-35)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
                     >
                       {genRendering ? (
                         <>
@@ -10619,7 +10676,7 @@ export default function App() {
                           .getElementById(`gen-sec-${nextEmpty}`)
                           ?.scrollIntoView({ behavior: "smooth", block: "center" });
                       }}
-                      className="w-full h-[52px] rounded-full bg-black/10 text-black/45 font-bold text-[17px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center"
+                      className="w-full h-[52px] rounded-full bg-[var(--pf-bg-10)] text-[var(--pf-i-45)] font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center"
                     >
                       {nextEmpty >= 0
                         ? `还差${genSlotLabel(photos[nextEmpty], photos.length)}`
@@ -10656,37 +10713,24 @@ export default function App() {
 
           {/* 8. 关于应用主页（一级页面，简约清晰） */}
           {currentStep === "about_app" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top pb-8 page-enter-anim select-none">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 pb-4 page-enter-anim select-none subpage-top">
               <div>
                 {/* 顶部返回导航 */}
-                <div className="flex items-center justify-between pb-4">
-                  <button
-                    type="button"
-                    onClick={() => goBackOr("main/settings")}
-                    className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                  >
-                    <CaretLeft className="w-6 h-6 stroke-[2]" />
-                  </button>
-                  <span className="text-[17px] font-bold text-black tracking-tight">
-                    关于应用
-                  </span>
-                  <div className="w-11 h-11" />
-                </div>
 
                 {/* 应用主视觉：图标 + 盘坊 + v0.1.0 */}
-                <div className="flex flex-col items-center text-center pt-5 pb-6">
+                <div className="flex flex-col items-center text-center pt-3 pb-4">
                   {/* 参考参考图风格重新设计的应用图标：清透蓝青双色微光背景 + 悬浮白透毛玻璃表盘 + 立体卷角折纸与核心刻度 */}
                   {/* 应用图标：与桌面图标同一套手绘设计稿（Figma 节点 21:77 导出，白底 + 内容 62%） */}
                   <div className="w-24 h-24 rounded-[24px] overflow-hidden relative mb-4 select-none shadow-[0_8px_24px_rgba(0,0,0,0.10)]">
                     <img src={appIcon} alt="盘坊" className="w-full h-full object-cover" />
                   </div>
-                  <h2 className="text-[24px] font-bold text-black tracking-tight">
+                  <h2 className="pf-fs-24 font-bold text-[var(--pf-ink)] tracking-tight">
                     盘坊
                   </h2>
                 </div>
 
                 {/* 开源声明行：「本应用以 AGPL-3.0 分发，点击查看源码」 */}
-                <div className="text-center pb-6 px-4">
+                <div className="text-center pb-4 px-4">
                   <a
                     href="https://github.com/Hobjl-lian/panfang"
                     target="_blank"
@@ -10694,87 +10738,87 @@ export default function App() {
                     onClick={(e) => {
                       openLink(e, "https://github.com/Hobjl-lian/panfang");
                     }}
-                    className="inline-flex items-center gap-1.5 text-[13px] font-medium text-black/50 hover:text-[#4361EE] transition-colors group cursor-pointer"
+                    className="inline-flex items-center gap-1.5 pf-fs-13 font-medium text-[var(--pf-i-50)] hover:text-[var(--pf-primary)] transition-colors group cursor-pointer"
                   >
                     <span className="whitespace-nowrap">本应用以 AGPL-3.0 分发，点击查看源码</span>
-                    <ArrowSquareOut className="w-3.5 h-3.5 stroke-[2] text-black/35 group-hover:text-[#4361EE]" />
+                    <ArrowSquareOut className="w-3.5 h-3.5 stroke-[2] text-[var(--pf-i-35)] group-hover:text-[var(--pf-primary)]" />
                   </a>
                 </div>
 
                 {/* 功能与详情列表组（包含关于开发者与开源许可） */}
-                <div className="bg-white rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/[0.02] divide-y divide-black/[0.05]">
+                <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] divide-y divide-[var(--pf-bd-5)]">
                   {/* 一级入口：检查更新（App 自更新通道；发现新版本时副标题变蓝） */}
                   <button
                     type="button"
                     onClick={() => void runAppUpdateCheck("manual")}
-                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
                   >
                     <div className="flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 shrink-0 rounded-xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center">
+                      <div className="w-9 h-9 shrink-0 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center">
                         <ArrowClockwise className="w-5 h-5 stroke-[2]" />
                       </div>
                       <div className="min-w-0">
-                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                           检查更新
                         </h4>
                         <p
-                          className={`text-[13px] font-medium mt-0.5 ${
-                            appUpdateKnown ? "text-[#4361EE]" : "text-black/40"
+                          className={`pf-fs-13 font-medium mt-0.5 ${
+                            appUpdateKnown ? "text-[var(--pf-primary)]" : "text-[var(--pf-i-40)]"
                           }`}
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.4.2"}`}
+                            : `当前版本 v${appVersion ?? "0.4.5"}`}
                         </p>
                       </div>
                     </div>
-                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/50 transition-colors" />
+                    <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-50)] transition-colors" />
                   </button>
 
                   {/* 二级入口：关于开发者 */}
                   <button
                     type="button"
                     onClick={() => pushRoute("about/developer")}
-                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
                   >
                     <div className="flex items-center gap-3.5 min-w-0">
                       <img
                         src={developerAvatar}
                         alt="Hobjl"
-                        className="w-9 h-9 shrink-0 rounded-full object-cover ring-2 ring-[#4361EE]/15 shadow-sm"
+                        className="w-9 h-9 shrink-0 rounded-full object-cover ring-2 ring-[var(--pf-primary-15)] shadow-sm"
                       />
                       <div className="min-w-0">
-                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                           关于开发者
                         </h4>
-                        <p className="text-[13px] font-medium text-black/40 mt-0.5">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5">
                           Hobjl，小米官方表盘设计师
                         </p>
                       </div>
                     </div>
-                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/50 transition-colors" />
+                    <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-50)] transition-colors" />
                   </button>
 
                   {/* 二级入口：开源许可与致谢 */}
                   <button
                     type="button"
                     onClick={() => pushRoute("about/licenses")}
-                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
                   >
                     <div className="flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 shrink-0 rounded-xl bg-black/5 flex items-center justify-center text-black/70">
+                      <div className="w-9 h-9 shrink-0 rounded-xl bg-[var(--pf-bg-5)] flex items-center justify-center text-[var(--pf-i-70)]">
                         <FileText className="w-5 h-5 stroke-[2]" />
                       </div>
                       <div className="min-w-0">
-                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                           开源许可与致谢
                         </h4>
-                        <p className="text-[13px] font-medium text-black/40 mt-0.5">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5">
                           AGPL-3.0 协议及 AstroBox-NG 致谢
                         </p>
                       </div>
                     </div>
-                    <CaretRight className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/50 transition-colors" />
+                    <CaretRight className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-50)] transition-colors" />
                   </button>
 
                   {/* 外部链接：隐私政策（挂在已备案域名上，App 内只做跳转） */}
@@ -10783,22 +10827,22 @@ export default function App() {
                     onClick={(e) => {
                       openLink(e, `${LEGAL_BASE}/privacy`);
                     }}
-                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
                   >
                     <div className="flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 shrink-0 rounded-xl bg-black/5 flex items-center justify-center text-black/70">
+                      <div className="w-9 h-9 shrink-0 rounded-xl bg-[var(--pf-bg-5)] flex items-center justify-center text-[var(--pf-i-70)]">
                         <ShieldCheck className="w-5 h-5 stroke-[2]" />
                       </div>
                       <div className="min-w-0">
-                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                           隐私政策
                         </h4>
-                        <p className="text-[13px] font-medium text-black/40 mt-0.5">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5">
                           数据怎么处理
                         </p>
                       </div>
                     </div>
-                    <ArrowSquareOut className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/50 transition-colors" />
+                    <ArrowSquareOut className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-50)] transition-colors" />
                   </button>
 
                   {/* 外部链接：用户协议 */}
@@ -10807,22 +10851,22 @@ export default function App() {
                     onClick={(e) => {
                       openLink(e, `${LEGAL_BASE}/terms`);
                     }}
-                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-black/[0.02] transition-colors cursor-pointer group"
+                    className="w-full p-4.5 flex items-center justify-between text-left active:bg-[var(--pf-bg-2)] transition-colors cursor-pointer group"
                   >
                     <div className="flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 shrink-0 rounded-xl bg-black/5 flex items-center justify-center text-black/70">
+                      <div className="w-9 h-9 shrink-0 rounded-xl bg-[var(--pf-bg-5)] flex items-center justify-center text-[var(--pf-i-70)]">
                         <Scroll className="w-5 h-5 stroke-[2]" />
                       </div>
                       <div className="min-w-0">
-                        <h4 className="text-[16px] font-bold text-black leading-tight">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] leading-tight">
                           用户协议
                         </h4>
-                        <p className="text-[13px] font-medium text-black/40 mt-0.5">
+                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5">
                           付费与使用规则
                         </p>
                       </div>
                     </div>
-                    <ArrowSquareOut className="w-5 h-5 shrink-0 text-black/25 stroke-[2] group-hover:text-black/50 transition-colors" />
+                    <ArrowSquareOut className="w-5 h-5 shrink-0 text-[var(--pf-i-25)] stroke-[2] group-hover:text-[var(--pf-i-50)] transition-colors" />
                   </button>
                 </div>
               </div>
@@ -10836,12 +10880,12 @@ export default function App() {
                   onClick={(e) => {
                     openLink(e, BEIAN_URL);
                   }}
-                  className="inline-flex items-center gap-1 text-[12px] font-medium text-black/30 hover:text-[#4361EE] transition-colors cursor-pointer"
+                  className="inline-flex items-center gap-1 pf-fs-12 font-medium text-[var(--pf-i-30)] hover:text-[var(--pf-primary)] transition-colors cursor-pointer"
                 >
                   <span>{APP_BEIAN_NO}</span>
                   <ArrowSquareOut className="w-3 h-3 stroke-[2]" />
                 </a>
-                <p className="text-[12px] font-medium text-black/25 mt-1.5">
+                <p className="pf-fs-12 font-medium text-[var(--pf-i-25)] mt-1.5">
                   Designed & Developed by Hobjl
                 </p>
               </div>
@@ -10850,21 +10894,8 @@ export default function App() {
 
           {/* 9. 关于开发者界面（二级页：克制、留白的 Apple 极简风格） */}
           {currentStep === "about_developer" && (
-            <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-12 page-enter-anim select-none">
+            <div className="flex-1 flex flex-col justify-between px-7 pb-12 page-enter-anim select-none subpage-top">
               {/* 顶部返回导航 */}
-              <div className="flex items-center justify-between">
-                <button
-                  type="button"
-                  onClick={() => goBackOr("about")}
-                  className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                >
-                  <CaretLeft className="w-6 h-6 stroke-[2]" />
-                </button>
-                <span className="text-[17px] font-bold text-black tracking-tight">
-                  关于开发者
-                </span>
-                <div className="w-11 h-11" />
-              </div>
 
               {/* 中间核心留白信息区 */}
               <div className="flex flex-col items-center text-center my-auto px-2">
@@ -10878,17 +10909,17 @@ export default function App() {
                 </div>
 
                 {/* 名字 */}
-                <h2 className="text-[26px] font-bold text-black tracking-tight">
+                <h2 className="pf-fs-26 font-bold text-[var(--pf-ink)] tracking-tight">
                   Hobjl
                 </h2>
 
                 {/* 身份小标签 */}
-                <p className="text-[13px] font-bold text-[#4361EE] mt-1.5">
+                <p className="pf-fs-13 font-bold text-[var(--pf-primary)] mt-1.5">
                   开发者
                 </p>
 
                 {/* 简介文案：自然留白，纯净排版 */}
-                <p className="text-[13px] font-medium text-black/45 leading-relaxed mt-6 max-w-[270px]">
+                <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] leading-relaxed mt-6 max-w-[270px]">
                   小米官方表盘设计师，米坛社区认证创作者。无论是否发电，希望你开心。
                 </p>
               </div>
@@ -10902,7 +10933,7 @@ export default function App() {
                   onClick={(e) => {
                     openLink(e, "https://afdian.com/a/Hobjl?utm_source=copylink&utm_medium=link");
                   }}
-                  className="w-full h-[52px] rounded-full bg-[#4361EE] hover:bg-[#3853db] text-white font-bold text-[17px] active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer shadow-[0_8px_24px_rgba(0,0,0,0.10)] tracking-tight"
+                  className="w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] hover:bg-[var(--pf-primary-strong)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer shadow-[0_8px_24px_rgba(0,0,0,0.10)] tracking-tight"
                 >
                   <span>前往爱发电</span>
                   <ArrowSquareOut className="w-5 h-5 stroke-[2]" />
@@ -10912,7 +10943,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => void copyDiag()}
-                    className="text-[13px] font-bold text-black/45 hover:text-black/70 transition-colors cursor-pointer"
+                    className="pf-fs-13 font-bold text-[var(--pf-i-45)] hover:text-[var(--pf-i-70)] transition-colors cursor-pointer"
                   >
                     复制诊断信息
                   </button>
@@ -10920,7 +10951,7 @@ export default function App() {
                     type="button"
                     disabled={diagBusy}
                     onClick={() => void exportDiag()}
-                    className="text-[13px] font-bold text-black/45 hover:text-black/70 transition-colors cursor-pointer disabled:opacity-50"
+                    className="pf-fs-13 font-bold text-[var(--pf-i-45)] hover:text-[var(--pf-i-70)] transition-colors cursor-pointer disabled:opacity-50"
                   >
                     {diagBusy ? "正在导出…" : "导出诊断包"}
                   </button>
@@ -10930,7 +10961,7 @@ export default function App() {
                     readOnly
                     value={diagText}
                     rows={Math.min(8, diagText.split("\n").length + 1)}
-                    className="w-full mt-3 text-[12px] font-medium text-black/55 bg-black/[0.03] rounded-2xl p-3 outline-none resize-none select-text leading-relaxed"
+                    className="w-full mt-3 pf-fs-12 font-medium text-[var(--pf-i-55)] bg-[var(--pf-bg-3)] rounded-2xl p-3 outline-none resize-none select-text leading-relaxed"
                   />
                 )}
               </div>
@@ -10939,47 +10970,34 @@ export default function App() {
 
           {/* 10. 开源许可与致谢（二级页：长文本可滚动、严格规范排版） */}
           {currentStep === "open_source_licenses" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim">
+            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
               <div>
                 {/* 顶部返回导航 */}
-                <div className="flex items-center justify-between pb-3">
-                  <button
-                    type="button"
-                    onClick={() => goBackOr("about")}
-                    className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 hover:bg-black/5 cursor-pointer active:scale-95 transition-all"
-                  >
-                    <CaretLeft className="w-6 h-6 stroke-[2]" />
-                  </button>
-                  <span className="text-[17px] font-bold text-black tracking-tight">
-                    开源许可与致谢
-                  </span>
-                  <div className="w-11 h-11" />
-                </div>
 
                 <div className="space-y-4 mt-3">
                   {/* 致谢项目：AstroBox-NG */}
-                  <div className="bg-white rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/5">
-                    <div className="flex items-center justify-between pb-3 border-b border-black/5">
+                  <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                    <div className="flex items-center justify-between pb-3 border-b border-[var(--pf-bd-5)]">
                       <div>
-                        <h3 className="text-[17px] font-bold text-black tracking-tight">
+                        <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight">
                           AstroBox-NG
                         </h3>
-                        <p className="text-[12px] font-bold text-[#4361EE] mt-0.5">
+                        <p className="pf-fs-12 font-bold text-[var(--pf-primary)] mt-0.5">
                           AGPL-3.0 + 附加署名条款
                         </p>
                       </div>
-                      <div className="w-8 h-8 rounded-full bg-[#4361EE]/10 flex items-center justify-center text-[#4361EE]">
+                      <div className="w-8 h-8 rounded-full bg-[var(--pf-primary-10)] flex items-center justify-center text-[var(--pf-primary)]">
                         <Code className="w-4 h-4 stroke-[2]" />
                       </div>
                     </div>
 
-                    <div className="pt-3.5 space-y-2.5 text-[13px]">
+                    <div className="pt-3.5 space-y-2.5 pf-fs-13">
                       <div>
-                        <span className="text-black/40 block text-[12px] font-bold">作者</span>
-                        <span className="font-bold text-black/80">AstralSight Studios</span>
+                        <span className="text-[var(--pf-i-40)] block pf-fs-12 font-bold">作者</span>
+                        <span className="font-bold text-[var(--pf-i-80)]">AstralSight Studios</span>
                       </div>
                       <div>
-                        <span className="text-black/40 block text-[12px] font-bold">仓库地址</span>
+                        <span className="text-[var(--pf-i-40)] block pf-fs-12 font-bold">仓库地址</span>
                         <a
                           href="https://github.com/AstralSightStudios/AstroBox-NG"
                           target="_blank"
@@ -10987,35 +11005,35 @@ export default function App() {
                           onClick={(e) => {
                             openLink(e, "https://github.com/AstralSightStudios/AstroBox-NG");
                           }}
-                          className="font-medium text-[#4361EE] break-all inline-flex items-center gap-1 hover:underline"
+                          className="font-medium text-[var(--pf-primary)] break-all inline-flex items-center gap-1 hover:underline"
                         >
                           <span>https://github.com/AstralSightStudios/AstroBox-NG</span>
                           <ArrowSquareOut className="w-3.5 h-3.5 stroke-[2] shrink-0" />
                         </a>
                       </div>
-                      <div className="bg-[#F5F6F9] rounded-2xl p-3 text-[13px] text-black/45 leading-relaxed mt-2">
+                      <div className="bg-[var(--pf-page)] rounded-2xl p-3 pf-fs-13 text-[var(--pf-i-45)] leading-relaxed mt-2">
                         遵循其 AGPL-3.0 附加署名条款，特此明确保留原项目仓库地址及作者 AstralSight Studios 署名，由衷感谢开源社区的杰出贡献。
                       </div>
                     </div>
                   </div>
 
                   {/* 本项目源码许可：GNU AGPL-3.0 */}
-                  <div className="bg-white rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/5">
-                    <div className="flex items-center justify-between pb-3 border-b border-black/5">
+                  <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                    <div className="flex items-center justify-between pb-3 border-b border-[var(--pf-bd-5)]">
                       <div>
-                        <h3 className="text-[17px] font-bold text-black tracking-tight">
+                        <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight">
                           GNU AGPL-3.0
                         </h3>
-                        <p className="text-[12px] font-bold text-black/40 mt-0.5">
+                        <p className="pf-fs-12 font-bold text-[var(--pf-i-40)] mt-0.5">
                           GNU Affero General Public License v3.0
                         </p>
                       </div>
-                      <div className="w-8 h-8 rounded-full bg-black/5 flex items-center justify-center text-black/40">
+                      <div className="w-8 h-8 rounded-full bg-[var(--pf-bg-5)] flex items-center justify-center text-[var(--pf-i-40)]">
                         <ShieldCheck className="w-4 h-4 stroke-[2]" />
                       </div>
                     </div>
 
-                    <div className="pt-3.5 text-[13px] text-black/45 leading-relaxed space-y-2.5">
+                    <div className="pt-3.5 pf-fs-13 text-[var(--pf-i-45)] leading-relaxed space-y-2.5">
                       <p>
                         本项目「盘坊」源码遵循 GNU Affero General Public License v3.0 协议分发。
                       </p>
@@ -11028,7 +11046,7 @@ export default function App() {
                           target="_blank"
                           rel="noopener noreferrer"
                           onClick={(e) => openLink(e, "https://www.gnu.org/licenses/agpl-3.0.html")}
-                          className="inline-flex items-center gap-1 text-[13px] font-bold text-[#4361EE] hover:underline"
+                          className="inline-flex items-center gap-1 pf-fs-13 font-bold text-[var(--pf-primary)] hover:underline"
                         >
                           <span>阅读 GNU AGPL-3.0 完整条款 (gnu.org)</span>
                           <ArrowSquareOut className="w-3.5 h-3.5 stroke-[2]" />
@@ -11038,22 +11056,22 @@ export default function App() {
                   </div>
 
                   {/* 内嵌字体：思源宋体子集（只用于首屏卡片标题） */}
-                  <div className="bg-white rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-black/5">
-                    <div className="flex items-center justify-between pb-3 border-b border-black/5">
+                  <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+                    <div className="flex items-center justify-between pb-3 border-b border-[var(--pf-bd-5)]">
                       <div>
-                        <h3 className="text-[17px] font-bold text-black tracking-tight">
+                        <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight">
                           Noto Serif SC
                         </h3>
-                        <p className="text-[12px] font-bold text-black/40 mt-0.5">
+                        <p className="pf-fs-12 font-bold text-[var(--pf-i-40)] mt-0.5">
                           SIL Open Font License 1.1
                         </p>
                       </div>
-                      <div className="w-8 h-8 rounded-full bg-black/5 flex items-center justify-center text-black/40">
+                      <div className="w-8 h-8 rounded-full bg-[var(--pf-bg-5)] flex items-center justify-center text-[var(--pf-i-40)]">
                         <FileText className="w-4 h-4 stroke-[2]" />
                       </div>
                     </div>
 
-                    <div className="pt-3.5 text-[13px] text-black/45 leading-relaxed space-y-2.5">
+                    <div className="pt-3.5 pf-fs-13 text-[var(--pf-i-45)] leading-relaxed space-y-2.5">
                       <p>
                         首屏卡片标题内嵌的思源宋体子集仅包含标题用字，遵循 SIL Open Font License 1.1 分发，许可全文随源码仓库提供。
                       </p>
@@ -11065,7 +11083,7 @@ export default function App() {
                           onClick={(e) =>
                             openLink(e, "https://openfontlicense.org/open-font-license-official-text/")
                           }
-                          className="inline-flex items-center gap-1 text-[13px] font-bold text-[#4361EE] hover:underline"
+                          className="inline-flex items-center gap-1 pf-fs-13 font-bold text-[var(--pf-primary)] hover:underline"
                         >
                           <span>阅读 SIL OFL 1.1 完整条款</span>
                           <ArrowSquareOut className="w-3.5 h-3.5 stroke-[2]" />
@@ -11079,7 +11097,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => goBackOr("about")}
-                  className="w-full h-[44px] rounded-full bg-black/5 hover:bg-black/10 active:scale-[0.98] transition-all text-black/75 font-bold text-[16px] cursor-pointer flex items-center justify-center tracking-tight"
+                  className="w-full h-[44px] rounded-full bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-[0.98] transition-all text-[var(--pf-i-75)] font-bold pf-fs-16 cursor-pointer flex items-center justify-center tracking-tight"
                 >
                   返回关于应用
                 </button>
@@ -11098,56 +11116,63 @@ export default function App() {
           />
         )}
 
-        {/* 底部 Tab 栏（不透明纯色底 + 原有分隔线） */}
+        {/* 二级页统一顶栏（全局层，滚动与回弹都带不走） */}
+        {(() => {
+          const page = SECONDARY_PAGES[currentStep];
+          if (!page) return null;
+          return <SubPageTopBar title={page.title} onBack={() => goBackOr(page.back)} />;
+        })()}
+
+        {/* 底部 Tab 栏（半透明底 + 均匀模糊 + 0.5px 发丝线，Miuix 式） */}
         {currentStep === "main" && (
-          <div data-pf-bottombar className="absolute bottom-0 left-0 right-0 bg-white border-t border-black/[0.04] px-2 pt-2.5 safe-bottom flex items-center justify-around z-30">
+          <div data-pf-bottombar className="pf-bottombar pf-hairline-top absolute bottom-0 left-0 right-0 px-2 pt-2.5 safe-bottom flex items-center justify-around z-30">
             <button
               type="button"
               onClick={() => switchTab("home")}
               className={`flex-1 flex flex-col items-center gap-1 transition-colors cursor-pointer ${
-                activeTab === "home" ? "text-[#4361EE]" : "text-black/35 hover:text-black/60"
+                activeTab === "home" ? "text-[var(--pf-primary)]" : "text-[var(--pf-i-35)] hover:text-[var(--pf-i-60)]"
               }`}
             >
               <House className="w-6 h-6 stroke-[2.2]" />
-              <span className="text-[12px] font-semibold">首页</span>
+              <span className="pf-fs-12 font-semibold">首页</span>
             </button>
 
             <button
               type="button"
               onClick={() => switchTab("market")}
               className={`flex-1 flex flex-col items-center gap-1 transition-colors cursor-pointer ${
-                activeTab === "market" ? "text-[#4361EE]" : "text-black/35 hover:text-black/60"
+                activeTab === "market" ? "text-[var(--pf-primary)]" : "text-[var(--pf-i-35)] hover:text-[var(--pf-i-60)]"
               }`}
             >
               <span className="relative">
                 <Storefront className="w-6 h-6 stroke-[2.2]" />
                 {marketUpdateCount > 0 && (
-                  <span className="absolute -top-0.5 -right-1 w-2 h-2 rounded-full bg-[#D4973B] ring-2 ring-white" />
+                  <span className="absolute -top-0.5 -right-1 w-2 h-2 rounded-full bg-[var(--pf-amber-solid)] ring-2 ring-white" />
                 )}
               </span>
-              <span className="text-[12px] font-semibold">集市</span>
+              <span className="pf-fs-12 font-semibold">集市</span>
             </button>
 
             <button
               type="button"
               onClick={() => switchTab("manage")}
               className={`flex-1 flex flex-col items-center gap-1 transition-colors cursor-pointer ${
-                activeTab === "manage" ? "text-[#4361EE]" : "text-black/35 hover:text-black/60"
+                activeTab === "manage" ? "text-[var(--pf-primary)]" : "text-[var(--pf-i-35)] hover:text-[var(--pf-i-60)]"
               }`}
             >
               <SlidersHorizontal className="w-6 h-6 stroke-[2.2]" />
-              <span className="text-[12px] font-semibold">管理</span>
+              <span className="pf-fs-12 font-semibold">管理</span>
             </button>
 
             <button
               type="button"
               onClick={() => switchTab("settings")}
               className={`flex-1 flex flex-col items-center gap-1 transition-colors cursor-pointer ${
-                activeTab === "settings" ? "text-[#4361EE]" : "text-black/35 hover:text-black/60"
+                activeTab === "settings" ? "text-[var(--pf-primary)]" : "text-[var(--pf-i-35)] hover:text-[var(--pf-i-60)]"
               }`}
             >
               <GearSix className="w-6 h-6 stroke-[2.2]" />
-              <span className="text-[12px] font-semibold">设置</span>
+              <span className="pf-fs-12 font-semibold">设置</span>
             </button>
           </div>
         )}
@@ -11162,12 +11187,12 @@ export default function App() {
                 这里**故意不用 backdrop-blur** —— 托盘滑出、卡片进场的整段时间里，
                 背景模糊每帧都要重算，安卓 WebView 上就是「一卡一顿」的抽动源头。 */}
             <div
-              className="absolute inset-0 bg-black/40 transition-opacity duration-200"
+              className="absolute inset-0 bg-[var(--pf-mask)] transition-opacity duration-200"
               style={{ opacity: sheetClosing ? 0 : Math.max(0, 1 - sheetDrag / 360) }}
             />
             {/* 底部托盘：宽度铺满屏幕，只有上方两个圆角（参考用户给的样式，颜色/圆角用我们自己的） */}
             <div
-              className="relative bg-white rounded-t-[28px] max-h-[88%] flex flex-col overflow-hidden sheet-up"
+              className="relative bg-[var(--pf-card)] pf-card-border rounded-t-[28px] max-h-[88%] flex flex-col overflow-hidden sheet-up"
               style={{
                 transform: sheetClosing
                   ? "translateY(100%)"
@@ -11188,19 +11213,19 @@ export default function App() {
               >
                 <span
                   className={`h-1 rounded-full transition-all duration-150 ${
-                    sheetDragging ? "w-11 bg-black/45" : "w-9 bg-black/15"
+                    sheetDragging ? "w-11 bg-[var(--pf-bg-45)]" : "w-9 bg-[var(--pf-bg-15)]"
                   }`}
                 />
               </div>
 
               {/* 标题 */}
               <div className="px-5 pt-1.5 pb-3 flex items-center justify-between shrink-0">
-                <h3 className="text-[20px] font-bold text-black tracking-tight">切换设备</h3>
+                <h3 className="pf-fs-20 font-bold text-[var(--pf-ink)] tracking-tight">切换设备</h3>
                 <button
                   type="button"
                   onClick={requestCloseDeviceDrawer}
                   aria-label="关闭"
-                  className="-mr-2 w-10 h-10 rounded-full flex items-center justify-center text-black/40 cursor-pointer active:bg-black/5 active:scale-95 transition-all shrink-0"
+                  className="-mr-2 w-10 h-10 rounded-full flex items-center justify-center text-[var(--pf-i-40)] cursor-pointer active:bg-[var(--pf-bg-5)] active:scale-95 transition-all shrink-0"
                 >
                   <X className="w-5 h-5 stroke-[2]" />
                 </button>
@@ -11217,7 +11242,7 @@ export default function App() {
                   {connectGuideCard}
 
                   {mockDevicesList.length === 0 && (
-                    <p className="text-[13px] font-medium text-black/40 text-center py-3 leading-relaxed">
+                    <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] text-center py-3 leading-relaxed">
                       {userProfile.nickname
                         ? "列表里没有设备了，点下方「重新导入小米设备」找回"
                         : "还没有设备，点下方扫描附近的手表"}
@@ -11254,7 +11279,7 @@ export default function App() {
                   两个按钮同一层级，靠品牌色区分：蓝色=vivo（无需账号），橙色=小米（要素材来自小米账号）。
                   「重新导入」是小米账号专属，没登录就整个不出现 —— 否则 vivo 用户会以为它是个通用功能，
                   点下去却被送去登录小米账号（用户 2026-11-15 反馈）。 */}
-              <div className="px-4 pt-3 pb-[calc(16px+env(safe-area-inset-bottom,0px))] border-t border-black/5 shrink-0 flex flex-col gap-2">
+              <div className="px-4 pt-3 pb-[calc(16px+env(safe-area-inset-bottom,0px))] border-t border-[var(--pf-bd-5)] shrink-0 flex flex-col gap-2">
                 <button
                   type="button"
                   onClick={() => {
@@ -11262,7 +11287,7 @@ export default function App() {
                     requestCloseDeviceDrawer();
                     window.setTimeout(() => pushRoute("vivo-scan"), 260);
                   }}
-                  className="w-full h-[44px] rounded-full bg-[#4361EE]/10 hover:bg-[#4361EE]/15 text-[#4361EE] font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
+                  className="w-full h-[44px] rounded-full bg-[var(--pf-primary-10)] hover:bg-[var(--pf-primary-15)] text-[var(--pf-primary)] font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
                 >
                   <Watch className="w-4 h-4 stroke-[2]" />
                   <span>扫描附近的 vivo 手表</span>
@@ -11291,7 +11316,7 @@ export default function App() {
                       // 浏览器预览：把演示列表恢复原样（删除过的设备一并回来）
                       setMockDevicesList(MOCK_DEVICES);
                     }}
-                    className="w-full h-[44px] rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold text-[16px] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
+                    className="w-full h-[44px] rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
                   >
                     <ArrowsClockwise className="w-4 h-4 stroke-[2]" />
                     <span>重新导入小米设备</span>
@@ -11305,27 +11330,27 @@ export default function App() {
         {/* 卸载表盘二次确认：精致居中 Apple 风格 Alert 对话框 */}
         {uninstallConfirmDial && (
           <div
-            className="absolute inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
+            className="absolute inset-0 z-50 bg-[var(--pf-mask)] backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
             onClick={() => setUninstallConfirmDial(null)}
           >
             <div
-              className="bg-white/95 backdrop-blur-2xl w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5 text-center"
+              className="bg-[var(--pf-sheet)] backdrop-blur-2xl w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-[var(--pf-bd-5)] text-center"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                   卸载「{uninstallConfirmDial.name}」？
                 </h3>
-                <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
+                <p className="pf-fs-13 text-[var(--pf-i-40)] font-medium mt-1.5 leading-relaxed">
                   卸载后将从手环中移除此表盘，后续可随时重新安装
                 </p>
               </div>
 
-              <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+              <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                 <button
                   type="button"
                   onClick={() => setUninstallConfirmDial(null)}
-                  className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   取消
                 </button>
@@ -11349,7 +11374,7 @@ export default function App() {
                     }
                     showToast(`已从手环卸载「${name}」`);
                   }}
-                  className="py-3.5 text-[16px] font-bold text-[#FF3B30] active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-danger)] active:bg-[var(--pf-danger-10)] transition-colors cursor-pointer"
                 >
                   卸载
                 </button>
@@ -11362,26 +11387,26 @@ export default function App() {
         {/* 连续 3 次连不上：主动问一句要不要看帮助（样式与「退出登录确认」同一套） */}
         {showConnectHelpPrompt && (
           <div
-            className="absolute inset-0 z-[60] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
+            className="absolute inset-0 z-[60] bg-[var(--pf-mask)] backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
             onClick={() => setShowConnectHelpPrompt(false)}
           >
             <div
-              className="bg-white/95 backdrop-blur-2xl w-full max-w-[300px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5 text-center"
+              className="bg-[var(--pf-sheet)] backdrop-blur-2xl w-full max-w-[300px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-[var(--pf-bd-5)] text-center"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                   连了 3 次都没成功
                 </h3>
-                <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
+                <p className="pf-fs-13 text-[var(--pf-i-40)] font-medium mt-1.5 leading-relaxed">
                   要不要看看正确的连接方法？
                 </p>
               </div>
-              <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+              <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                 <button
                   type="button"
                   onClick={() => setShowConnectHelpPrompt(false)}
-                  className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   再试一次
                 </button>
@@ -11392,7 +11417,7 @@ export default function App() {
                     helpFromDrawer.current = true;
                     pushRoute("connect-help");
                   }}
-                  className="py-3.5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-primary)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   看看怎么连
                 </button>
@@ -11404,36 +11429,36 @@ export default function App() {
         {/* 爱发电账号二次确认：退出 / 换账号 */}
         {paidAccountConfirm && (
           <div
-            className="absolute inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
+            className="absolute inset-0 z-50 bg-[var(--pf-mask)] backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
             onClick={() => setPaidAccountConfirm(null)}
           >
             <div
-              className="bg-white/95 backdrop-blur-2xl w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5 text-center"
+              className="bg-[var(--pf-sheet)] backdrop-blur-2xl w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-[var(--pf-bd-5)] text-center"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                   {paidAccountConfirm === "switch" ? "换一个爱发电账号？" : "退出爱发电账号？"}
                 </h3>
-                <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
+                <p className="pf-fs-13 text-[var(--pf-i-40)] font-medium mt-1.5 leading-relaxed">
                   {paidAccountConfirm === "switch"
                     ? "将退出当前账号，并打开爱发电授权页，用新账号重新登录"
                     : "退出后需重新绑定，才能查看已购表盘"}
                 </p>
               </div>
 
-              <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+              <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                 <button
                   type="button"
                   onClick={() => setPaidAccountConfirm(null)}
-                  className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   取消
                 </button>
                 <button
                   type="button"
                   onClick={() => doPaidUnbind(paidAccountConfirm)}
-                  className="py-3.5 text-[16px] font-bold text-[#FF3B30] active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-danger)] active:bg-[var(--pf-danger-10)] transition-colors cursor-pointer"
                 >
                   {paidAccountConfirm === "switch" ? "继续" : "退出"}
                 </button>
@@ -11450,7 +11475,7 @@ export default function App() {
             {/* 点空白处关掉：透明遮罩，不压暗背景（这是小浮窗不是弹窗） */}
             <div className="fixed inset-0 z-[58]" onClick={() => setDeviceMenu(null)} />
             <div
-              className="fixed z-[59] w-[176px] rounded-2xl overflow-hidden bg-white border border-black/5 shadow-[0_10px_30px_rgba(0,0,0,0.16)] animate-in fade-in zoom-in-95 duration-150 origin-top-right"
+              className="fixed z-[59] w-[176px] rounded-2xl overflow-hidden bg-[var(--pf-card)] pf-card-border shadow-[0_10px_30px_rgba(0,0,0,0.16)] animate-in fade-in zoom-in-95 duration-150 origin-top-right"
               style={{ left: deviceMenu.x, top: deviceMenu.y }}
             >
               <button
@@ -11462,7 +11487,7 @@ export default function App() {
                   // 断开连接 = 断开且**不再自动重连**（与点已连接那台同一套语义）
                   handleDisconnectDevice(dev);
                 }}
-                className="w-full text-left px-4 py-3 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer disabled:text-black/20 disabled:cursor-default disabled:active:bg-transparent"
+                className="w-full text-left px-4 py-3 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer disabled:text-[var(--pf-i-20)] disabled:cursor-default disabled:active:bg-transparent"
               >
                 断开连接
               </button>
@@ -11474,7 +11499,7 @@ export default function App() {
                   setDeviceMenu(null);
                   setDeviceRemoveConfirm(dev);
                 }}
-                className="w-full text-left px-4 py-3 text-[16px] font-bold text-[#FF3B30] border-t border-black/5 active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
+                className="w-full text-left px-4 py-3 pf-fs-16 font-bold text-[var(--pf-danger)] border-t border-[var(--pf-bd-5)] active:bg-[var(--pf-danger-10)] transition-colors cursor-pointer"
               >
                 删除设备
               </button>
@@ -11484,29 +11509,29 @@ export default function App() {
 
         {deviceRemoveConfirm && (
           <div
-            className="absolute inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
+            className="absolute inset-0 z-50 bg-[var(--pf-mask)] backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
             onClick={() => setDeviceRemoveConfirm(null)}
           >
             <div
-              className="bg-white/95 backdrop-blur-2xl w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5 text-center"
+              className="bg-[var(--pf-sheet)] backdrop-blur-2xl w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-[var(--pf-bd-5)] text-center"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                   从列表移除「{deviceRemoveConfirm.name}」？
                 </h3>
-                <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
+                <p className="pf-fs-13 text-[var(--pf-i-40)] font-medium mt-1.5 leading-relaxed">
                   {deviceRemoveConfirm.brand === "vivo"
                     ? "移除后需要重新扫描才能连回来"
                     : "小米账号里的设备不受影响；点「重新导入小米设备」即可找回来"}
                 </p>
               </div>
 
-              <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+              <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                 <button
                   type="button"
                   onClick={() => setDeviceRemoveConfirm(null)}
-                  className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   取消
                 </button>
@@ -11517,7 +11542,7 @@ export default function App() {
                     setDeviceRemoveConfirm(null);
                     removeDeviceFromList(dev);
                   }}
-                  className="py-3.5 text-[16px] font-bold text-[#FF3B30] active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-danger)] active:bg-[var(--pf-danger-10)] transition-colors cursor-pointer"
                 >
                   移除
                 </button>
@@ -11528,19 +11553,19 @@ export default function App() {
 
         {/* 视频表盘首次进入：使用建议与风险说明（固定弹窗，点遮罩不关，必须点按钮） */}
         {videoNoticeOpen && currentStep === "video_watchface" && (
-          <div className="absolute inset-0 z-[90] bg-black/40 flex items-center justify-center p-6 animate-in fade-in duration-200">
+          <div className="absolute inset-0 z-[90] bg-[var(--pf-mask)] flex items-center justify-center p-6 animate-in fade-in duration-200">
             <div
-              className="bg-white w-full max-w-[330px] rounded-3xl overflow-hidden shadow-[0_10px_30px_rgba(0,0,0,0.14)] border border-black/5 text-left"
+              className="bg-[var(--pf-card)] pf-card-border w-full max-w-[330px] rounded-3xl overflow-hidden shadow-[0_10px_30px_rgba(0,0,0,0.14)] text-left"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight">动态表盘使用说明</h3>
-                <div className="mt-3 space-y-1.5 text-[13px] font-medium text-black/50 leading-relaxed">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight">动态表盘使用说明</h3>
+                <div className="mt-3 space-y-1.5 pf-fs-13 font-medium text-[var(--pf-i-50)] leading-relaxed">
                   <p>1. 视频不超过 3 秒</p>
                   <p>2. 优先选择「省电」或「标准」档</p>
                   <p>3. 播放方式选择「播放 1 次」</p>
                 </div>
-                <div className="mt-4 space-y-1.5 text-[13px] font-medium text-black/50 leading-relaxed">
+                <div className="mt-4 space-y-1.5 pf-fs-13 font-medium text-[var(--pf-i-50)] leading-relaxed">
                   <p>不按推荐设置，可能耗电加快、滑动卡顿。</p>
                   <p>在表盘界面，或同时开了占内存较多的快应用时，手环可能重启；重启只释放内存，不会损坏表盘或固件。</p>
                 </div>
@@ -11548,7 +11573,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={ackVideoNotice}
-                className="w-full py-3.5 border-t border-black/5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
+                className="w-full py-3.5 border-t border-[var(--pf-bd-5)] pf-fs-16 font-bold text-[var(--pf-primary)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
               >
                 我已知晓
               </button>
@@ -11558,44 +11583,44 @@ export default function App() {
 
         {/* App 更新：发现新版本（开屏自动弹出；样式与「退出登录确认」同一套 Apple 风格） */}
         {appUpdatePrompt && appUpdate && (
-          <div className="absolute inset-0 z-[60] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
+          <div className="absolute inset-0 z-[60] bg-[var(--pf-mask)] backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
             <div
-              className="bg-white/95 backdrop-blur-2xl w-full max-w-[320px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5 text-center"
+              className="bg-[var(--pf-sheet)] backdrop-blur-2xl w-full max-w-[320px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-[var(--pf-bd-5)] text-center"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                   发现新版本 v{appUpdate.version_name}
                 </h3>
-                <p className="text-[13px] text-black/45 font-medium mt-1.5 leading-relaxed whitespace-pre-line">
+                <p className="pf-fs-13 text-[var(--pf-i-45)] font-medium mt-1.5 leading-relaxed whitespace-pre-line">
                   {appUpdate.notes?.trim() || "建议更新到最新版本，体验会更好"}
                 </p>
                 {appUpdate.mandatory && (
-                  <p className="text-[12px] font-bold text-[#FF3B30] mt-2">
+                  <p className="pf-fs-12 font-bold text-[var(--pf-danger)] mt-2">
                     当前版本过旧，更新后才能继续使用
                   </p>
                 )}
                 {appUpdate.size ? (
-                  <p className="text-[12px] font-medium text-black/30 mt-2">
+                  <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-2">
                     {Math.round((appUpdate.size / 1048576) * 10) / 10} MB，当前 v{appUpdate.current}
                   </p>
                 ) : null}
               </div>
-              <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+              <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                 <button
                   type="button"
                   onClick={() => {
                     snoozeUpdate(appUpdate.version_name);
                     setAppUpdatePrompt(false);
                   }}
-                  className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   跳过
                 </button>
                 <button
                   type="button"
                   onClick={() => void startAppUpdate()}
-                  className="py-3.5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-primary)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   确定更新
                 </button>
@@ -11606,20 +11631,20 @@ export default function App() {
 
         {/* App 更新：下载 / 调起安装器的进度浮层（下载期间保持屏幕常亮） */}
         {appUpdatePhase && (
-          <div className="absolute inset-0 z-[70] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
-            <div className="bg-white/95 backdrop-blur-2xl w-full max-w-[300px] rounded-3xl p-6 shadow-[0_8px_24px_rgba(0,0,0,0.10)] border border-black/5 text-center">
-              <h3 className="text-[16px] font-bold text-black tracking-tight">
+          <div className="absolute inset-0 z-[70] bg-[var(--pf-mask)] backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
+            <div className="bg-[var(--pf-sheet)] backdrop-blur-2xl w-full max-w-[300px] rounded-3xl p-6 shadow-[0_8px_24px_rgba(0,0,0,0.10)] border border-[var(--pf-bd-5)] text-center">
+              <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] tracking-tight">
                 {appUpdatePhase.step === "downloading"
                   ? `正在下载 v${appUpdate?.version_name ?? ""}`
                   : "正在打开安装器"}
               </h3>
-              <div className="mt-4 h-2 rounded-full bg-black/[0.08] overflow-hidden">
+              <div className="mt-4 h-2 rounded-full bg-[var(--pf-bg-8)] overflow-hidden">
                 <div
-                  className="h-full rounded-full bg-[#4361EE] transition-all duration-200"
+                  className="h-full rounded-full bg-[var(--pf-primary-solid)] transition-all duration-200"
                   style={{ width: `${appUpdatePhase.step === "downloading" ? appUpdatePhase.percent : 100}%` }}
                 />
               </div>
-              <p className="text-[12px] font-medium text-black/40 mt-2.5">
+              <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-2.5">
                 {appUpdatePhase.step === "downloading"
                   ? `${appUpdatePhase.percent}%，请保持应用在前台`
                   : "随后按系统提示点「安装」"}
@@ -11631,31 +11656,31 @@ export default function App() {
         {/* 制作壁纸页「返回」时的保存确认（只在这一页新做了壁纸时才问） */}
         {genExitAsk && (
           <div
-            className="absolute inset-0 z-50 bg-black/40 flex items-center justify-center p-6"
+            className="absolute inset-0 z-50 bg-[var(--pf-mask)] flex items-center justify-center p-6"
             onClick={() => setGenExitAsk(false)}
           >
             <div
-              className="bg-white w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] border border-black/5 text-center"
+              className="bg-[var(--pf-card)] pf-card-border w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] text-center"
               onClick={e => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                   要保存这次做的壁纸吗？
                 </h3>
-                <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
+                <p className="pf-fs-13 text-[var(--pf-i-40)] font-medium mt-1.5 leading-relaxed">
                   {genPendingEdit
                     ? `这次做了 ${genSessionMade} 张，还有 1 张没生成，点保存会一起生成`
                     : `这次做了 ${genSessionMade} 张`}
                 </p>
               </div>
-              <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+              <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                 <button
                   type="button"
                   onClick={() => {
                     setGenExitAsk(false);
                     discardGenWallpapers();
                   }}
-                  className="py-3.5 text-[16px] font-bold text-[#C7332B] active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[#C7332B] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   不保存
                 </button>
@@ -11665,7 +11690,7 @@ export default function App() {
                     setGenExitAsk(false);
                     saveGenWallpapers();
                   }}
-                  className="py-3.5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-primary)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   保存
                 </button>
@@ -11676,27 +11701,27 @@ export default function App() {
 
         {showLogoutConfirm && (
           <div
-            className="absolute inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
+            className="absolute inset-0 z-50 bg-[var(--pf-mask)] backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200"
             onClick={() => setShowLogoutConfirm(false)}
           >
             <div
-              className="bg-white/95 backdrop-blur-2xl w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5 text-center"
+              className="bg-[var(--pf-sheet)] backdrop-blur-2xl w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-[var(--pf-bd-5)] text-center"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                   退出当前小米账号？
                 </h3>
-                <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
+                <p className="pf-fs-13 text-[var(--pf-i-40)] font-medium mt-1.5 leading-relaxed">
                   退出后需重新验证并登录
                 </p>
               </div>
 
-              <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+              <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                 <button
                   type="button"
                   onClick={() => setShowLogoutConfirm(false)}
-                  className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   取消
                 </button>
@@ -11727,7 +11752,7 @@ export default function App() {
                     resetStackTo("welcome");
                     showToast("已安全退出");
                   }}
-                  className="py-3.5 text-[16px] font-bold text-[#FF3B30] active:bg-[#FF3B30]/10 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-danger)] active:bg-[var(--pf-danger-10)] transition-colors cursor-pointer"
                 >
                   退出登录
                 </button>
@@ -11757,18 +11782,18 @@ export default function App() {
           const someOn = checkedSelectable > 0 && !allOn;
           return (
             <div
-              className="absolute inset-0 z-[80] bg-black/40 flex items-center justify-center p-6 animate-in fade-in duration-200"
+              className="absolute inset-0 z-[80] bg-[var(--pf-mask)] flex items-center justify-center p-6 animate-in fade-in duration-200"
               onClick={cancelInstallPicker}
             >
               <div
-                className="bg-white w-full max-w-[320px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200 border border-black/5"
+                className="bg-[var(--pf-card)] pf-card-border w-full max-w-[320px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] animate-in zoom-in-95 duration-200"
                 onClick={(e) => e.stopPropagation()}
               >
                 <div className="pt-6 px-6 pb-3 text-center">
-                  <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                  <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                     {installPicker.updateMode ? "选择要更新的表盘" : "选择要安装的表盘"}
                   </h3>
-                  <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
+                  <p className="pf-fs-13 text-[var(--pf-i-40)] font-medium mt-1.5 leading-relaxed">
                     {installPicker.updateMode
                       ? "默认只选有更新的包；没变的包可以不装"
                       : "默认全部安装，可以只勾选需要的"}
@@ -11779,24 +11804,24 @@ export default function App() {
                   <button
                     type="button"
                     onClick={toggleInstallPickAll}
-                    className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl active:bg-black/5 transition-colors cursor-pointer"
+                    className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                   >
                     <span
                       className={`w-[22px] h-[22px] rounded-lg flex items-center justify-center shrink-0 border-2 ${
-                        allOn || someOn ? "bg-[#4361EE] border-[#4361EE]" : "bg-white border-black/20"
+                        allOn || someOn ? "bg-[var(--pf-primary-solid)] border-[var(--pf-primary)]" : "bg-[var(--pf-card)] border-[var(--pf-bd-20)]"
                       }`}
                     >
                       {allOn ? (
                         <Check className="w-3.5 h-3.5 text-white stroke-[3]" />
                       ) : someOn ? (
-                        <span className="w-2.5 h-[2px] bg-white rounded-full" />
+                        <span className="w-2.5 h-[2px] bg-[var(--pf-card)] pf-card-border rounded-full" />
                       ) : null}
                     </span>
-                    <span className="text-[16px] font-bold text-black">
+                    <span className="pf-fs-16 font-bold text-[var(--pf-ink)]">
                       {installPicker.updateMode ? "全选可更新" : "全选"}
                     </span>
                   </button>
-                  <div className="h-px bg-black/5 mx-4" />
+                  <div className="h-px bg-[var(--pf-bg-5)] mx-4" />
                   {installPicker.files.map((f, i) => {
                     const st = installPicker.status[i] ?? "normal";
                     return (
@@ -11804,11 +11829,11 @@ export default function App() {
                         key={f.file_id}
                         type="button"
                         onClick={() => toggleInstallPick(i)}
-                        className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl active:bg-black/5 transition-colors cursor-pointer"
+                        className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                       >
                         <span
                           className={`w-[22px] h-[22px] rounded-lg flex items-center justify-center shrink-0 border-2 ${
-                            installPicker.picked[i] ? "bg-[#4361EE] border-[#4361EE]" : "bg-white border-black/20"
+                            installPicker.picked[i] ? "bg-[var(--pf-primary-solid)] border-[var(--pf-primary)]" : "bg-[var(--pf-card)] border-[var(--pf-bd-20)]"
                           }`}
                         >
                           {installPicker.picked[i] && (
@@ -11817,25 +11842,25 @@ export default function App() {
                         </span>
                         <span className="flex-1 min-w-0 text-left">
                           <span
-                            className={`block text-[16px] font-medium ${
-                              st === "latest" ? "text-black/45" : "text-black"
+                            className={`block pf-fs-16 font-medium ${
+                              st === "latest" ? "text-[var(--pf-i-45)]" : "text-[var(--pf-ink)]"
                             }`}
                           >
                             表盘{i + 1}
                             {f.version && (
-                              <span className="ml-1.5 text-[12px] font-medium text-black/35">
+                              <span className="ml-1.5 pf-fs-12 font-medium text-[var(--pf-i-35)]">
                                 v{f.version}
                               </span>
                             )}
                           </span>
                           {installPicker.updateMode && st !== "normal" && (
                             <span
-                              className={`block text-[12px] font-medium mt-0.5 ${
+                              className={`block pf-fs-12 font-medium mt-0.5 ${
                                 st === "latest"
-                                  ? "text-black/35"
+                                  ? "text-[var(--pf-i-35)]"
                                   : st === "new"
-                                    ? "text-[#4361EE]"
-                                    : "text-[#D4973B]"
+                                    ? "text-[var(--pf-primary)]"
+                                    : "text-[var(--pf-amber)]"
                               }`}
                             >
                               {st === "latest" ? "已是最新" : st === "new" ? "新增包体" : "有更新"}
@@ -11843,7 +11868,7 @@ export default function App() {
                           )}
                         </span>
                         {/* 单个包体大小：多包体（比如 4 个配色近 40MB）装之前先有个数 */}
-                        <span className="shrink-0 text-[12px] font-medium text-black/35 tabular-nums">
+                        <span className="shrink-0 pf-fs-12 font-medium text-[var(--pf-i-35)] tabular-nums">
                           {fmtSize(f.size)}
                         </span>
                       </button>
@@ -11852,17 +11877,17 @@ export default function App() {
                 </div>
 
                 {/* 已选合计：个数 + 大小（多包体一次装几十 MB，先让用户看清） */}
-                <p className="px-6 pb-3 text-center text-[12px] font-medium text-black/35">
+                <p className="px-6 pb-3 text-center pf-fs-12 font-medium text-[var(--pf-i-35)]">
                   {pickedCount > 0
                     ? `已选 ${pickedCount} 个${pickedSize ? `，共 ${pickedSize}` : ""}`
                     : "至少选一个包"}
                 </p>
 
-                <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+                <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                   <button
                     type="button"
                     onClick={cancelInstallPicker}
-                    className="py-3.5 text-[16px] font-bold text-black active:bg-black/5 transition-colors cursor-pointer"
+                    className="py-3.5 pf-fs-16 font-bold text-[var(--pf-ink)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                   >
                     取消
                   </button>
@@ -11870,10 +11895,10 @@ export default function App() {
                     type="button"
                     onClick={confirmInstallPicker}
                     disabled={pickedCount === 0}
-                    className={`py-3.5 text-[16px] font-bold transition-colors ${
+                    className={`py-3.5 pf-fs-16 font-bold transition-colors ${
                       pickedCount === 0
-                        ? "text-black/25 cursor-default"
-                        : "text-[#4361EE] active:bg-[#4361EE]/10 cursor-pointer"
+                        ? "text-[var(--pf-i-25)] cursor-default"
+                        : "text-[var(--pf-primary)] active:bg-[var(--pf-primary-10)] cursor-pointer"
                     }`}
                   >
                     {installPicker.updateMode
@@ -11897,11 +11922,11 @@ export default function App() {
             // 与底栏顶边恒定间隔 TOAST_GAP；无底栏页面用 80px 基础位置
             style={{ bottom: bottomBarH > 0 ? bottomBarH + TOAST_GAP : 80 }}
           >
-            <div className="bg-[#0C0D0E] text-white text-[13px] font-bold min-h-[44px] max-w-full px-5 py-2.5 rounded-2xl flex items-center gap-2 text-center animate-in fade-in slide-in-from-bottom-2 duration-200 shadow-[0_8px_24px_rgba(0,0,0,0.10)]">
+            <div className="bg-[var(--pf-toast)] text-white pf-fs-13 font-bold min-h-[44px] max-w-full px-5 py-2.5 rounded-2xl flex items-center gap-2 text-center animate-in fade-in slide-in-from-bottom-2 duration-200 shadow-[0_8px_24px_rgba(0,0,0,0.10)]">
               {toast.kind === "error" ? (
-                <X className="w-4 h-4 text-[#FF3B30] stroke-[2.5] shrink-0" />
+                <X className="w-4 h-4 text-[var(--pf-danger)] stroke-[2.5] shrink-0" />
               ) : (
-                <Check className="w-4 h-4 text-[#34C759] stroke-[2] shrink-0" />
+                <Check className="w-4 h-4 text-[var(--pf-ok)] stroke-[2] shrink-0" />
               )}
               <span className="min-w-0 whitespace-normal break-words leading-snug">{toast.msg}</span>
             </div>

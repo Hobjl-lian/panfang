@@ -1,0 +1,219 @@
+/*
+ * 深色模式：颜色变量表
+ * ====================
+ * 全 App 的颜色类统一写成 `bg-[var(--pf-xxx)]` / `text-[var(--pf-xxx)]` 这种形式，
+ * 浅色一套值、[data-theme="dark"] 一套值。为什么不用 Tailwind 的 `dark:` 或变量替身：
+ * Tailwind v4 把 `text-black/40` 编译成「静态 #00000066 + @supports color-mix」，
+ * color-mix 要 Chrome 111，而 App 的 WebView 门禁是 83 —— 老设备会走静态黑值，
+ * 深底黑字直接不可读。用 var() 包一层，Chrome 49 起就支持，两边都不会漏。
+ *
+ * 命名：ink = 文字灰阶；bg-/bd- = 背景/边框；primary = 品牌蓝；page/card/sheet = 页面/卡片/浮层。
+ * 浅色值必须与替换前的 Tailwind 原值逐字等价，保证浅色模式零变化。
+ */
+
+:root {
+  /* 页面 / 卡片 / 浮层 / 抬升面 */
+  --pf-page: #f5f6f9;
+  --pf-card: #ffffff;
+  --pf-sheet: rgba(255, 255, 255, 0.95);
+  --pf-elev: #eaeaef;
+  --pf-card-weak: rgba(255, 255, 255, 0.75);
+  /* 首屏选择卡顶部的内高光（浅色靠它做「描边感」，深色要压暗否则刺眼） */
+  --pf-card-hi: rgba(255, 255, 255, 0.9);
+  /* 首屏两张分流卡：左上品牌光斑 + 右下极淡反光 + 对角底色，单色相、峰值约 20% */
+  --pf-tint-xiaomi:
+    radial-gradient(78% 70% at 0% 0%, rgba(255, 106, 0, 0.14) 0%, rgba(255, 106, 0, 0) 78%),
+    radial-gradient(48% 44% at 100% 100%, rgba(255, 106, 0, 0.05) 0%, rgba(255, 106, 0, 0) 72%),
+    linear-gradient(135deg, rgba(255, 106, 0, 0.05) 0%, rgba(255, 106, 0, 0.012) 55%, rgba(255, 106, 0, 0) 100%);
+  --pf-tint-vivo:
+    radial-gradient(78% 70% at 0% 0%, rgba(65, 95, 255, 0.14) 0%, rgba(65, 95, 255, 0) 78%),
+    radial-gradient(48% 44% at 100% 100%, rgba(65, 95, 255, 0.05) 0%, rgba(65, 95, 255, 0) 72%),
+    linear-gradient(135deg, rgba(65, 95, 255, 0.05) 0%, rgba(65, 95, 255, 0.012) 55%, rgba(65, 95, 255, 0) 100%);
+
+  /* 文字：黑度梯度（design.md §2.2） */
+  --pf-ink: #000000;
+  --pf-i-80: rgba(0, 0, 0, 0.8);
+  --pf-i-75: rgba(0, 0, 0, 0.75);
+  --pf-i-70: rgba(0, 0, 0, 0.7);
+  --pf-i-65: rgba(0, 0, 0, 0.65);
+  --pf-i-60: rgba(0, 0, 0, 0.6);
+  --pf-i-55: rgba(0, 0, 0, 0.55);
+  --pf-i-50: rgba(0, 0, 0, 0.5);
+  --pf-i-45: rgba(0, 0, 0, 0.45);
+  --pf-i-40: rgba(0, 0, 0, 0.4);
+  --pf-i-35: rgba(0, 0, 0, 0.35);
+  --pf-i-30: rgba(0, 0, 0, 0.3);
+  --pf-i-25: rgba(0, 0, 0, 0.25);
+  --pf-i-20: rgba(0, 0, 0, 0.2);
+  --pf-i-15: rgba(0, 0, 0, 0.15);
+  --pf-i-10: rgba(0, 0, 0, 0.1);
+  --pf-i-8: rgba(0, 0, 0, 0.08);
+
+  /* 背景灰阶（图标底、输入框底、禁用底） */
+  --pf-bg-2: rgba(0, 0, 0, 0.02);
+  --pf-bg-3: rgba(0, 0, 0, 0.03);
+  --pf-bg-4: rgba(0, 0, 0, 0.04);
+  --pf-bg-5: rgba(0, 0, 0, 0.05);
+  --pf-bg-6: rgba(0, 0, 0, 0.06);
+  --pf-bg-7: rgba(0, 0, 0, 0.07);
+  --pf-bg-8: rgba(0, 0, 0, 0.08);
+  --pf-bg-10: rgba(0, 0, 0, 0.1);
+  --pf-bg-15: rgba(0, 0, 0, 0.15);
+  --pf-bg-20: rgba(0, 0, 0, 0.2);
+
+  /* 边框 / 分隔线 */
+  --pf-bd-2: rgba(0, 0, 0, 0.02);
+  --pf-bd-4: rgba(0, 0, 0, 0.04);
+  --pf-bd-5: rgba(0, 0, 0, 0.05);
+  --pf-bd-10: rgba(0, 0, 0, 0.1);
+  --pf-bd-15: rgba(0, 0, 0, 0.15);
+  --pf-bd-20: rgba(0, 0, 0, 0.2);
+  --pf-bd-white-60: rgba(255, 255, 255, 0.6);
+
+  /* 顶栏着色渐变（Miuix barTintBrush：强端 0.9，弱端同色 0）+ 0.5px 发丝线 */
+  --pf-page-veil: rgba(245, 246, 249, 0.9);
+  --pf-page-veil-0: rgba(245, 246, 249, 0);
+  --pf-hairline: rgba(0, 0, 0, 0.1);
+  /* 底部 Tab 栏：卡片色压到 0.82，叠一层均匀模糊，能透出一点滚动内容 */
+  --pf-bar-fill: rgba(255, 255, 255, 0.82);
+
+  /* 品牌蓝：文字/图标用一个，实心按钮底用另一个（深色下按钮底要够暗才压得住白字） */
+  --pf-primary: #4361ee;
+  --pf-primary-solid: #4361ee;
+  --pf-primary-strong: #3853db;
+  --pf-primary-5: rgba(67, 97, 238, 0.05);
+  --pf-primary-7: rgba(67, 97, 238, 0.07);
+  --pf-primary-10: rgba(67, 97, 238, 0.1);
+  --pf-primary-15: rgba(67, 97, 238, 0.15);
+  --pf-primary-20: rgba(67, 97, 238, 0.2);
+  --pf-primary-25: rgba(67, 97, 238, 0.25);
+  --pf-primary-50: rgba(67, 97, 238, 0.5);
+  --pf-primary-60: rgba(67, 97, 238, 0.6);
+  --pf-primary-80: rgba(67, 97, 238, 0.8);
+
+  /* 状态色 */
+  --pf-danger: #ff3b30;
+  --pf-danger-solid: #ff3b30;
+  --pf-danger-8: rgba(255, 59, 48, 0.08);
+  --pf-danger-10: rgba(255, 59, 48, 0.1);
+  --pf-ok: #34c759;
+  --pf-ok-solid: #34c759;
+  --pf-amber: #d4973b;
+  --pf-amber-solid: #d4973b;
+  --pf-amber-10: rgba(212, 151, 59, 0.1);
+  --pf-amber-15: rgba(212, 151, 59, 0.15);
+  --pf-warn-weak: #fff7e8;
+  --pf-warn-ink: #8a5a12;
+
+  /* 胶囊 / Toast / 媒体黑底 / 遮罩 / 反相面 */
+  --pf-toast: #0c0d0e;
+  --pf-media: #1c1c1e;
+  --pf-mask: rgba(0, 0, 0, 0.4);
+  --pf-mask-soft: rgba(0, 0, 0, 0.3);
+  --pf-inverse: #0c0d0e;
+  --pf-inverse-ink: #ffffff;
+}
+
+[data-theme="dark"] {
+  --pf-page: #0e1014;
+  --pf-card: #191c21;
+  --pf-sheet: rgba(31, 35, 41, 0.97);
+  --pf-elev: #2a2f36;
+  --pf-card-weak: rgba(255, 255, 255, 0.12);
+  --pf-card-hi: rgba(255, 255, 255, 0.06);
+  --pf-tint-xiaomi:
+    radial-gradient(74% 66% at 0% 0%, rgba(255, 106, 0, 0.26) 0%, rgba(255, 106, 0, 0) 74%),
+    radial-gradient(50% 46% at 100% 100%, rgba(255, 106, 0, 0.09) 0%, rgba(255, 106, 0, 0) 70%),
+    linear-gradient(135deg, rgba(255, 106, 0, 0.10) 0%, rgba(255, 106, 0, 0.02) 55%, rgba(255, 106, 0, 0) 100%);
+  --pf-tint-vivo:
+    radial-gradient(74% 66% at 0% 0%, rgba(65, 95, 255, 0.26) 0%, rgba(65, 95, 255, 0) 74%),
+    radial-gradient(50% 46% at 100% 100%, rgba(65, 95, 255, 0.09) 0%, rgba(65, 95, 255, 0) 70%),
+    linear-gradient(135deg, rgba(65, 95, 255, 0.10) 0%, rgba(65, 95, 255, 0.02) 55%, rgba(65, 95, 255, 0) 100%);
+
+  /* 深色下灰阶整体抬高约一档：低透明度在深底上更难读 */
+  --pf-ink: #f2f4f7;
+  --pf-i-80: rgba(242, 244, 247, 0.86);
+  --pf-i-75: rgba(242, 244, 247, 0.82);
+  --pf-i-70: rgba(242, 244, 247, 0.78);
+  --pf-i-65: rgba(242, 244, 247, 0.74);
+  --pf-i-60: rgba(242, 244, 247, 0.7);
+  --pf-i-55: rgba(242, 244, 247, 0.66);
+  --pf-i-50: rgba(242, 244, 247, 0.62);
+  --pf-i-45: rgba(242, 244, 247, 0.58);
+  --pf-i-40: rgba(242, 244, 247, 0.54);
+  --pf-i-35: rgba(242, 244, 247, 0.49);
+  --pf-i-30: rgba(242, 244, 247, 0.44);
+  --pf-i-25: rgba(242, 244, 247, 0.38);
+  --pf-i-20: rgba(242, 244, 247, 0.32);
+  --pf-i-15: rgba(242, 244, 247, 0.25);
+  --pf-i-10: rgba(242, 244, 247, 0.17);
+  --pf-i-8: rgba(242, 244, 247, 0.15);
+
+  --pf-bg-2: rgba(255, 255, 255, 0.04);
+  --pf-bg-3: rgba(255, 255, 255, 0.05);
+  --pf-bg-4: rgba(255, 255, 255, 0.06);
+  --pf-bg-5: rgba(255, 255, 255, 0.07);
+  --pf-bg-6: rgba(255, 255, 255, 0.08);
+  --pf-bg-7: rgba(255, 255, 255, 0.09);
+  --pf-bg-8: rgba(255, 255, 255, 0.1);
+  --pf-bg-10: rgba(255, 255, 255, 0.12);
+  --pf-bg-15: rgba(255, 255, 255, 0.16);
+  --pf-bg-20: rgba(255, 255, 255, 0.22);
+
+  /* 输入框、胶囊按钮、卡片统一用这条极淡描边（卡片见 .pf-card-border） */
+  --pf-bd-2: rgba(255, 255, 255, 0.035);
+  --pf-bd-4: rgba(255, 255, 255, 0.04);
+  --pf-bd-5: rgba(255, 255, 255, 0.045);
+  --pf-bd-10: rgba(255, 255, 255, 0.12);
+  --pf-bd-15: rgba(255, 255, 255, 0.16);
+  --pf-bd-20: rgba(255, 255, 255, 0.2);
+  --pf-bd-white-60: rgba(255, 255, 255, 0.12);
+
+  /* 顶栏着色渐变（深色同样 0.9 → 同色 0） */
+  --pf-page-veil: rgba(14, 16, 20, 0.9);
+  --pf-page-veil-0: rgba(14, 16, 20, 0);
+  --pf-hairline: rgba(255, 255, 255, 0.1);
+  --pf-bar-fill: rgba(25, 28, 33, 0.82);
+
+  --pf-primary: #7b90ff;
+  --pf-primary-solid: #4f6bf0;
+  --pf-primary-strong: #6a83ff;
+  --pf-primary-5: rgba(123, 144, 255, 0.12);
+  --pf-primary-7: rgba(123, 144, 255, 0.15);
+  --pf-primary-10: rgba(123, 144, 255, 0.18);
+  --pf-primary-15: rgba(123, 144, 255, 0.22);
+  --pf-primary-20: rgba(123, 144, 255, 0.28);
+  --pf-primary-25: rgba(123, 144, 255, 0.32);
+  --pf-primary-50: rgba(123, 144, 255, 0.55);
+  --pf-primary-60: rgba(123, 144, 255, 0.7);
+  --pf-primary-80: rgba(123, 144, 255, 0.85);
+
+  --pf-danger: #ff6b61;
+  --pf-danger-solid: #e5484d;
+  --pf-danger-8: rgba(255, 107, 97, 0.14);
+  --pf-danger-10: rgba(255, 107, 97, 0.16);
+  --pf-ok: #3ddc6a;
+  --pf-ok-solid: #2fb85a;
+  --pf-amber: #e8b45c;
+  --pf-amber-solid: #c9963f;
+  --pf-amber-10: rgba(232, 180, 92, 0.16);
+  --pf-amber-15: rgba(232, 180, 92, 0.2);
+  --pf-warn-weak: #2a2316;
+  --pf-warn-ink: #e8c07a;
+
+  --pf-toast: #2a2f36;
+  --pf-media: #1c1c1e;
+  --pf-mask: rgba(0, 0, 0, 0.6);
+  --pf-mask-soft: rgba(0, 0, 0, 0.45);
+  --pf-inverse: #f2f4f7;
+  --pf-inverse-ink: #101318;
+}
+
+html {
+  background-color: var(--pf-page);
+  /* 输入框、下拉、滚动条跟着主题走 */
+  color-scheme: light;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+}

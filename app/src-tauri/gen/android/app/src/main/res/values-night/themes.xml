@@ -1,7 +1,7 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <!-- Base application theme. -->
     <style name="Theme.wf_installer" parent="Theme.Material3.DayNight.NoActionBar">
-        <!-- 深色模式下也用浅底：App 界面本身固定浅色 -->
-        <item name="android:windowBackground">#F5F6F9</item>
+        <!-- 系统深色时用深色页面底（默认跟随系统；键盘弹起不闪白） -->
+        <item name="android:windowBackground">#0E1014</item>
     </style>
 </resources>

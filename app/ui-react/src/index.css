@@ -26,9 +26,9 @@
 
 body {
   font-family: var(--font-sans);
-  /* 键盘弹起 / WebView 缩高时露出来的是页面底色，不能是黑的 */
-  background-color: #f5f6f9;
-  color: #16181d;
+  /* 键盘弹起 / WebView 缩高时露出来的是页面底色；跟随主题（见 theme.css） */
+  background-color: var(--pf-page);
+  color: var(--pf-ink);
   margin: 0;
   padding: 0;
   -webkit-font-smoothing: antialiased;
@@ -139,10 +139,10 @@ body {
 
 /* 各页顶部内边距（替代原 pt-12/13/14/16：那些是为了给「假 iOS 状态栏」让位，已删） */
 .safe-top {
-  padding-top: max(28px, calc(env(safe-area-inset-top, 0px) + 8px));
+  padding-top: max(40px, calc(env(safe-area-inset-top, 0px) + 8px));
 }
 
-/* 顶栏空条（照设计稿「顶栏」节点：实心 #F5F6F9，无内容无边框）。
+/* 顶栏空条（旧版兜底样式，页面里已不再使用；一级页顶栏现在由 App.tsx 渲染 .pf-topbar-blur）。
    2026-10-30 起一级页的大标题由 App.tsx 的全局折叠标题统一渲染（滚动时缩小并滑到顶部居中），
    这一条只作为兜底样式保留，页面里不再单独放。 */
 .top-bar {
@@ -152,12 +152,102 @@ body {
   right: 0;
   z-index: 25;
   height: 70px;
-  background: #F5F6F9;
+  background: var(--pf-page);
 }
 
-/* 一级页（首页/集市/管理/设置）内容起点：70px 顶栏 + 12px = 82px。 */
+/* 一级页（首页/集市/管理/设置）内容起点：82px 顶栏 + 12px = 94px。 */
 .safe-top-tab {
-  padding-top: 82px;
+  padding-top: 94px;
+}
+
+/* 一级页顶栏：Miuix 式渐进模糊（progressive blur）。
+   内容从下面经过时，越靠顶部糊得越强，到栏底刚好归零，所以看不到一条「顶栏边界」。
+   做法：5 层 backdrop-filter 叠同一条竖向遮罩，半径 12→2.5px；每层都从栏顶就开始衰减，
+   不设「满强度平台期」——平台期会让模糊在 40% 高度处突然开始退出，肉眼看就是一道横向切痕。
+   高斯模糊按平方和复合，顶部等效约 17px（比初版的 15px 平台更强，但全程渐变）。
+   最上面再盖一条页面底色的竖向渐变（alpha 0.9 → 0），颜色与模糊解耦，不会出现「纯色板」。
+   注意：Chrome 83 只认 -webkit-mask-image，两个都写。
+   栏体不做整体淡入淡出：在栏区域之外它是页面底色叠页面底色，本来就看不见。 */
+.pf-topbar-blur {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  pointer-events: none;
+}
+
+.pf-frost {
+  position: absolute;
+  inset: 0;
+  -webkit-backdrop-filter: blur(var(--pf-frost-r));
+  backdrop-filter: blur(var(--pf-frost-r));
+  -webkit-mask-image: linear-gradient(to bottom, #000, transparent var(--pf-frost-clear));
+  mask-image: linear-gradient(to bottom, #000, transparent var(--pf-frost-clear));
+}
+
+.pf-frost-1 { --pf-frost-r: 12px; --pf-frost-clear: 65%; }
+.pf-frost-2 { --pf-frost-r: 9px; --pf-frost-clear: 77%; }
+.pf-frost-3 { --pf-frost-r: 6px; --pf-frost-clear: 87%; }
+.pf-frost-4 { --pf-frost-r: 4px; --pf-frost-clear: 95%; }
+.pf-frost-5 { --pf-frost-r: 2.5px; --pf-frost-clear: 100%; }
+
+/* 独立着色层：上浓下淡，与模糊斜坡无关（Miuix 的 barTintBrush 同一思路） */
+.pf-topbar-tint {
+  background: linear-gradient(to bottom, var(--pf-page-veil), var(--pf-page-veil-0));
+}
+
+/* 一级页折叠标题：只有「大标题在起点」「小标题在顶部居中」两态，交叉淡变；
+   中间不做位移与缩放 —— 手指停在半途时不会出现不大不小、位置也不对的标题。
+   过渡带一点虚化：大标题淡出时轻微散焦，小标题从虚到实、延后 60ms 入场，
+   先让大标题淡开再出现，避免两行字同时压在屏幕上造成闪烁感。 */
+.pf-title-big {
+  opacity: 1;
+  filter: blur(0);
+  transition:
+    opacity 180ms cubic-bezier(0.4, 0, 1, 1),
+    filter 180ms cubic-bezier(0.4, 0, 1, 1);
+}
+.pf-title-big[data-hide="1"] {
+  opacity: 0;
+  filter: blur(5px);
+}
+.pf-title-small {
+  opacity: 0;
+  filter: blur(5px);
+  transition:
+    opacity 240ms cubic-bezier(0, 0, 0.2, 1) 60ms,
+    filter 240ms cubic-bezier(0, 0, 0.2, 1) 60ms;
+}
+.pf-title-small[data-show="1"] {
+  opacity: 1;
+  filter: blur(0);
+}
+
+/* 二级页内容起点：固定顶栏 82 + 12 = 94（留白在滚动容器内部，内容照常从顶栏下面滚过）。 */
+.subpage-top {
+  padding-top: 94px;
+}
+
+/* 底部 Tab 栏顶边的 0.5px 发丝线（Miuix 那种贴着页面的一条细线）。 */
+.pf-hairline-top {
+  border-top: 0.5px solid var(--pf-hairline);
+}
+
+/* 卡片统一描边：和搜索框、胶囊同一档（--pf-bd-5），避免「有的有边有的没边」。
+   只加 border，不碰 background —— 带 hover:bg / 条件底色的卡片仍然按原样工作。 */
+.pf-card-border {
+  border: 1px solid var(--pf-bd-5);
+}
+
+/* 底部 Tab 栏：半透明卡片底 + 均匀模糊。
+   这里**不做**渐变模糊（顶栏那套是自上而下衰减的），底栏只要一层平铺的模糊：
+   渐变放在底栏会像顶栏的倒影，反而更花；平铺模糊足够让滚动内容透一点过来。
+   底色 alpha 压到 0.82：能看见一点背景，又不会让图标和文字失去对比。 */
+.pf-bottombar {
+  background: var(--pf-bar-fill);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
 }
 
 /* 底部 Tab 栏（第四轮：再往下沉一点——手势区只避让 70%，视觉上离手势条更近，
@@ -176,7 +266,7 @@ body {
   padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
 }
 
-/* 顶栏 / 底栏一律不透明纯色（见 App.tsx：状态栏条 #F5F6F9、底部 Tab 栏与固定操作栏 #FFF） */
+/* 顶栏 = 半透明 + 渐进模糊（.pf-topbar-blur）；底部 Tab 栏 = 半透明底 + 均匀模糊 + 0.5px 发丝线 */
 
 /* —— 壁纸生成器「纯色」自定义滑杆 ——
    轨道用 CSS 变量传入（色相彩虹条 / 黑-当前色-白），拇指统一白色圆点。

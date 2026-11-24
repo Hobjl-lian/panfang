@@ -6,6 +6,25 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title><!-- figma:title --></title>
     <!-- figma:head-end -->
+    <meta name="theme-color" content="#f5f6f9" />
+    <script>
+      // 首帧前定主题：bundle 还没下载完时，页面底和 <html> 已经是对的颜色，
+      // 避免深色系统下先闪一帧白。规则与 src/theme.ts 保持一致。
+      (function () {
+        try {
+          var mode = localStorage.getItem("pf.theme");
+          var dark =
+            mode === "dark" ||
+            (mode !== "light" &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.dataset.theme = dark ? "dark" : "light";
+          document.documentElement.style.colorScheme = dark ? "dark" : "light";
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute("content", dark ? "#0e1014" : "#f5f6f9");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <!-- figma:body-start -->

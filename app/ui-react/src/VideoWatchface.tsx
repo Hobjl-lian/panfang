@@ -35,7 +35,7 @@ import {
   setKeepScreenOn,
   type ScreenInfo,
 } from "./tauri";
-import { DragSlider, GenSlider } from "./Slider";
+import { GenSlider } from "./Slider";
 
 const API_BASE = "https://api.hobjl-shop.top";
 const MAX_VIDEO_BYTES = 80 * 1024 * 1024;
@@ -172,6 +172,111 @@ function fmtSize(n?: number): string {
 function fmtTime(sec?: number): string {
   const v = Math.max(0, Number(sec) || 0);
   return `${v.toFixed(1)}s`;
+}
+
+/**
+ * 「截取片段」卡片里的进度条：按视频播放器的习惯做——
+ * 点轨道任意位置直接跳过去，按住左右拖可以连续找画面。
+ * 轨道整条都能点（不像 DragSlider 只有白点热区）；`touch-action: pan-y`
+ * 让手指竖着划仍然滚页面，横向动过 6px 才认成拖动，避免一碰就跳。
+ */
+function ClipScrubBar(props: {
+  /** 选区内的秒数（0 ~ max） */
+  value: number;
+  max: number;
+  disabled?: boolean;
+  /** 开始拖动时通知外面（播放中要暂停） */
+  onScrubStart?: () => void;
+  onScrub: (v: number) => void;
+}) {
+  const { value, max, disabled, onScrubStart, onScrub } = props;
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const gestureRef = useRef<{
+    id: number;
+    startX: number;
+    startY: number;
+    active: boolean;
+  } | null>(null);
+  const pct = max > 0 ? Math.min(1, Math.max(0, value / max)) : 0;
+
+  const valueAtX = (clientX: number) => {
+    const el = trackRef.current;
+    if (!el || max <= 0) return 0;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0) return 0;
+    const k = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+    return k * max;
+  };
+
+  return (
+    <div
+      className={`relative flex-1 min-w-0 h-10 flex items-center ${
+        disabled ? "opacity-45" : "cursor-pointer"
+      }`}
+      style={{ touchAction: "pan-y" }}
+      onPointerDown={(e) => {
+        if (disabled || max <= 0) return;
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          /* 老内核 */
+        }
+        gestureRef.current = {
+          id: e.pointerId,
+          startX: e.clientX,
+          startY: e.clientY,
+          active: false,
+        };
+      }}
+      onPointerMove={(e) => {
+        const g = gestureRef.current;
+        if (!g || g.id !== e.pointerId || disabled) return;
+        const dx = e.clientX - g.startX;
+        const dy = e.clientY - g.startY;
+        if (!g.active) {
+          // 竖划优先给页面滚动；横移超过 6px 才算拖进度条
+          if (Math.abs(dx) < 6 || Math.abs(dx) < Math.abs(dy)) return;
+          g.active = true;
+          onScrubStart?.();
+        }
+        onScrub(valueAtX(e.clientX));
+      }}
+      onPointerUp={(e) => {
+        const g = gestureRef.current;
+        if (!g || g.id !== e.pointerId) return;
+        gestureRef.current = null;
+        if (!disabled) {
+          if (!g.active) {
+            // 没动过 = 点按：直接跳到点到的位置
+            onScrubStart?.();
+            onScrub(valueAtX(e.clientX));
+          }
+        }
+        try {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        } catch {
+          /* 已经释放 */
+        }
+      }}
+      onPointerCancel={() => {
+        gestureRef.current = null;
+      }}
+    >
+      <div
+        ref={trackRef}
+        className="relative w-full h-1.5 rounded-full bg-[var(--pf-bg-10)]"
+      >
+        <div
+          className="absolute inset-y-0 left-0 rounded-full bg-[var(--pf-primary-solid)]"
+          style={{ width: `${pct * 100}%` }}
+        />
+        <div
+          className="absolute top-1/2 w-4 h-4 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white border-2 border-[var(--pf-primary-solid)] shadow-[0_1px_3px_rgba(0,0,0,0.22)]"
+          style={{ left: `${pct * 100}%` }}
+        />
+      </div>
+    </div>
+  );
 }
 
 /** 项目缩略图：优先用成品 bin 里解出的真实预览，没有再退回模板预览 */
@@ -1266,6 +1371,12 @@ export default function VideoWatchface({
    */
   const scrubTo = (t: number) => {
     const next = Math.max(0, Math.min(duration > 0 ? duration : t, t));
+    // 拖进度条时先停下播放：一边播一边 seek 会互相抢位置
+    const v = videoRef.current;
+    if (v && !v.paused) {
+      v.pause();
+      setPlaying(false);
+    }
     setPlayhead(next);
     scrubTargetRef.current = next;
     scrubbingRef.current = true;
@@ -1274,7 +1385,6 @@ export default function VideoWatchface({
       scrubbingRef.current = false;
     }, 260);
     if (seekTimerRef.current !== undefined) return;
-    const v = videoRef.current;
     if (v) {
       try {
         v.currentTime = next;
@@ -1587,9 +1697,10 @@ export default function VideoWatchface({
     dragRef.current = null;
   };
 
-  const previewPlay = () => {
+  /** 播放 / 暂停：播放头在选区里就从这里接着播，拖到选区外则从头播 */
+  const togglePlay = () => {
     const v = videoRef.current;
-    if (!v) return;
+    if (!v || !videoReady) return;
     if (seekTimerRef.current) {
       window.clearTimeout(seekTimerRef.current);
       seekTimerRef.current = undefined;
@@ -1604,8 +1715,16 @@ export default function VideoWatchface({
       setPlaying(false);
       return;
     }
-    setPlayhead(trimStart);
-    v.currentTime = trimStart;
+    const from =
+      playhead > trimStart + 0.01 && playhead < trimEnd - 0.05
+        ? playhead
+        : trimStart;
+    setPlayhead(from);
+    try {
+      v.currentTime = from;
+    } catch {
+      /* 忽略 */
+    }
     void v.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
   };
 
@@ -1991,11 +2110,11 @@ export default function VideoWatchface({
       <button
         type="button"
         onClick={onBackPress}
-        className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-black/80 active:scale-95 transition-all cursor-pointer"
+        className="w-11 h-11 -ml-2.5 rounded-full flex items-center justify-center text-[var(--pf-i-80)] active:scale-95 transition-all cursor-pointer"
       >
         <CaretLeft className="w-6 h-6 stroke-[2]" />
       </button>
-      <span className="absolute left-1/2 -translate-x-1/2 max-w-[58%] truncate text-[17px] font-bold text-black tracking-tight">
+      <span className="absolute left-1/2 -translate-x-1/2 max-w-[58%] truncate pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight">
         {title}
       </span>
       <div className="w-14 h-11 flex items-center justify-end">{right}</div>
@@ -2003,8 +2122,8 @@ export default function VideoWatchface({
   );
 
   const Empty = ({ text }: { text: string }) => (
-    <div className="bg-white rounded-3xl p-6 text-center">
-      <p className="text-[13px] font-medium text-black/40">{text}</p>
+    <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-6 text-center">
+      <p className="pf-fs-13 font-medium text-[var(--pf-i-40)]">{text}</p>
     </div>
   );
 
@@ -2033,18 +2152,18 @@ export default function VideoWatchface({
         <Header title="视频表盘" onBackPress={onBack} />
 
         <div className="flex-1 flex flex-col justify-center gap-3">
-          <div className="bg-white rounded-3xl p-5">
-            <div className="w-12 h-12 rounded-2xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center">
+          <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5">
+            <div className="w-12 h-12 rounded-2xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center">
               <VideoCamera className="w-6 h-6" />
             </div>
-            <h2 className="text-[22px] font-bold text-black tracking-tight mt-4">制作视频表盘</h2>
-            <p className="text-[13px] font-medium text-black/45 mt-1.5 leading-relaxed">
+            <h2 className="pf-fs-22 font-bold text-[var(--pf-ink)] tracking-tight mt-4">制作视频表盘</h2>
+            <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-1.5 leading-relaxed">
               选择一段视频，把它制作成动态表盘
             </p>
             <button
               type="button"
               onClick={openTemplates}
-              className="mt-4 w-full h-12 rounded-2xl bg-[#4361EE] text-white text-[16px] font-bold active:scale-[0.99] transition-all cursor-pointer flex items-center justify-center gap-2"
+              className="mt-4 w-full h-12 rounded-2xl bg-[var(--pf-primary-solid)] text-white pf-fs-16 font-bold active:scale-[0.99] transition-all cursor-pointer flex items-center justify-center gap-2"
             >
               <Plus className="w-5 h-5 stroke-[2.4]" />
               开始制作
@@ -2054,17 +2173,17 @@ export default function VideoWatchface({
           <button
             type="button"
             onClick={() => pushScreen("projects")}
-            className="w-full text-left bg-white rounded-3xl p-4 flex items-center justify-between active:scale-[0.98] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+            className="w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex items-center justify-between active:scale-[0.98] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
           >
             <div className="flex items-center gap-3.5">
-              <div className="w-11 h-11 rounded-xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center shrink-0">
+              <div className="w-11 h-11 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
                 <FilmStrip className="w-5 h-5 stroke-[2]" />
               </div>
               <div className="min-w-0">
-                <h3 className="text-[17px] font-bold text-black leading-snug tracking-tight">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] leading-snug tracking-tight">
                   历史记录
                 </h3>
-                <p className="text-[13px] font-medium text-black/40 mt-0.5 truncate">
+                <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
                   {projects.length > 0
                     ? `${projects.length} 个，${fmtSize(totalSize)}`
                     : "还没有历史记录"}
@@ -2074,28 +2193,28 @@ export default function VideoWatchface({
             <div className="flex items-center gap-2 shrink-0">
               {showJobBadge && (
                 <span
-                  className={`flex items-center gap-1 text-[12px] font-bold ${
+                  className={`flex items-center gap-1 pf-fs-12 font-bold ${
                     latestActive
-                      ? "text-[#4361EE]"
+                      ? "text-[var(--pf-primary)]"
                       : latestStatus === "done"
                         ? "text-[#34A853]"
-                        : "text-[#FF3B30]"
+                        : "text-[var(--pf-danger)]"
                   }`}
                 >
                   {latestActive && <ArrowClockwise className="w-3.5 h-3.5 animate-spin" />}
                   {statusLabel(latestStatus)}
                 </span>
               )}
-              <CaretRight className="w-5 h-5 text-black/25 stroke-[2]" />
+              <CaretRight className="w-5 h-5 text-[var(--pf-i-25)] stroke-[2]" />
             </div>
           </button>
         </div>
 
         {busy && (
-          <div className="fixed inset-0 z-[80] bg-black/30 flex items-center justify-center px-8">
-            <div className="bg-white rounded-2xl px-5 py-4 flex items-center gap-3 shadow-xl">
-              <ArrowClockwise className="w-5 h-5 text-[#4361EE] animate-spin" />
-              <span className="text-[14px] font-bold text-black">{busy}</span>
+          <div className="fixed inset-0 z-[80] bg-[var(--pf-mask-soft)] flex items-center justify-center px-8">
+            <div className="bg-[var(--pf-card)] pf-card-border rounded-2xl px-5 py-4 flex items-center gap-3 shadow-xl">
+              <ArrowClockwise className="w-5 h-5 text-[var(--pf-primary)] animate-spin" />
+              <span className="pf-fs-14 font-bold text-[var(--pf-ink)]">{busy}</span>
             </div>
           </div>
         )}
@@ -2134,10 +2253,10 @@ export default function VideoWatchface({
                   key={p.id}
                   type="button"
                   onClick={() => openProject(p)}
-                  className="w-full text-left bg-white rounded-3xl p-4 flex items-center gap-3 active:scale-[0.98] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                  className="w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex items-center gap-3 active:scale-[0.98] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
                 >
                   <div
-                    className="relative rounded-xl bg-black/5 overflow-hidden shrink-0"
+                    className="relative rounded-xl bg-[var(--pf-bg-5)] overflow-hidden shrink-0"
                     style={thumbBox(p.canvas_w, p.canvas_h, 64)}
                   >
                     {previewSrc(p) ? (
@@ -2147,7 +2266,7 @@ export default function VideoWatchface({
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      <div className="w-full h-full flex items-center justify-center text-black/20">
+                      <div className="w-full h-full flex items-center justify-center text-[var(--pf-i-20)]">
                         <FilmStrip className="w-5 h-5" />
                       </div>
                     )}
@@ -2165,39 +2284,39 @@ export default function VideoWatchface({
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <h4 className="text-[16px] font-bold text-black truncate">
+                      <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] truncate">
                         {p.title || "视频表盘"}
                       </h4>
                       {active && (
-                        <span className="shrink-0 text-[11px] font-bold text-[#D4973B] bg-[#D4973B]/10 px-2 py-0.5 rounded-full flex items-center gap-1">
+                        <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-amber)] bg-[var(--pf-amber-10)] px-2 py-0.5 rounded-full flex items-center gap-1">
                           <ArrowClockwise className="w-3 h-3 animate-spin" />
                           {statusLabel(p.job_status)}
                         </span>
                       )}
                       {done && !active && (
-                        <span className="shrink-0 text-[11px] font-bold text-[#34A853] bg-[#34A853]/10 px-2 py-0.5 rounded-full">
+                        <span className="shrink-0 pf-fs-11 font-bold text-[#34A853] bg-[#34A853]/10 px-2 py-0.5 rounded-full">
                           已完成
                         </span>
                       )}
                       {failed && !active && (
-                        <span className="shrink-0 text-[11px] font-bold text-[#FF3B30] bg-[#FF3B30]/10 px-2 py-0.5 rounded-full">
+                        <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-danger)] bg-[var(--pf-danger-10)] px-2 py-0.5 rounded-full">
                           制作失败
                         </span>
                       )}
                     </div>
-                    <p className="text-[12px] font-medium text-black/40 mt-1 truncate">
+                    <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-1 truncate">
                       {p.style_name || "样式"}，{p.frame_count || 0} 帧
                     </p>
-                    <p className="text-[12px] font-medium text-black/30 mt-0.5">
+                    <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-0.5">
                       {fmtDate(p.updated_at || p.created_at)}，{fmtSize(total)}
                     </p>
                     {active && (
-                      <div className="mt-2 h-1 rounded-full bg-[#D4973B]/15 overflow-hidden">
-                        <div className="wf-indeterminate h-full w-1/3 rounded-full bg-[#D4973B]" />
+                      <div className="mt-2 h-1 rounded-full bg-[var(--pf-amber-15)] overflow-hidden">
+                        <div className="wf-indeterminate h-full w-1/3 rounded-full bg-[var(--pf-amber-solid)]" />
                       </div>
                     )}
                   </div>
-                  <CaretRight className="w-5 h-5 text-black/20 shrink-0" />
+                  <CaretRight className="w-5 h-5 text-[var(--pf-i-20)] shrink-0" />
                 </button>
               );
             })}
@@ -2234,15 +2353,15 @@ export default function VideoWatchface({
         {loadingTemplates ? (
           <Empty text="正在读取模板…" />
         ) : templatesError ? (
-          <div className="bg-white rounded-3xl p-5 text-center">
-            <p className="text-[13px] font-medium text-black/45">{templatesError}</p>
+          <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 text-center">
+            <p className="pf-fs-13 font-medium text-[var(--pf-i-45)]">{templatesError}</p>
             <button
               type="button"
               onClick={() => {
                 if (templatesError.includes("绑定")) onOpenPaid();
                 else void loadTemplates();
               }}
-              className="mt-3 h-11 px-5 rounded-full bg-[#4361EE] text-white text-[14px] font-bold cursor-pointer"
+              className="mt-3 h-11 px-5 rounded-full bg-[var(--pf-primary-solid)] text-white pf-fs-14 font-bold cursor-pointer"
             >
               {templatesError.includes("绑定") ? "去绑定爱发电" : "重试"}
             </button>
@@ -2258,27 +2377,27 @@ export default function VideoWatchface({
         ) : (
           <div className="flex flex-col gap-4">
             {allLocked && (
-              <div className="flex items-center justify-between gap-3 bg-white rounded-2xl px-4 py-3">
+              <div className="flex items-center justify-between gap-3 bg-[var(--pf-card)] pf-card-border rounded-2xl px-4 py-3">
                 <div className="flex items-center gap-2 min-w-0">
-                  <LockSimple className="w-4 h-4 shrink-0 text-[#D4973B]" />
-                  <span className="text-[14px] font-bold text-black truncate">未解锁</span>
+                  <LockSimple className="w-4 h-4 shrink-0 text-[var(--pf-amber)]" />
+                  <span className="pf-fs-14 font-bold text-[var(--pf-ink)] truncate">未解锁</span>
                 </div>
                 <button
                   type="button"
                   onClick={() => invoke && void invoke("open_external", { url: buyUrl })}
-                  className="h-9 px-4 shrink-0 rounded-full bg-[#4361EE] text-white text-[13px] font-bold active:scale-95 transition-all cursor-pointer"
+                  className="h-9 px-4 shrink-0 rounded-full bg-[var(--pf-primary-solid)] text-white pf-fs-13 font-bold active:scale-95 transition-all cursor-pointer"
                 >
                   去爱发电购买
                 </button>
               </div>
             )}
             {shownTemplates.map((tpl) => (
-              <div key={tpl.id} className="bg-white rounded-3xl p-4 flex flex-col gap-3">
+              <div key={tpl.id} className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex flex-col gap-3">
                 <div className="flex items-center justify-between">
                   <div>
-                    <h3 className="text-[17px] font-bold text-black">{tpl.name}</h3>
+                    <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)]">{tpl.name}</h3>
                     {!allLocked && (
-                      <p className="text-[12px] font-medium text-black/40 mt-0.5">
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5">
                         {tpl.unlocked ? "已解锁全部样式" : "购买后解锁这个模板包的全部样式"}
                       </p>
                     )}
@@ -2286,7 +2405,7 @@ export default function VideoWatchface({
                   {tpl.unlocked ? (
                     <CheckCircle className="w-5 h-5 text-[#34A853]" />
                   ) : (
-                    <LockSimple className="w-5 h-5 text-black/25" />
+                    <LockSimple className="w-5 h-5 text-[var(--pf-i-25)]" />
                   )}
                 </div>
                 <div className="flex flex-col gap-2">
@@ -2296,11 +2415,11 @@ export default function VideoWatchface({
                       type="button"
                       onClick={() => startNew(tpl, st)}
                       className={`flex items-center gap-3 rounded-2xl p-2.5 text-left active:scale-[0.99] transition-all cursor-pointer ${
-                        tpl.unlocked ? "bg-black/[0.03]" : "bg-black/[0.02] opacity-70"
+                        tpl.unlocked ? "bg-[var(--pf-bg-3)]" : "bg-[var(--pf-bg-2)] opacity-70"
                       }`}
                     >
                       <div
-                        className="rounded-lg bg-black/5 overflow-hidden shrink-0"
+                        className="rounded-lg bg-[var(--pf-bg-5)] overflow-hidden shrink-0"
                         style={thumbBox(st.canvas_w, st.canvas_h, 56)}
                       >
                         {st.preview_url ? (
@@ -2310,14 +2429,14 @@ export default function VideoWatchface({
                             className="w-full h-full object-cover"
                           />
                         ) : (
-                          <div className="w-full h-full flex items-center justify-center text-black/20">
+                          <div className="w-full h-full flex items-center justify-center text-[var(--pf-i-20)]">
                             <FilmStrip className="w-4 h-4" />
                           </div>
                         )}
                       </div>
                       <div className="flex-1 min-w-0">
-                        <p className="text-[14px] font-bold text-black truncate">{st.name}</p>
-                        <p className="text-[12px] font-medium text-black/40 mt-0.5">
+                        <p className="pf-fs-14 font-bold text-[var(--pf-ink)] truncate">{st.name}</p>
+                        <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5">
                           {st.canvas_w}×{st.canvas_h} 画布
                           {st.frame_colors?.length
                             ? ` · 相框 ${st.frame_colors.length} 色`
@@ -2325,9 +2444,9 @@ export default function VideoWatchface({
                         </p>
                       </div>
                       {tpl.unlocked ? (
-                        <CaretRight className="w-4 h-4 text-black/20" />
+                        <CaretRight className="w-4 h-4 text-[var(--pf-i-20)]" />
                       ) : (
-                        <LockSimple className="w-4 h-4 text-black/25" />
+                        <LockSimple className="w-4 h-4 text-[var(--pf-i-25)]" />
                       )}
                     </button>
                   ))}
@@ -2336,7 +2455,7 @@ export default function VideoWatchface({
                   <button
                     type="button"
                     onClick={() => invoke && void invoke("open_external", { url: tpl.buy_url })}
-                    className="h-11 rounded-xl bg-[#4361EE] text-white text-[14px] font-bold active:scale-[0.99] transition-all cursor-pointer"
+                    className="h-11 rounded-xl bg-[var(--pf-primary-solid)] text-white pf-fs-14 font-bold active:scale-[0.99] transition-all cursor-pointer"
                   >
                     去爱发电解锁
                   </button>
@@ -2353,7 +2472,7 @@ export default function VideoWatchface({
 
   if (screen === "edit") {
     return (
-      <div className="flex-1 flex flex-col overflow-hidden bg-[#F5F6F9] page-enter-anim select-none relative">
+      <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
         <div className="px-4 safe-top pb-1 shrink-0 z-20">
           <Header
             title={project ? "继续制作" : "制作视频表盘"}
@@ -2363,10 +2482,10 @@ export default function VideoWatchface({
                 type="button"
                 disabled={!videoUrl || !projectId || !!busy}
                 onClick={() => void saveDraft()}
-                className={`h-8 px-3 rounded-full text-[12px] font-bold whitespace-nowrap transition-all ${
+                className={`h-8 px-3 rounded-full pf-fs-12 font-bold whitespace-nowrap transition-all ${
                   !videoUrl || !projectId || busy
-                    ? "bg-black/[0.05] text-black/25"
-                    : "bg-[#4361EE] text-white cursor-pointer active:scale-95"
+                    ? "bg-[var(--pf-bg-5)] text-[var(--pf-i-25)]"
+                    : "bg-[var(--pf-primary-solid)] text-white cursor-pointer active:scale-95"
                 }`}
               >
                 保存
@@ -2420,8 +2539,8 @@ export default function VideoWatchface({
                 className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-white/70 cursor-pointer"
               >
                 <VideoCamera className="w-8 h-8" />
-                <span className="text-[14px] font-bold">选择视频</span>
-                <span className="text-[11px] font-medium text-white/40">5 秒以内，最大 80MB</span>
+                <span className="pf-fs-14 font-bold">选择视频</span>
+                <span className="pf-fs-11 font-medium text-white/40">5 秒以内，最大 80MB</span>
               </button>
             )}
             {videoUrl && framePreviewUrl && (
@@ -2443,18 +2562,9 @@ export default function VideoWatchface({
                 className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
               />
             )}
-            {videoUrl && (
-              <button
-                type="button"
-                onClick={previewPlay}
-                className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 rounded-full bg-black/45 text-white flex items-center justify-center backdrop-blur-sm active:scale-95 transition-all cursor-pointer"
-              >
-                {playing ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
-              </button>
-            )}
           </div>
 
-          <p className="mt-1.5 text-center text-[11px] font-medium text-black/35">
+          <p className="mt-1.5 text-center pf-fs-11 font-medium text-[var(--pf-i-35)]">
             {frameColors.length > 0
               ? "拖动画面调整位置（相框外的画面会被遮住）"
               : "拖动画面调整位置"}
@@ -2476,13 +2586,13 @@ export default function VideoWatchface({
         >
 
           {frameColors.length > 0 && (
-            <section className="bg-white rounded-2xl p-4 flex flex-col gap-3">
+            <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
               <div className="flex items-center justify-between">
-                <h3 className="text-[16px] font-bold text-black flex items-center gap-2">
-                  <Palette className="w-4 h-4 text-[#4361EE]" />
+                <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] flex items-center gap-2">
+                  <Palette className="w-4 h-4 text-[var(--pf-primary)]" />
                   相框颜色
                 </h3>
-                <span className="text-[12px] font-bold text-black/40">
+                <span className="pf-fs-12 font-bold text-[var(--pf-i-40)]">
                   {frameColors.find((c) => String(c.i) === frameColor)?.name || ""}
                 </span>
               </div>
@@ -2498,15 +2608,15 @@ export default function VideoWatchface({
                       onClick={() => setFrameColor(String(c.i))}
                       className={`w-9 h-9 rounded-full transition-all cursor-pointer ${
                         active
-                          ? "ring-2 ring-[#4361EE] ring-offset-2 ring-offset-white"
-                          : "ring-1 ring-black/10"
+                          ? "ring-2 ring-[var(--pf-primary)] ring-offset-2 ring-offset-white"
+                          : "ring-1 ring-[var(--pf-bd-10)]"
                       }`}
                       style={{ background: c.swatch }}
                     />
                   );
                 })}
               </div>
-              <p className="text-[11px] font-medium text-black/35">
+              <p className="pf-fs-11 font-medium text-[var(--pf-i-35)]">
                 只换相框颜色；相框外的画面会被遮住。
               </p>
             </section>
@@ -2516,30 +2626,30 @@ export default function VideoWatchface({
             <button
               type="button"
               onClick={() => fileRef.current?.click()}
-              className="w-full bg-white rounded-2xl p-4 flex items-center justify-between active:scale-[0.99] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+              className="w-full bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex items-center justify-between active:scale-[0.99] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
             >
               <div className="flex items-center gap-3 min-w-0">
-                <div className="w-10 h-10 rounded-xl bg-[#4361EE]/10 text-[#4361EE] flex items-center justify-center shrink-0">
+                <div className="w-10 h-10 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
                   <VideoCamera className="w-5 h-5" />
                 </div>
                 <div className="min-w-0 text-left">
-                  <p className="text-[15px] font-bold text-black">更换视频</p>
-                  <p className="text-[12px] font-medium text-black/40 mt-0.5 truncate">
+                  <p className="pf-fs-15 font-bold text-[var(--pf-ink)]">更换视频</p>
+                  <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
                     {videoName || "已选视频"}
                   </p>
                 </div>
               </div>
-              <CaretRight className="w-5 h-5 text-black/20 shrink-0" />
+              <CaretRight className="w-5 h-5 text-[var(--pf-i-20)] shrink-0" />
             </button>
           )}
 
-          <section className="bg-white rounded-2xl p-4 flex flex-col gap-3">
+          <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-[16px] font-bold text-black flex items-center gap-2">
-                <Scissors className="w-4 h-4 text-[#4361EE]" />
+              <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] flex items-center gap-2">
+                <Scissors className="w-4 h-4 text-[var(--pf-primary)]" />
                 截取片段
               </h3>
-              <span className="text-[12px] font-bold text-black/40">
+              <span className="pf-fs-12 font-bold text-[var(--pf-i-40)]">
                 {duration > 0
                   ? tlZoom > 1.01
                     ? `${tlZoom.toFixed(1)}x，已选 ${fmtTime(clipLen)}`
@@ -2551,7 +2661,7 @@ export default function VideoWatchface({
             {/* 轨道：缩略图 + 选区；单指拖选区/平移，双指缩放 */}
             <div
               ref={trimTrackRef}
-              className="relative h-14 rounded-xl bg-black/[0.06]"
+              className="relative h-14 rounded-xl bg-[var(--pf-bg-6)]"
               style={{ touchAction: "none" }}
               onPointerDown={onTrackDown}
               onPointerMove={onTrackMove}
@@ -2566,7 +2676,7 @@ export default function VideoWatchface({
                     return src ? (
                       <img key={i} src={src} alt="" className="h-full flex-1 object-cover" />
                     ) : (
-                      <div key={i} className="h-full flex-1 bg-black/[0.05]" />
+                      <div key={i} className="h-full flex-1 bg-[var(--pf-bg-5)]" />
                     );
                   })}
                 </div>
@@ -2583,18 +2693,18 @@ export default function VideoWatchface({
                   }}
                 />
                 <div
-                  className="absolute inset-y-0 bg-[#4361EE]/20"
+                  className="absolute inset-y-0 bg-[var(--pf-primary-20)]"
                   style={{
                     left: `${startPct}%`,
                     width: `${Math.max(0, endPct - startPct)}%`,
                   }}
                 />
                 <div
-                  className="absolute inset-y-0 w-0.5 bg-[#4361EE]"
+                  className="absolute inset-y-0 w-0.5 bg-[var(--pf-primary-solid)]"
                   style={{ left: `${startPct}%` }}
                 />
                 <div
-                  className="absolute inset-y-0 w-0.5 bg-[#4361EE]"
+                  className="absolute inset-y-0 w-0.5 bg-[var(--pf-primary-solid)]"
                   style={{ left: `${endPct}%` }}
                 />
                 <div
@@ -2627,32 +2737,51 @@ export default function VideoWatchface({
                     }}
                   >
                     <div className="w-3.5 h-10 rounded-md bg-white shadow-[0_1px_4px_rgba(0,0,0,0.22)] flex items-center justify-center">
-                      <div className="w-0.5 h-4 rounded-full bg-[#4361EE]" />
+                      <div className="w-0.5 h-4 rounded-full bg-[var(--pf-primary-solid)]" />
                     </div>
                   </div>
                 );
               })}
             </div>
 
-            <div className="flex items-center gap-2">
-              <span className="w-9 shrink-0 text-[11px] font-mono font-medium text-black/40">
-                {fmtTime(Math.min(clipLen, Math.max(0, playhead - trimStart)))}
-              </span>
-              <DragSlider
+            {/* 播放控制：播放/暂停 + 选区内的进度条（点按跳转、拖动找画面） */}
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                aria-label={playing ? "暂停" : "播放"}
+                disabled={!videoReady}
+                onClick={togglePlay}
+                className={`w-9 h-9 shrink-0 rounded-full flex items-center justify-center transition-all ${
+                  videoReady
+                    ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)] active:scale-95 active:bg-[var(--pf-primary-20)] cursor-pointer"
+                    : "bg-[var(--pf-bg-5)] text-[var(--pf-i-25)]"
+                }`}
+              >
+                {playing ? (
+                  <Pause weight="fill" className="w-5 h-5" />
+                ) : (
+                  <Play weight="fill" className="w-5 h-5" />
+                )}
+              </button>
+              <ClipScrubBar
                 value={Math.min(clipLen, Math.max(0, playhead - trimStart))}
-                min={0}
-                max={Math.max(0.1, clipLen)}
-                step={0.05}
-                onChange={(v) => scrubTo(trimStart + v)}
-                disabled={!videoDim}
+                max={clipLen}
+                disabled={!videoReady}
+                onScrubStart={() => {
+                  if (playing) {
+                    videoRef.current?.pause();
+                    setPlaying(false);
+                  }
+                }}
+                onScrub={(v) => scrubTo(trimStart + v)}
               />
-              <span className="w-9 shrink-0 text-right text-[11px] font-mono font-medium text-black/40">
-                {fmtTime(clipLen)}
+              <span className="w-[84px] shrink-0 text-right pf-fs-11 font-mono font-medium text-[var(--pf-i-40)] tabular-nums">
+                {fmtTime(Math.min(clipLen, Math.max(0, playhead - trimStart)))} / {fmtTime(clipLen)}
               </span>
             </div>
           </section>
 
-          <section className="bg-white rounded-2xl p-4">
+          <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4">
             <GenSlider
               icon={<ArrowsOutSimple className="w-4 h-4" />}
               label="缩放"
@@ -2664,19 +2793,19 @@ export default function VideoWatchface({
             />
           </section>
 
-          <section className="bg-white rounded-2xl p-4 flex flex-col gap-3">
+          <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-[16px] font-bold text-black">流畅度</h3>
+              <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)]">流畅度</h3>
               <button
                 type="button"
                 onClick={() => {
                   if (!customOpen) setCustomCount(String(count));
                   setCustomOpen(!customOpen);
                 }}
-                className={`h-7 px-3 rounded-full text-[12px] font-bold active:scale-95 transition-all cursor-pointer ${
+                className={`h-7 px-3 rounded-full pf-fs-12 font-bold active:scale-95 transition-all cursor-pointer ${
                   customOpen || quality === "custom"
-                    ? "bg-[#4361EE]/10 text-[#4361EE]"
-                    : "bg-black/[0.04] text-black/45"
+                    ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
+                    : "bg-[var(--pf-bg-4)] text-[var(--pf-i-45)]"
                 }`}
               >
                 高级
@@ -2694,10 +2823,10 @@ export default function VideoWatchface({
                     setCustomCount(String(n));
                     setCustomOpen(false);
                   }}
-                  className={`h-10 rounded-xl text-[13px] font-bold active:scale-[0.98] transition-all cursor-pointer ${
+                  className={`h-10 rounded-xl pf-fs-13 font-bold active:scale-[0.98] transition-all cursor-pointer ${
                     quality === level.key
-                      ? "bg-[#4361EE] text-white"
-                      : "bg-black/[0.04] text-black/60"
+                      ? "bg-[var(--pf-primary-solid)] text-white"
+                      : "bg-[var(--pf-bg-4)] text-[var(--pf-i-60)]"
                   }`}
                 >
                   {level.label}
@@ -2706,7 +2835,7 @@ export default function VideoWatchface({
             </div>
             {customOpen && (
               <div className="flex flex-col gap-1.5">
-                <span className="text-[12px] font-semibold text-black/50">自定义帧数</span>
+                <span className="pf-fs-12 font-semibold text-[var(--pf-i-50)]">自定义帧数</span>
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
@@ -2735,12 +2864,12 @@ export default function VideoWatchface({
                         setQuality("custom");
                       }
                     }}
-                    className="w-full h-10 rounded-xl bg-black/[0.04] px-3 text-[14px] font-semibold text-black outline-none"
+                    className="w-full h-10 rounded-xl bg-[var(--pf-bg-4)] px-3 pf-fs-14 font-semibold text-[var(--pf-ink)] outline-none"
                     placeholder="1~300"
                   />
-                  <span className="text-[12px] font-medium text-black/35 shrink-0">帧</span>
+                  <span className="pf-fs-12 font-medium text-[var(--pf-i-35)] shrink-0">帧</span>
                 </div>
-                <p className="text-[12px] font-medium text-black/35">
+                <p className="pf-fs-12 font-medium text-[var(--pf-i-35)]">
                   {clipLen > 0
                     ? `每秒约 ${(count / clipLen).toFixed(1)} 帧，最多 ${maxFrames} 帧`
                     : "选择视频后可自定义帧数"}
@@ -2748,21 +2877,21 @@ export default function VideoWatchface({
               </div>
             )}
             {fpsBad && (
-              <p className="text-[11px] font-medium text-[#FF3B30]">
+              <p className="pf-fs-11 font-medium text-[var(--pf-danger)]">
                 帧率超过 60，请减少帧数或延长片段。
               </p>
             )}
 
           </section>
 
-          <section className="bg-white rounded-2xl p-4 flex flex-col gap-3">
-            <h3 className="text-[16px] font-bold text-black">播放方式</h3>
-            <div className="flex rounded-full bg-black/5 p-1">
+          <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
+            <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)]">播放方式</h3>
+            <div className="flex rounded-full bg-[var(--pf-bg-5)] p-1">
               <button
                 type="button"
                 onClick={() => setMode("loop")}
-                className={`flex-1 h-9 rounded-full text-[13px] font-semibold transition-all cursor-pointer ${
-                  mode === "loop" ? "bg-white text-black shadow-sm" : "text-black/50"
+                className={`flex-1 h-9 rounded-full pf-fs-13 font-semibold transition-all cursor-pointer ${
+                  mode === "loop" ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-sm" : "text-[var(--pf-i-50)]"
                 }`}
               >
                 循环播放
@@ -2770,8 +2899,8 @@ export default function VideoWatchface({
               <button
                 type="button"
                 onClick={() => setMode("once")}
-                className={`flex-1 h-9 rounded-full text-[13px] font-semibold transition-all cursor-pointer ${
-                  mode === "once" ? "bg-white text-black shadow-sm" : "text-black/50"
+                className={`flex-1 h-9 rounded-full pf-fs-13 font-semibold transition-all cursor-pointer ${
+                  mode === "once" ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-sm" : "text-[var(--pf-i-50)]"
                 }`}
               >
                 播放一次
@@ -2783,7 +2912,7 @@ export default function VideoWatchface({
 
         <div
           data-pf-bottombar
-          className="px-4 pt-2 safe-bottom-panel bg-white border-t border-black/5 shrink-0 z-30"
+          className="px-4 pt-2 safe-bottom-panel bg-[var(--pf-card)] border-t border-[var(--pf-bd-5)] shrink-0 z-30"
         >
           <button
             type="button"
@@ -2791,10 +2920,10 @@ export default function VideoWatchface({
             onClick={triggerGenerate}
             onPointerDown={onGenDown}
             onPointerUp={onGenUp}
-            className={`w-full h-12 rounded-2xl text-[16px] font-bold active:scale-[0.99] transition-all ${
+            className={`w-full h-12 rounded-2xl pf-fs-16 font-bold active:scale-[0.99] transition-all ${
               !videoReady || !projectId || fpsBad || durationBad || busy
-                ? "bg-black/[0.06] text-black/25"
-                : "bg-[#4361EE] text-white cursor-pointer"
+                ? "bg-[var(--pf-bg-6)] text-[var(--pf-i-25)]"
+                : "bg-[var(--pf-primary-solid)] text-white cursor-pointer"
             }`}
           >
             {busy
@@ -2806,12 +2935,12 @@ export default function VideoWatchface({
         </div>
 
         {busy && progress > 0 && (
-          <div className="fixed inset-0 z-[80] bg-black/30 flex items-center justify-center px-8">
-            <div className="bg-white rounded-2xl px-5 py-4 w-full max-w-xs text-center">
-              <p className="text-[14px] font-bold text-black">{busy}</p>
-              <div className="h-2 rounded-full bg-black/10 mt-3 overflow-hidden relative">
+          <div className="fixed inset-0 z-[80] bg-[var(--pf-mask-soft)] flex items-center justify-center px-8">
+            <div className="bg-[var(--pf-card)] pf-card-border rounded-2xl px-5 py-4 w-full max-w-xs text-center">
+              <p className="pf-fs-14 font-bold text-[var(--pf-ink)]">{busy}</p>
+              <div className="h-2 rounded-full bg-[var(--pf-bg-10)] mt-3 overflow-hidden relative">
                 <div
-                  className="h-full bg-[#4361EE] transition-[width] duration-200"
+                  className="h-full bg-[var(--pf-primary-solid)] transition-[width] duration-200"
                   style={{ width: `${progress}%` }}
                 />
                 <div className="wf-shimmer absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-white/50 to-transparent" />
@@ -2822,33 +2951,33 @@ export default function VideoWatchface({
 
         {exitAsk && (
           <div
-            className="absolute inset-0 z-50 bg-black/40 flex items-center justify-center p-6"
+            className="absolute inset-0 z-50 bg-[var(--pf-mask)] flex items-center justify-center p-6"
             onClick={() => setExitAsk(false)}
           >
             <div
-              className="bg-white w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] border border-black/5 text-center"
+              className="bg-[var(--pf-card)] pf-card-border w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] text-center"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="pt-6 px-6 pb-5">
-                <h3 className="text-[17px] font-bold text-black tracking-tight leading-snug">
+                <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] tracking-tight leading-snug">
                   当前表盘还未保存
                 </h3>
-                <p className="text-[13px] text-black/40 font-medium mt-1.5 leading-relaxed">
+                <p className="pf-fs-13 text-[var(--pf-i-40)] font-medium mt-1.5 leading-relaxed">
                   是否保存到历史记录？
                 </p>
               </div>
-              <div className="grid grid-cols-2 border-t border-black/5 divide-x divide-black/5">
+              <div className="grid grid-cols-2 border-t border-[var(--pf-bd-5)] divide-x divide-[var(--pf-bd-5)]">
                 <button
                   type="button"
                   onClick={() => void confirmExit("discard")}
-                  className="py-3.5 text-[16px] font-bold text-[#C7332B] active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[#C7332B] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   不保存
                 </button>
                 <button
                   type="button"
                   onClick={() => void confirmExit("save")}
-                  className="py-3.5 text-[16px] font-bold text-[#4361EE] active:bg-black/5 transition-colors cursor-pointer"
+                  className="py-3.5 pf-fs-16 font-bold text-[var(--pf-primary)] active:bg-[var(--pf-bg-5)] transition-colors cursor-pointer"
                 >
                   保存
                 </button>
@@ -2867,14 +2996,14 @@ export default function VideoWatchface({
     const done = st === "done";
     const failed = st === "failed";
     return (
-      <div className="flex-1 flex flex-col overflow-hidden bg-[#F5F6F9] page-enter-anim select-none">
+      <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none">
         <div className="px-4 safe-top pb-1 shrink-0">
           <Header title="制作进度" onBackPress={backFromScreen} />
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-6 pb-10 flex flex-col items-center justify-center">
           <div
             className={`w-16 h-16 rounded-full flex items-center justify-center ${
-              done ? "bg-[#34A853]/10 text-[#34A853]" : failed ? "bg-[#FF3B30]/10 text-[#FF3B30]" : "bg-[#4361EE]/10 text-[#4361EE]"
+              done ? "bg-[#34A853]/10 text-[#34A853]" : failed ? "bg-[var(--pf-danger-10)] text-[var(--pf-danger)]" : "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
             }`}
           >
             {done ? (
@@ -2885,10 +3014,10 @@ export default function VideoWatchface({
               <ArrowClockwise className="w-8 h-8 animate-spin" />
             )}
           </div>
-          <h2 className="text-[20px] font-bold text-black mt-4">
+          <h2 className="pf-fs-20 font-bold text-[var(--pf-ink)] mt-4">
             {done ? "视频表盘已生成" : failed ? "制作失败" : statusLabel(st)}
           </h2>
-          <p className="text-[13px] font-medium text-black/45 mt-2 text-center leading-relaxed">
+          <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-2 text-center leading-relaxed">
             {done
               ? "成品已保存，可以安装到手表了。"
               : failed
@@ -2896,7 +3025,7 @@ export default function VideoWatchface({
                 : "预计 5~6 分钟，制作期间可以退出 App。"}
           </p>
           {!done && !failed && (
-            <p className="text-[12px] font-medium text-black/30 mt-4">
+            <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-4">
               任务 {job?.id || "—"}
             </p>
           )}
@@ -2904,7 +3033,7 @@ export default function VideoWatchface({
             <button
               type="button"
               onClick={() => projectId && void installBin(projectId)}
-              className="mt-6 w-full max-w-xs h-12 rounded-2xl bg-[#4361EE] text-white text-[16px] font-bold active:scale-[0.99] transition-all cursor-pointer flex items-center justify-center gap-2"
+              className="mt-6 w-full max-w-xs h-12 rounded-2xl bg-[var(--pf-primary-solid)] text-white pf-fs-16 font-bold active:scale-[0.99] transition-all cursor-pointer flex items-center justify-center gap-2"
             >
               <DeviceMobile className="w-5 h-5" />
               安装到手表
@@ -2918,17 +3047,17 @@ export default function VideoWatchface({
                 if (p) void editExisting(p, "replace");
                 else backFromScreen();
               }}
-              className="mt-3 h-11 px-5 rounded-full bg-white text-[14px] font-bold text-black/60 active:scale-95 transition-all cursor-pointer"
+              className="mt-3 h-11 px-5 rounded-full bg-[var(--pf-card)] pf-card-border pf-fs-14 font-bold text-[var(--pf-i-60)] active:scale-95 transition-all cursor-pointer"
             >
               {failed ? "调整后重试" : "继续制作"}
             </button>
           )}
         </div>
         {busy && (
-          <div className="fixed inset-0 z-[80] bg-black/30 flex items-center justify-center px-8">
-            <div className="bg-white rounded-2xl px-5 py-4 flex items-center gap-3 shadow-xl">
-              <ArrowClockwise className="w-5 h-5 text-[#4361EE] animate-spin" />
-              <span className="text-[14px] font-bold text-black">{busy}</span>
+          <div className="fixed inset-0 z-[80] bg-[var(--pf-mask-soft)] flex items-center justify-center px-8">
+            <div className="bg-[var(--pf-card)] pf-card-border rounded-2xl px-5 py-4 flex items-center gap-3 shadow-xl">
+              <ArrowClockwise className="w-5 h-5 text-[var(--pf-primary)] animate-spin" />
+              <span className="pf-fs-14 font-bold text-[var(--pf-ink)]">{busy}</span>
             </div>
           </div>
         )}
@@ -2955,15 +3084,15 @@ export default function VideoWatchface({
         <Empty text={loadingProjects ? "正在读取作品…" : "作品不存在"} />
       ) : (
         <div className="flex flex-col gap-3">
-          <div className="bg-white rounded-3xl p-4 flex gap-4">
+          <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex gap-4">
             <div
-              className="relative rounded-2xl bg-black/5 overflow-hidden shrink-0"
+              className="relative rounded-2xl bg-[var(--pf-bg-5)] overflow-hidden shrink-0"
               style={thumbBox(p.canvas_w, p.canvas_h, 112)}
             >
               {previewSrc(p) ? (
                 <img src={previewSrc(p)} alt="" className="w-full h-full object-cover" />
               ) : (
-                <div className="w-full h-full flex items-center justify-center text-black/20">
+                <div className="w-full h-full flex items-center justify-center text-[var(--pf-i-20)]">
                   <FilmStrip className="w-6 h-6" />
                 </div>
               )}
@@ -2981,23 +3110,23 @@ export default function VideoWatchface({
             </div>
             <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
               <div className="min-w-0">
-                <h2 className="text-[19px] font-bold text-black leading-tight truncate">
+                <h2 className="pf-fs-19 font-bold text-[var(--pf-ink)] leading-tight truncate">
                   {p.title || "视频表盘"}
                 </h2>
-                <p className="text-[12px] font-medium text-black/40 mt-1 truncate">
+                <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-1 truncate">
                   {[p.template_name, p.style_name].filter(Boolean).join("，")}
                 </p>
               </div>
-              <p className="text-[12px] font-medium text-black/30 truncate">
+              <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] truncate">
                 {p.mode === "loop" ? "循环播放" : "播放一次"}，{fmtDate(p.created_at)}
               </p>
             </div>
           </div>
 
-          <div className="bg-white rounded-2xl p-4 flex flex-col gap-3">
+          <div className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-[16px] font-bold text-black">本地占用</h3>
-              <span className="text-[12px] font-bold text-black/40">{fmtSize(total)}</span>
+              <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)]">本地占用</h3>
+              <span className="pf-fs-12 font-bold text-[var(--pf-i-40)]">{fmtSize(total)}</span>
             </div>
             {[
               { key: "video", label: "视频", size: p.video_size, has: p.has_video },
@@ -3006,8 +3135,8 @@ export default function VideoWatchface({
             ].map((it) => (
               <div key={it.key} className="flex items-center justify-between h-10">
                 <div className="flex items-center gap-2">
-                  <span className="text-[13px] font-semibold text-black/70">{it.label}</span>
-                  <span className="text-[12px] font-medium text-black/35">{fmtSize(it.size)}</span>
+                  <span className="pf-fs-13 font-semibold text-[var(--pf-i-70)]">{it.label}</span>
+                  <span className="pf-fs-12 font-medium text-[var(--pf-i-35)]">{fmtSize(it.size)}</span>
                 </div>
                 {it.has ? (
                   <button
@@ -3016,21 +3145,21 @@ export default function VideoWatchface({
                       if (it.key === "bin") setClearBinAsk(true);
                       else void clearKinds(p.id, [it.key]);
                     }}
-                    className="h-8 px-3 rounded-full bg-black/[0.04] text-[12px] font-bold text-black/55 cursor-pointer active:scale-95 transition-all"
+                    className="h-8 px-3 rounded-full bg-[var(--pf-bg-4)] pf-fs-12 font-bold text-[var(--pf-i-55)] cursor-pointer active:scale-95 transition-all"
                   >
                     清理
                   </button>
                 ) : (
-                  <span className="text-[12px] font-medium text-black/20">无</span>
+                  <span className="pf-fs-12 font-medium text-[var(--pf-i-20)]">无</span>
                 )}
               </div>
             ))}
           </div>
 
           {p.job_status === "failed" && (
-            <div className="bg-[#FF3B30]/8 rounded-2xl p-4">
-              <p className="text-[12px] font-bold text-[#FF3B30]">上次制作失败</p>
-              <p className="text-[12px] font-medium text-black/55 mt-1">
+            <div className="bg-[var(--pf-danger-8)] rounded-2xl p-4">
+              <p className="pf-fs-12 font-bold text-[var(--pf-danger)]">上次制作失败</p>
+              <p className="pf-fs-12 font-medium text-[var(--pf-i-55)] mt-1">
                 {friendlyJobError(p.job_error)}
               </p>
             </div>
@@ -3040,7 +3169,7 @@ export default function VideoWatchface({
             <button
               type="button"
               onClick={() => openJob(p)}
-              className="h-11 rounded-2xl bg-[#D4973B]/10 text-[#D4973B] text-[14px] font-bold cursor-pointer flex items-center justify-center gap-2"
+              className="h-11 rounded-2xl bg-[var(--pf-amber-10)] text-[var(--pf-amber)] pf-fs-14 font-bold cursor-pointer flex items-center justify-center gap-2"
             >
               <ArrowClockwise className="w-4 h-4 animate-spin" />
               查看制作进度（{statusLabel(p.job_status)}）
@@ -3051,7 +3180,7 @@ export default function VideoWatchface({
             <button
               type="button"
               onClick={() => void refetchBin(p)}
-              className="h-11 rounded-2xl bg-[#4361EE]/10 text-[#4361EE] text-[14px] font-bold cursor-pointer active:scale-[0.99] transition-all"
+              className="h-11 rounded-2xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] pf-fs-14 font-bold cursor-pointer active:scale-[0.99] transition-all"
             >
               重新下载成品
             </button>
@@ -3061,17 +3190,17 @@ export default function VideoWatchface({
             type="button"
             disabled={!p.has_bin}
             onClick={() => void installBin(p.id)}
-            className={`h-12 rounded-2xl text-[16px] font-bold active:scale-[0.99] transition-all flex items-center justify-center gap-2 ${
+            className={`h-12 rounded-2xl pf-fs-16 font-bold active:scale-[0.99] transition-all flex items-center justify-center gap-2 ${
               p.has_bin
-                ? "bg-[#4361EE] text-white cursor-pointer"
-                : "bg-black/[0.05] text-black/25"
+                ? "bg-[var(--pf-primary-solid)] text-white cursor-pointer"
+                : "bg-[var(--pf-bg-5)] text-[var(--pf-i-25)]"
             }`}
           >
             <DeviceMobile className="w-5 h-5" />
             安装到手表
           </button>
           {!deviceConnected && (
-            <p className="text-[11px] font-medium text-black/30 text-center -mt-1">
+            <p className="pf-fs-11 font-medium text-[var(--pf-i-30)] text-center -mt-1">
               当前未连接设备（{deviceName || "未知设备"}）
             </p>
           )}
@@ -3080,7 +3209,7 @@ export default function VideoWatchface({
             <button
               type="button"
               onClick={() => void editExisting(p)}
-              className="h-11 rounded-2xl bg-white text-[14px] font-bold text-black/65 cursor-pointer active:scale-[0.99] transition-all"
+              className="h-11 rounded-2xl bg-[var(--pf-card)] pf-card-border pf-fs-14 font-bold text-[var(--pf-i-65)] cursor-pointer active:scale-[0.99] transition-all"
             >
               继续制作
             </button>
@@ -3094,7 +3223,7 @@ export default function VideoWatchface({
                 }
                 setConfirmDelete(true);
               }}
-              className={`h-11 rounded-2xl bg-white text-[14px] font-bold text-[#FF3B30] cursor-pointer active:scale-[0.99] transition-all ${
+              className={`h-11 rounded-2xl bg-[var(--pf-card)] pf-card-border pf-fs-14 font-bold text-[var(--pf-danger)] cursor-pointer active:scale-[0.99] transition-all ${
                 jobActive ? "opacity-40" : ""
               }`}
             >
@@ -3105,24 +3234,24 @@ export default function VideoWatchface({
       )}
 
       {confirmDelete && p && (
-        <div className="fixed inset-0 z-[90] bg-black/35 flex items-end justify-center px-4 pb-6">
-          <div className="w-full max-w-sm bg-white rounded-3xl p-5 text-center">
-            <h3 className="text-[18px] font-bold text-black">删除这个作品？</h3>
-            <p className="text-[13px] font-medium text-black/45 mt-2 leading-relaxed">
+        <div className="fixed inset-0 z-[90] bg-[var(--pf-bg-35)] flex items-end justify-center px-4 pb-6">
+          <div className="w-full max-w-sm bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 text-center">
+            <h3 className="pf-fs-18 font-bold text-[var(--pf-ink)]">删除这个作品？</h3>
+            <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-2 leading-relaxed">
               会删除本机的视频、帧包和表盘文件；已经装在手表上的表盘不会自动卸载。
             </p>
             <div className="grid grid-cols-2 gap-3 mt-5">
               <button
                 type="button"
                 onClick={() => setConfirmDelete(false)}
-                className="h-11 rounded-2xl bg-black/[0.05] text-[14px] font-bold text-black/65 cursor-pointer"
+                className="h-11 rounded-2xl bg-[var(--pf-bg-5)] pf-fs-14 font-bold text-[var(--pf-i-65)] cursor-pointer"
               >
                 取消
               </button>
               <button
                 type="button"
                 onClick={() => void deleteProject(p.id)}
-                className="h-11 rounded-2xl bg-[#FF3B30] text-white text-[14px] font-bold cursor-pointer"
+                className="h-11 rounded-2xl bg-[var(--pf-danger-solid)] text-white pf-fs-14 font-bold cursor-pointer"
               >
                 删除
               </button>
@@ -3132,17 +3261,17 @@ export default function VideoWatchface({
       )}
 
       {clearBinAsk && p && (
-        <div className="fixed inset-0 z-[90] bg-black/35 flex items-end justify-center px-4 pb-6">
-          <div className="w-full max-w-sm bg-white rounded-3xl p-5 text-center">
-            <h3 className="text-[18px] font-bold text-black">清理表盘文件？</h3>
-            <p className="text-[13px] font-medium text-black/45 mt-2 leading-relaxed">
+        <div className="fixed inset-0 z-[90] bg-[var(--pf-bg-35)] flex items-end justify-center px-4 pb-6">
+          <div className="w-full max-w-sm bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 text-center">
+            <h3 className="pf-fs-18 font-bold text-[var(--pf-ink)]">清理表盘文件？</h3>
+            <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-2 leading-relaxed">
               清理后这个作品将无法在 App 里继续编辑，需要重新生成才能恢复。已装在手表上的表盘不受影响。
             </p>
             <div className="grid grid-cols-2 gap-3 mt-5">
               <button
                 type="button"
                 onClick={() => setClearBinAsk(false)}
-                className="h-11 rounded-2xl bg-black/[0.05] text-[14px] font-bold text-black/65 cursor-pointer"
+                className="h-11 rounded-2xl bg-[var(--pf-bg-5)] pf-fs-14 font-bold text-[var(--pf-i-65)] cursor-pointer"
               >
                 取消
               </button>
@@ -3152,7 +3281,7 @@ export default function VideoWatchface({
                   setClearBinAsk(false);
                   void clearKinds(p.id, ["bin"]);
                 }}
-                className="h-11 rounded-2xl bg-[#FF3B30] text-white text-[14px] font-bold cursor-pointer"
+                className="h-11 rounded-2xl bg-[var(--pf-danger-solid)] text-white pf-fs-14 font-bold cursor-pointer"
               >
                 清理
               </button>
@@ -3162,10 +3291,10 @@ export default function VideoWatchface({
       )}
 
       {busy && (
-        <div className="fixed inset-0 z-[80] bg-black/30 flex items-center justify-center px-8">
-          <div className="bg-white rounded-2xl px-5 py-4 flex items-center gap-3 shadow-xl">
-            <ArrowClockwise className="w-5 h-5 text-[#4361EE] animate-spin" />
-            <span className="text-[14px] font-bold text-black">{busy}</span>
+        <div className="fixed inset-0 z-[80] bg-[var(--pf-mask-soft)] flex items-center justify-center px-8">
+          <div className="bg-[var(--pf-card)] pf-card-border rounded-2xl px-5 py-4 flex items-center gap-3 shadow-xl">
+            <ArrowClockwise className="w-5 h-5 text-[var(--pf-primary)] animate-spin" />
+            <span className="pf-fs-14 font-bold text-[var(--pf-ink)]">{busy}</span>
           </div>
         </div>
       )}
