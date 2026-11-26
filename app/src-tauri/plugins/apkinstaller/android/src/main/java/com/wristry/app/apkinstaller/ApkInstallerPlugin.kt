@@ -2,6 +2,7 @@ package com.wristry.app.apkinstaller
 
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -15,6 +16,7 @@ import app.tauri.plugin.Plugin
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.security.MessageDigest
 
 @InvokeArg
 class InstallArg {
@@ -105,13 +107,22 @@ class ApkInstallerPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(ret)
     }
 
-    /** 分享诊断包：先复制进内部 cacheDir 再走 FileProvider（外部 cache 不在白名单）。 */
+    /** 分享诊断包：校验源路径必须在应用私有数据/缓存目录内，复制到内部 cacheDir/diag 后分享。 */
     @Command
     fun shareFile(invoke: Invoke) {
         val args = invoke.parseArgs(ShareArg::class.java)
         try {
-            val src = File(args.path)
-            if (!src.exists() || src.length() <= 0) {
+            val src = File(args.path).canonicalFile
+            val allowedRoots = listOfNotNull(
+                activity.cacheDir.canonicalFile,
+                activity.dataDir.canonicalFile,
+                activity.externalCacheDir?.canonicalFile,
+            )
+            if (allowedRoots.none { src.path.startsWith(it.path + File.separator) }) {
+                invoke.reject("PATH_FORBIDDEN", "不允许分享应用目录之外的文件")
+                return
+            }
+            if (!src.exists() || !src.isFile || src.length() <= 0) {
                 invoke.reject("FILE_NOT_FOUND", "要分享的文件不存在")
                 return
             }
@@ -164,25 +175,26 @@ class ApkInstallerPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("NEED_INSTALL_PERMISSION", "还没有允许盘坊安装应用")
             return
         }
-        val apk = File(args.path)
-        if (!apk.exists() || apk.length() <= 0) {
+        val apk = File(args.path).canonicalFile
+        val updatesRoot = File(activity.cacheDir, "updates").canonicalFile
+        if (!apk.path.startsWith(updatesRoot.path + File.separator) || apk.extension.lowercase() != "apk") {
+            invoke.reject("APK_PATH_FORBIDDEN", "安装包必须位于专用更新缓存目录中")
+            return
+        }
+        if (!apk.exists() || !apk.isFile || apk.length() <= 0) {
             invoke.reject("APK_NOT_FOUND", "安装包不存在或为空")
             return
         }
+        if (!verifyApkMatchesSelf(apk)) {
+            invoke.reject("APK_SIGNATURE_MISMATCH", "安装包签名或包名校验不通过，已拒绝安装")
+            return
+        }
         val authority = "${activity.packageName}.fileprovider"
-        // 路径不在 FileProvider 白名单里（例如下载落到了别处）→ 先复制进内部 cache 再来一次
         val uri = try {
             FileProvider.getUriForFile(activity, authority, apk)
         } catch (e: IllegalArgumentException) {
-            try {
-                val moved = File(activity.cacheDir, "updates/${apk.name}")
-                moved.parentFile?.mkdirs()
-                apk.copyTo(moved, overwrite = true)
-                FileProvider.getUriForFile(activity, authority, moved)
-            } catch (e2: Exception) {
-                invoke.reject("APK_NOT_SHARABLE", e2.message ?: "安装包位置无法共享给安装器")
-                return
-            }
+            invoke.reject("APK_NOT_SHARABLE", e.message ?: "安装包位置无法共享给安装器")
+            return
         }
         try {
             val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -195,6 +207,41 @@ class ApkInstallerPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (e: Exception) {
             invoke.reject("INSTALL_INTENT_FAILED", e.message ?: "调起安装器失败")
         }
+    }
+
+    private fun verifyApkMatchesSelf(apk: File): Boolean {
+        return try {
+            val pm = activity.packageManager
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                PackageManager.GET_SIGNING_CERTIFICATES
+            } else {
+                @Suppress("DEPRECATION")
+                PackageManager.GET_SIGNATURES
+            }
+            val selfInfo = pm.getPackageInfo(activity.packageName, flags)
+            val archInfo = pm.getPackageArchiveInfo(apk.absolutePath, flags) ?: return false
+            if (archInfo.packageName != activity.packageName) return false
+
+            val selfSigs = signingCertDigests(selfInfo)
+            val archSigs = signingCertDigests(archInfo)
+            selfSigs.isNotEmpty() && selfSigs == archSigs
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun signingCertDigests(info: android.content.pm.PackageInfo): Set<String> {
+        val sha256 = MessageDigest.getInstance("SHA-256")
+        val rawSigs: Array<android.content.pm.Signature> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val si = info.signingInfo ?: return emptySet()
+            if (si.hasMultipleSigners()) si.apkContentsSigners else si.signingCertificateHistory
+        } else {
+            @Suppress("DEPRECATION")
+            info.signatures ?: return emptySet()
+        } ?: return emptySet()
+        return rawSigs.map { sig ->
+            sha256.digest(sig.toByteArray()).joinToString("") { "%02x".format(it) }
+        }.toSet()
     }
 
     private fun canInstall(): Boolean = try {

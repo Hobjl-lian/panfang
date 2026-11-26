@@ -55,7 +55,7 @@ class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { err
             padding: '10px 24px',
             border: 0,
             borderRadius: 12,
-            background: '#4361EE',
+            background: 'var(--pf-primary-solid, #4361EE)',
             color: '#fff',
             fontSize: 'var(--pf-fs-14)',
             fontWeight: 600,

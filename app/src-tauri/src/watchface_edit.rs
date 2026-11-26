@@ -309,14 +309,14 @@ fn parse_widgets(d: &[u8], style: &StyleSection) -> Vec<WidgetInfo> {
     };
     for rec in watchface_bin::block_records(d, block.count, block.offset) {
         let off = rec.data_offset as usize;
-        if off + 4 > d.len() {
+        if off.checked_add(4).is_none_or(|e| e > d.len()) {
             continue;
         }
         let shape = d[off];
         let data_src = d[off + 1];
         let digits = d[off + 2];
         let flags = d[off + 3];
-        let (x, y) = if rec.data_len >= 0x18 {
+        let (x, y) = if rec.data_len >= 0x18 && off.checked_add(0x18).is_some_and(|e| e <= d.len()) {
             (
                 u16::from_le_bytes([d[off + 0x14], d[off + 0x15]]) as u32,
                 u16::from_le_bytes([d[off + 0x16], d[off + 0x17]]) as u32,

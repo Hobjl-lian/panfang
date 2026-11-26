@@ -75,14 +75,19 @@ async fn fetch_latest(base: &str) -> Result<Option<Value>, String> {
     Ok(Some(d))
 }
 
-/// 下载安装包用的客户端：超时放宽到 10 分钟。
-/// 付费链路的客户端是 120 秒总超时（含收完响应体），23MB 在弱网下会中途被打断。
+/// 下载安装包用的客户端：复用连接池，超时放宽到 10 分钟。
 fn http_download() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent("Panfang/0.2 (watchface-installer)")
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("创建下载客户端失败：{e}"))
+    static DL_CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    DL_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(concat!("Panfang/", env!("CARGO_PKG_VERSION"), " (watchface-installer)"))
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .map_err(|e| format!("创建下载客户端失败：{e}"))
+        })
+        .clone()
 }
 
 /// 安装包落盘的目录：内部 cacheDir（由插件给出）→ FileProvider 的 `<cache-path>` 正好覆盖它；
@@ -138,43 +143,68 @@ pub async fn app_update_check(
     Ok(out)
 }
 
-/// 下载最新版 APK 到 cacheDir（流式 + 进度事件 + sha256 校验），返回可交给安装器的路径。
+/// 下载最新版 APK 到 cacheDir（流式写盘 + 流式 sha256 校验，不整包攒内存），返回可交给安装器的路径。
 #[tauri::command]
 pub async fn app_update_download(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write as _;
+
     let base = crate::paid::service_base(&state)?;
     let d = fetch_latest(&base)
         .await?
         .ok_or_else(|| "服务端还没有发布过版本".to_string())?;
-    let url = d["url"].as_str().unwrap_or_default().to_string();
-    let want_sha = d["sha256"].as_str().unwrap_or_default().to_string();
+    let remote_name = d["version_name"].as_str().unwrap_or("").to_string();
+    let remote_code = d["version_code"].as_i64().unwrap_or(0);
+    let st = local_status(&app).unwrap_or_default();
+    if remote_name == LOCAL_VERSION || (remote_code <= st.version_code && !semver_gt(&remote_name, LOCAL_VERSION)) {
+        return Err("当前已是最新版本，无需下载".into());
+    }
+
+    let url = d["url"].as_str().unwrap_or_default().trim().to_string();
+    let want_sha = d["sha256"].as_str().unwrap_or_default().trim().to_ascii_lowercase();
     let total = d["size"].as_u64().unwrap_or(0);
     if url.is_empty() {
         return Err("更新信息缺少下载地址".into());
     }
+    if want_sha.len() != 64 || !want_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("更新信息缺少有效的校验指纹，已拒绝下载".into());
+    }
+    // 校验下载 URL 必须使用 https（调试态本地开发例外）且域名与授权服务同源
+    let parsed_url = url::Url::parse(&url).map_err(|_| "更新下载地址格式非法".to_string())?;
+    let parsed_base = url::Url::parse(&base).map_err(|_| "服务地址格式非法".to_string())?;
+    if cfg!(not(debug_assertions)) && parsed_url.scheme() != "https" {
+        return Err("安全限制：仅允许通过 HTTPS 下载更新包".into());
+    }
+    if parsed_url.host_str() != parsed_base.host_str() {
+        return Err("安全限制：更新包域名与官方服务不一致".into());
+    }
 
-    // 下载目录：优先内部 cacheDir（FileProvider 的 <cache-path> 覆盖它），
-    // 拿不到才退回 Tauri 的 cache_dir()（安卓上是外部 cache，安装时插件会兜底复制）
     let dir = download_dir(&app).join("updates");
     std::fs::create_dir_all(&dir).map_err(|e| format!("建缓存目录失败：{e}"))?;
-    // 清掉上一次下载留下的包（一个 23MB，不清理会一直堆在缓存里）
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("apk") {
+            if p.extension().and_then(|s| s.to_str()) == Some("apk")
+                || p.extension().and_then(|s| s.to_str()) == Some("part")
+            {
                 let _ = std::fs::remove_file(p);
             }
         }
     }
-    let file_name = url
+    let raw_name = url
         .rsplit('/')
         .next()
         .filter(|s| !s.is_empty() && s.ends_with(".apk"))
-        .unwrap_or("panfang-update.apk")
-        .to_string();
+        .unwrap_or("panfang-update.apk");
+    let file_name: String = raw_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
     let path = dir.join(&file_name);
+    let tmp_path = dir.join(format!("{file_name}.part"));
 
     let mut resp = http_download()?
         .get(&url)
@@ -185,33 +215,49 @@ pub async fn app_update_download(
         return Err(format!("下载安装包失败（HTTP {}）", resp.status().as_u16()));
     }
 
-    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    let mut file = std::fs::File::create(&tmp_path).map_err(|e| format!("创建临时包失败：{e}"))?;
+    let mut hasher = Sha256::new();
+    let mut received: u64 = 0;
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|_| "下载中断，请重试".to_string())?
+        .map_err(|_| {
+            let _ = std::fs::remove_file(&tmp_path);
+            "下载中断，请重试".to_string()
+        })?
     {
-        buf.extend_from_slice(&chunk);
+        if let Err(e) = file.write_all(&chunk) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("写入安装包失败：{e}"));
+        }
+        hasher.update(&chunk);
+        received += chunk.len() as u64;
         let percent = if total > 0 {
-            ((buf.len() as f64 / total as f64) * 100.0).min(100.0).round() as u64
+            ((received as f64 / total as f64) * 100.0).min(100.0).round() as u64
         } else {
             0
         };
         let _ = app.emit(
             PROGRESS_EVENT,
-            json!({ "sent": buf.len(), "total": total, "percent": percent }),
+            json!({ "sent": received, "total": total, "percent": percent }),
         );
     }
+    let _ = file.sync_all();
+    drop(file);
 
-    if !want_sha.is_empty() && crate::paid::sha256_hex(&buf) != want_sha {
-        let _ = std::fs::remove_file(&path);
+    let got_sha = hex::encode(hasher.finalize());
+    if got_sha != want_sha {
+        let _ = std::fs::remove_file(&tmp_path);
         return Err("安装包校验失败（下载内容与服务端不一致），请重试".into());
     }
-    std::fs::write(&path, &buf).map_err(|e| format!("保存安装包失败：{e}"))?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("保存安装包失败：{e}")
+    })?;
     Ok(json!({
         "path": path.to_string_lossy(),
         "version_name": d["version_name"].clone(),
-        "size": buf.len(),
+        "size": received,
     }))
 }
 
@@ -225,12 +271,23 @@ pub async fn app_update_install(app: tauri::AppHandle, path: String) -> Result<V
     #[cfg(target_os = "android")]
     {
         use apkinstaller::ApkInstallerExt;
+        let updates_dir = download_dir(&app).join("updates");
+        let root_canon = std::fs::canonicalize(&updates_dir)
+            .map_err(|_| "更新包目录不存在，请重新下载".to_string())?;
+        let target_canon = std::fs::canonicalize(&path)
+            .map_err(|_| "安装包不存在，请重新下载".to_string())?;
+        if !target_canon.starts_with(&root_canon)
+            || target_canon.extension().and_then(|s| s.to_str()) != Some("apk")
+        {
+            return Err("安全限制：非法的安装包路径".into());
+        }
         let st = local_status(&app).unwrap_or_default();
         if !st.can_install {
             let _ = app.apk_installer().open_install_settings();
             return Ok(json!({ "needs_permission": true }));
         }
-        app.apk_installer().install(&path)?;
+        app.apk_installer()
+            .install(&target_canon.to_string_lossy())?;
         Ok(json!({ "launched": true }))
     }
     #[cfg(not(target_os = "android"))]

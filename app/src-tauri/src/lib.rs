@@ -29,10 +29,16 @@ pub fn run() {
             use tauri::Manager;
 
             // 日志：安卓 → logcat（adb 实时可读）；桌面 → 应用数据目录文件
-            #[cfg(target_os = "android")]
+            #[cfg(all(target_os = "android", debug_assertions))]
             android_logger::init_once(
                 android_logger::Config::default()
                     .with_max_level(log::LevelFilter::Debug)
+                    .with_tag("WFInstaller"),
+            );
+            #[cfg(all(target_os = "android", not(debug_assertions)))]
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_max_level(log::LevelFilter::Info)
                     .with_tag("WFInstaller"),
             );
             #[cfg(not(target_os = "android"))]
@@ -172,6 +178,7 @@ pub fn run() {
             bridge::watchface_album_get,
             bridge::watchface_archive_list,
             bridge::watchface_archive_get,
+            bridge::watchface_archive_photo_flags,
             bridge::open_external,
             bridge::app_version,
             bridge::watchface_photos_load,
@@ -197,6 +204,7 @@ pub fn run() {
             video::video_project_create,
             video::video_project_list,
             video::video_project_get,
+            video::video_project_install,
             video::video_project_clear,
             video::video_project_delete,
             video::video_project_update_meta,

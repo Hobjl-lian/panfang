@@ -57,6 +57,13 @@ class ConnKeepPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun start(invoke: Invoke) {
         val args = invoke.parseArgs(StartArg::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ContextCompat.checkSelfPermission(activity, Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            invoke.reject("BT_PERMISSION_MISSING", "缺少蓝牙连接权限，无法启动前台保活服务")
+            return
+        }
         val intent = Intent(activity, ConnKeepService::class.java).apply {
             putExtra(ConnKeepService.EXTRA_NAME, args.name)
             putExtra("device_addr", args.addr)
@@ -165,13 +172,17 @@ class ConnKeepPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(ret)
     }
 
-    /** Android 12 以下没有 BLUETOOTH_SCAN/CONNECT；那套系统上 SPP 连接不需要运行时权限。 */
+    /** Android 12+ 需要 BLUETOOTH_SCAN / CONNECT；Android 6~11 BLE 扫描需要 ACCESS_FINE_LOCATION。 */
     private fun missingBtPermissions(): Array<String> {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptyArray()
-        return listOf(
-            Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.BLUETOOTH_CONNECT
-        ).filter {
+        val req = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            listOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+            )
+        } else {
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        return req.filter {
             ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
         }.toTypedArray()
     }

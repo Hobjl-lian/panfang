@@ -92,12 +92,18 @@ class ConnKeepService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val name = intent?.getStringExtra(EXTRA_NAME)?.trim().orEmpty().ifEmpty { "手环" }
         val notification = build(this, "$name · 已连接")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(NOTIF_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+            running = true
+        } catch (e: SecurityException) {
+            android.util.Log.w("ConnKeep", "startForeground 缺少权限: ${e.message}")
+            running = false
+            stopSelf()
         }
-        running = true
         // 不自愈重启：连接状态在 Rust 侧，服务被系统单独重启只会变成一条没有连接的假通知
         return START_NOT_STICKY
     }

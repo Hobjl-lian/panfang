@@ -193,7 +193,10 @@ pub(crate) async fn await_oneshot<T, E: std::fmt::Display>(
     rx: tokio::sync::oneshot::Receiver<Result<T, E>>,
     missing: &'static str,
 ) -> anyhow::Result<T> {
-    let r = rx.await.map_err(|_| anyhow::anyhow!(missing))?;
+    let r = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("设备响应超时，请确认手环在附近并保持连接"))?
+        .map_err(|_| anyhow::anyhow!(missing))?;
     r.map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -1302,7 +1305,9 @@ pub(crate) async fn install_file_bytes_id(
         }
     });
 
-    let result = install_future.await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(600), install_future)
+        .await
+        .map_err(|_| "表盘传输超时，请确认手环电量与连接后重试".to_string())?;
     if let Some(profiler) = transport_profiler.as_ref() {
         let report = profiler.stop();
         record_transport_profile(&report, profile_file_len, result.is_ok());
@@ -1483,35 +1488,30 @@ pub async fn watchface_archive_list(
     Ok(out)
 }
 
-/// 留档字节（编辑页入口：直接拿它进编辑页，不用用户再选文件）
+/// 留档元数据（不再把解密后的明文 .bin 经 IPC 吐给 WebView，防止被注入/调试直接导出原件）
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveData {
     pub id: String,
     pub ext: String,
     pub size: u64,
-    pub data_b64: String,
 }
 
-/// 读某个表的留档字节（编辑页的入口：不用再让用户选一次 .bin）
-#[tauri::command]
-pub async fn watchface_archive_get(
-    app: tauri::AppHandle,
-    addr: String,
-    face_id: String,
-) -> Result<ArchiveData, String> {
-    use base64::Engine as _;
-    let dir = archive_dir(&app, &addr).map_err(|e| e.to_string())?;
-    // 逐个扩展名找（.bin / .mwz / .rpk）
+/// 在 Rust 侧解密指定设备的留档 `.bin` 字节（仅内部命令消费，不跨 IPC 暴露给 JS）。
+pub(crate) fn read_archive_plain(
+    app: &tauri::AppHandle,
+    addr: &str,
+    face_id: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let dir = archive_dir(app, addr).map_err(|e| e.to_string())?;
     let mut hit = None;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let p = e.path();
-            // `<id>.lua` 是 Lua 表盘标记（空文件），不是留档本体
             if p.extension().and_then(|s| s.to_str()) == Some("lua") {
                 continue;
             }
-            if p.file_stem().and_then(|s| s.to_str()) == Some(face_id.as_str()) {
+            if p.file_stem().and_then(|s| s.to_str()) == Some(face_id) {
                 hit = Some(p);
                 break;
             }
@@ -1521,22 +1521,23 @@ pub async fn watchface_archive_get(
         format!("本地没有 {face_id} 的留档（该表盘不是通过本应用安装的，请用「选择 .bin 文件」打开它）")
     })?;
     let raw = std::fs::read(&path).map_err(|e| format!("读取留档失败: {e}"))?;
-    // 留档是密文（付费包必须不落明文）→ 读出来在内存里解密；老版本明文留档自动兼容
     let was_plain = !crate::paid::is_sealed(&raw);
-    let bytes = match paid_dir(&app).and_then(|d| crate::paid::open_archive(&d, &raw).map_err(|e| e)) {
+    let bytes = match paid_dir(app).and_then(|d| crate::paid::open_archive(&d, &raw)) {
         Ok(v) => v,
         Err(e) => {
             log::warn!("[archive] 留档解密失败 {}: {e:#}", path.display());
             return Err("本地留档无法解密（通常是重装过应用）。到「我的表盘」或「本地表盘安装」重装一次这个表盘，之后就能编辑了".into());
         }
     };
-    // 加密前的老版本留下的是明文 .bin（手机里躺着可直接拷走的素材）→ 顺手升级成密文
     if was_plain {
-        match paid_dir(&app).and_then(|d| crate::paid::seal_archive(&d, &bytes)) {
-            Ok(sealed) => match std::fs::write(&path, &sealed) {
-                Ok(_) => log::info!("[archive] 明文留档已升级为密文 {}", path.display()),
-                Err(e) => log::warn!("[archive] 留档回写失败（仍是明文）{}: {e}", path.display()),
-            },
+        match paid_dir(app).and_then(|d| crate::paid::seal_archive(&d, &bytes)) {
+            Ok(sealed) => {
+                if let Err(e) = crate::paid::atomic_write(&path, &sealed) {
+                    log::warn!("[archive] 留档回写失败（仍是明文）{}: {e}", path.display());
+                } else {
+                    log::info!("[archive] 明文留档已升级为密文 {}", path.display());
+                }
+            }
             Err(e) => log::warn!("[archive] 留档升级加密失败（仍是明文）{}: {e:#}", path.display()),
         }
     }
@@ -1545,12 +1546,50 @@ pub async fn watchface_archive_get(
         .and_then(|s| s.to_str())
         .unwrap_or("bin")
         .to_string();
-    log::info!("[archive] 载入留档 {} ({} 字节，已解密)", path.display(), bytes.len());
+    Ok((bytes, ext))
+}
+
+/// 批量探测留档表盘是否为「照片表盘」（Rust 内存完成解密与模型判定，不把明文送进 WebView）
+#[tauri::command]
+pub async fn watchface_archive_photo_flags(
+    app: tauri::AppHandle,
+    addr: String,
+    face_ids: Vec<String>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = std::collections::HashMap::new();
+        for fid in face_ids {
+            let is_photo = match read_archive_plain(&app, &addr, &fid) {
+                Ok((bytes, _)) => crate::watchface_render::derive_model(&bytes, None)
+                    .map(|m| m.photo_album)
+                    .unwrap_or(false),
+                Err(_) => false,
+            };
+            out.insert(fid, is_photo);
+        }
+        out
+    })
+    .await
+    .map_err(|e| format!("探测任务失败: {e}"))
+}
+
+/// 校验并确认留档存在（返回元信息，不返明文字节）
+#[tauri::command]
+pub async fn watchface_archive_get(
+    app: tauri::AppHandle,
+    addr: String,
+    face_id: String,
+) -> Result<ArchiveData, String> {
+    let id_out = face_id.clone();
+    let (bytes, ext) = tauri::async_runtime::spawn_blocking(move || {
+        read_archive_plain(&app, &addr, &face_id)
+    })
+    .await
+    .map_err(|e| format!("读取留档任务失败: {e}"))??;
     Ok(ArchiveData {
-        id: face_id,
+        id: id_out,
         ext,
         size: bytes.len() as u64,
-        data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
     })
 }
 
@@ -1891,16 +1930,15 @@ pub async fn watchface_photos_load(
     Ok(list)
 }
 
-/// 覆盖保存本地相册存档
+/// 覆盖保存本地相册存档（仅写 index.json，避免同时写冗余的 NNNN.png 造成双倍存储膨胀）
 #[tauri::command]
 pub async fn watchface_photos_save(
     app: tauri::AppHandle,
     face_id: String,
     photos: Vec<SavedPhoto>,
 ) -> Result<(), String> {
-    use base64::Engine as _;
     let dir = photos_dir(&app, &face_id).map_err(|e| e.to_string())?;
-    // 清掉旧的 png（数量可能变少），再写新的
+    // 清理历史版本留下的冗余 .png 文件
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let p = e.path();
@@ -1909,13 +1947,9 @@ pub async fn watchface_photos_save(
             }
         }
     }
-    for (i, ph) in photos.iter().enumerate() {
-        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&ph.b64) {
-            let _ = std::fs::write(dir.join(format!("{i:04}.png")), bytes);
-        }
-    }
     let text = serde_json::to_string_pretty(&photos).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("index.json"), text).map_err(|e| e.to_string())?;
+    crate::paid::atomic_write(&dir.join("index.json"), text.as_bytes())
+        .map_err(|e| e.to_string())?;
     log::info!("[photos] 保存本地相册 {} 张（{face_id}）", photos.len());
     Ok(())
 }

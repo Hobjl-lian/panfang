@@ -1,11 +1,21 @@
 //! 表盘 .bin 解包/预览的前端命令（与 `watchface_bin` 模块配套）。
 //!
-//! 传输约定沿用安装功能：前端读文件 → base64 → invoke（避免安卓 content:// 路径问题）。
+//! 安全性原则：设备留档和视频成品在 Rust 内存内解密与缓存（只传不透明引用给前端），
+//! 不跨 IPC 返回明文 `.bin`；仅用户本地自选未加密文件时才接受 `data_b64`。
 
 use base64::Engine;
+use parking_lot::Mutex;
 use serde::Serialize;
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
 
 use crate::watchface_bin;
+
+static BIN_CACHE: OnceLock<Mutex<VecDeque<(String, Arc<Vec<u8>>)>>> = OnceLock::new();
+
+fn bin_cache() -> &'static Mutex<VecDeque<(String, Arc<Vec<u8>>)>> {
+    BIN_CACHE.get_or_init(|| Mutex::new(VecDeque::with_capacity(2)))
+}
 
 fn decode_b64(data_b64: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = data_b64
@@ -17,10 +27,89 @@ fn decode_b64(data_b64: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("base64 解码失败: {e}"))
 }
 
+fn resolve_bin_bytes(
+    app: &tauri::AppHandle,
+    state: &crate::bridge::AppState,
+    data_b64: Option<String>,
+    archive_addr: Option<String>,
+    archive_face_id: Option<String>,
+    video_project_id: Option<String>,
+) -> Result<Arc<Vec<u8>>, String> {
+    if let (Some(addr), Some(fid)) = (
+        archive_addr.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        archive_face_id.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        let key = format!("archive:{addr}:{fid}");
+        {
+            let cache = bin_cache().lock();
+            if let Some((_, hit)) = cache.iter().find(|(k, _)| k == &key) {
+                return Ok(hit.clone());
+            }
+        }
+        let (bytes, _) = crate::bridge::read_archive_plain(app, addr, fid)?;
+        let arc = Arc::new(bytes);
+        let mut cache = bin_cache().lock();
+        cache.retain(|(k, _)| k != &key);
+        if cache.len() >= 2 {
+            cache.pop_front();
+        }
+        cache.push_back((key, arc.clone()));
+        return Ok(arc);
+    }
+    if let Some(pid) = video_project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let key = format!("video:{pid}");
+        {
+            let cache = bin_cache().lock();
+            if let Some((_, hit)) = cache.iter().find(|(k, _)| k == &key) {
+                return Ok(hit.clone());
+            }
+        }
+        let bytes = crate::video::read_video_project_bin(state, pid)?;
+        let arc = Arc::new(bytes);
+        let mut cache = bin_cache().lock();
+        cache.retain(|(k, _)| k != &key);
+        if cache.len() >= 2 {
+            cache.pop_front();
+        }
+        cache.push_back((key, arc.clone()));
+        return Ok(arc);
+    }
+    let b64 = data_b64
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "缺少表盘数据源".to_string())?;
+    Ok(Arc::new(decode_b64(&b64)?))
+}
+
+fn decode_photo_checked(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let dims = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("照片格式不可读: {e}"))?
+        .into_dimensions()
+        .map_err(|e| format!("照片解码失败: {e}"))?;
+    if dims.0 > 12_000 || dims.1 > 12_000 || (dims.0 as u64 * dims.1 as u64) > 24_000_000 {
+        return Err("照片分辨率过高，请裁切或换一张再试".into());
+    }
+    let im = image::load_from_memory(bytes).map_err(|e| format!("照片解码失败: {e}"))?;
+    let rgba = im.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Ok((rgba.into_raw(), w, h))
+}
+
 /// 解析 .bin 摘要：头部信息 + 每样式元数据 + 预览图 PNG
 #[tauri::command]
-pub async fn watchface_bin_inspect(data_b64: String) -> Result<watchface_bin::BinSummary, String> {
-    let data = decode_b64(&data_b64)?;
+pub async fn watchface_bin_inspect(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::bridge::AppState>,
+    data_b64: Option<String>,
+    archive_addr: Option<String>,
+    archive_face_id: Option<String>,
+    video_project_id: Option<String>,
+) -> Result<watchface_bin::BinSummary, String> {
+    let data = resolve_bin_bytes(&app, &state, data_b64, archive_addr, archive_face_id, video_project_id)?;
     tauri::async_runtime::spawn_blocking(move || watchface_bin::inspect(&data))
         .await
         .map_err(|e| format!("解析任务失败: {e}"))?
@@ -100,10 +189,15 @@ pub async fn watchface_edit_model(
 /// 图层模型（对齐 AstroBox 反编译产物结构）：主题/图层/槽位/组件/数据项/图片组
 #[tauri::command]
 pub async fn watchface_layer_model(
-    data_b64: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::bridge::AppState>,
+    data_b64: Option<String>,
+    archive_addr: Option<String>,
+    archive_face_id: Option<String>,
+    video_project_id: Option<String>,
     device_model: Option<String>,
 ) -> Result<crate::watchface_render::LayerModelDoc, String> {
-    let data = decode_b64(&data_b64)?;
+    let data = resolve_bin_bytes(&app, &state, data_b64, archive_addr, archive_face_id, video_project_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         crate::watchface_render::derive_model(&data, device_model.as_deref())
     })
@@ -117,26 +211,23 @@ pub async fn watchface_layer_model(
 /// `slot_choices`：可编辑容器的选择（槽位序号 → 动作序号）；不传则每槽取第一个候选。
 #[tauri::command]
 pub async fn watchface_compose_photo(
-    data_b64: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::bridge::AppState>,
+    data_b64: Option<String>,
+    archive_addr: Option<String>,
+    archive_face_id: Option<String>,
+    video_project_id: Option<String>,
     theme_index: Option<usize>,
     photo_b64: String,
     photo_transform: Option<crate::watchface_render::PhotoTransform>,
     device_model: Option<String>,
 ) -> Result<String, String> {
-    let data = decode_b64(&data_b64)?;
+    let data = resolve_bin_bytes(&app, &state, data_b64, archive_addr, archive_face_id, video_project_id)?;
     let photo = decode_b64(&photo_b64)?;
     let theme_index = theme_index.unwrap_or(0);
     tauri::async_runtime::spawn_blocking(move || {
         let model = crate::watchface_render::derive_model(&data, device_model.as_deref())?;
-        let photo_decoded = image::load_from_memory(&photo)
-            .map_err(|e| anyhow::anyhow!("照片解码失败: {e}"))
-            .ok()
-            .map(|im| {
-                let rgba = im.to_rgba8();
-                let (w, h) = rgba.dimensions();
-                (rgba.into_raw(), w, h)
-            })
-            .ok_or_else(|| anyhow::anyhow!("照片解码失败"))?;
+        let photo_decoded = decode_photo_checked(&photo).map_err(|e| anyhow::anyhow!(e))?;
         let (rgba, w, h) = crate::watchface_render::compose_photo_canvas(
             &data,
             &model,
@@ -157,12 +248,17 @@ pub async fn watchface_compose_photo(
 /// 只画背景层、不画表盘元素；多配色表盘按 `color_group` 取对应配色。
 #[tauri::command]
 pub async fn watchface_default_wallpaper(
-    data_b64: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::bridge::AppState>,
+    data_b64: Option<String>,
+    archive_addr: Option<String>,
+    archive_face_id: Option<String>,
+    video_project_id: Option<String>,
     theme_index: Option<usize>,
     device_model: Option<String>,
     color_group: Option<u32>,
 ) -> Result<String, String> {
-    let data = decode_b64(&data_b64)?;
+    let data = resolve_bin_bytes(&app, &state, data_b64, archive_addr, archive_face_id, video_project_id)?;
     let theme_index = theme_index.unwrap_or(0);
     tauri::async_runtime::spawn_blocking(move || {
         let model = crate::watchface_render::derive_model(&data, device_model.as_deref())?;
@@ -185,7 +281,12 @@ pub async fn watchface_default_wallpaper(
 /// `color_group`：多配色表盘选第几套配色（0 起；不传 = 0）。
 #[tauri::command]
 pub async fn watchface_render_preview(
-    data_b64: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::bridge::AppState>,
+    data_b64: Option<String>,
+    archive_addr: Option<String>,
+    archive_face_id: Option<String>,
+    video_project_id: Option<String>,
     theme_index: Option<usize>,
     photo_b64: Option<String>,
     device_model: Option<String>,
@@ -193,7 +294,7 @@ pub async fn watchface_render_preview(
     photo_transform: Option<crate::watchface_render::PhotoTransform>,
     color_group: Option<u32>,
 ) -> Result<String, String> {
-    let data = decode_b64(&data_b64)?;
+    let data = resolve_bin_bytes(&app, &state, data_b64, archive_addr, archive_face_id, video_project_id)?;
     let photo = match photo_b64 {
         Some(p) if !p.is_empty() => Some(decode_b64(&p)?),
         _ => None,
@@ -201,16 +302,10 @@ pub async fn watchface_render_preview(
     let theme_index = theme_index.unwrap_or(0);
     tauri::async_runtime::spawn_blocking(move || {
         let model = crate::watchface_render::derive_model(&data, device_model.as_deref())?;
-        // 照片：解析 PNG/JPEG 尺寸（image crate）
-        let photo_decoded = photo.and_then(|bytes| {
-            image::load_from_memory(&bytes)
-                .ok()
-                .map(|im| {
-                    let rgba = im.to_rgba8();
-                    let (w, h) = rgba.dimensions();
-                    (rgba.into_raw(), w, h)
-                })
-        });
+        let photo_decoded = match photo {
+            Some(bytes) => Some(decode_photo_checked(&bytes).map_err(|e| anyhow::anyhow!(e))?),
+            None => None,
+        };
         let opts = crate::watchface_render::RenderOpts {
             photo: photo_decoded.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h)),
             photo_transform,

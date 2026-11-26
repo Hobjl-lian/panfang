@@ -113,10 +113,29 @@ fn now_ts() -> i64 {
 }
 
 fn load_store(app: &AppHandle) -> OpenIdStore {
-    store_path(app)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        return OpenIdStore::default();
+    };
+    let Some(path) = store_path(app) else {
+        return OpenIdStore::default();
+    };
+    let Ok(raw) = std::fs::read(&path) else {
+        return OpenIdStore::default();
+    };
+    let was_plain = !crate::paid::is_sealed(&raw);
+    let paid_dir = crate::paid::paid_dir(&app_dir);
+    let Ok(plain) = crate::paid::open_archive(&paid_dir, &raw) else {
+        return OpenIdStore::default();
+    };
+    let Ok(store) = serde_json::from_slice::<OpenIdStore>(&plain) else {
+        return OpenIdStore::default();
+    };
+    if was_plain {
+        if let Ok(sealed) = crate::paid::seal_archive(&paid_dir, &plain) {
+            let _ = crate::paid::atomic_write(&path, &sealed);
+        }
+    }
+    store
 }
 
 fn record_of(app: &AppHandle, addr: &str) -> DeviceRecord {
@@ -134,16 +153,18 @@ pub fn stored_open_id(app: &AppHandle, addr: &str) -> String {
 }
 
 fn save_record(app: &AppHandle, addr: &str, rec: DeviceRecord) {
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        return;
+    };
     let Some(path) = store_path(app) else { return };
     let mut store = load_store(app);
     store
         .map
         .insert(norm_addr(addr), RecordCompat::Full(rec));
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(&store) {
-        let _ = std::fs::write(path, text);
+    if let Ok(plain) = serde_json::to_vec_pretty(&store) {
+        let paid_dir = crate::paid::paid_dir(&app_dir);
+        let data = crate::paid::seal_archive(&paid_dir, &plain).unwrap_or(plain);
+        let _ = crate::paid::atomic_write(&path, &data);
     }
 }
 
@@ -254,7 +275,7 @@ pub struct WatchBindInfo {
 async fn transport_connect(addr: &str, ct: ConnectType) -> Result<(), String> {
     let addr_owned = addr.to_string();
     let display_addr = addr.to_string();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    let fut = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let iface = bt().map_err(|e| e.to_string())?;
         // Some(false)=保留已有配对直接连接
         iface.connect(addr_owned, ct, vec![], Some(false)).map_err(|e| match e {
@@ -269,9 +290,11 @@ async fn transport_connect(addr: &str, ct: ConnectType) -> Result<(), String> {
             ),
             other => format!("蓝牙连接失败（{display_addr}）：{other}"),
         })
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    });
+    tokio::time::timeout(Duration::from_secs(20), fut)
+        .await
+        .map_err(|_| format!("连接手表超时（{addr}），请确认手表在附近并重新尝试"))?
+        .map_err(|e| e.to_string())?
 }
 
 async fn transport_close(addr: &str) {

@@ -70,7 +70,7 @@
   --pf-bd-20: rgba(0, 0, 0, 0.2);
   --pf-bd-white-60: rgba(255, 255, 255, 0.6);
 
-  /* 顶栏着色渐变（Miuix barTintBrush：强端 0.9，弱端同色 0）+ 0.5px 发丝线 */
+  /* 顶栏着色保留供其它位置或备用 */
   --pf-page-veil: rgba(245, 246, 249, 0.9);
   --pf-page-veil-0: rgba(245, 246, 249, 0);
   --pf-hairline: rgba(0, 0, 0, 0.1);
@@ -112,6 +112,13 @@
   --pf-mask-soft: rgba(0, 0, 0, 0.3);
   --pf-inverse: #0c0d0e;
   --pf-inverse-ink: #ffffff;
+  --pf-badge-dark: #1f242c;
+  --pf-track-dim: rgba(255, 255, 255, 0.25);
+  --pf-xiaomi-10: rgba(255, 105, 0, 0.1);
+  --pf-xiaomi-15: rgba(255, 105, 0, 0.15);
+  --pf-xiaomi-ink: #ff6900;
+  --pf-ok-12: rgba(22, 163, 74, 0.12);
+  --pf-ok-15: rgba(22, 163, 74, 0.15);
 }
 
 [data-theme="dark"] {
@@ -169,7 +176,7 @@
   --pf-bd-20: rgba(255, 255, 255, 0.2);
   --pf-bd-white-60: rgba(255, 255, 255, 0.12);
 
-  /* 顶栏着色渐变（深色同样 0.9 → 同色 0） */
+  /* 顶栏着色保留供其它位置或备用 */
   --pf-page-veil: rgba(14, 16, 20, 0.9);
   --pf-page-veil-0: rgba(14, 16, 20, 0);
   --pf-hairline: rgba(255, 255, 255, 0.1);
@@ -207,6 +214,13 @@
   --pf-mask-soft: rgba(0, 0, 0, 0.45);
   --pf-inverse: #f2f4f7;
   --pf-inverse-ink: #101318;
+  --pf-badge-dark: #252b36;
+  --pf-track-dim: rgba(255, 255, 255, 0.28);
+  --pf-xiaomi-10: rgba(255, 128, 36, 0.14);
+  --pf-xiaomi-15: rgba(255, 128, 36, 0.2);
+  --pf-xiaomi-ink: #ff8b3d;
+  --pf-ok-12: rgba(52, 211, 153, 0.14);
+  --pf-ok-15: rgba(52, 211, 153, 0.2);
 }
 
 html {

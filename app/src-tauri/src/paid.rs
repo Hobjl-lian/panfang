@@ -50,13 +50,35 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-/// 与授权服务通信用的 HTTP 客户端（付费链路与 App 自更新共用）。
+/// 原子写文件（同目录写 `.tmp` → `sync_all` → `rename`），防止移动端强杀/断电截断半截 JSON 或密文。
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|s| s.to_str()).unwrap_or("dat")
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        let _ = f.sync_all();
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// 与授权服务通信用的 HTTP 客户端（付费链路与 App 自更新共用连接池）。
 pub(crate) fn http() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent("Panfang/0.2 (watchface-installer)")
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .context("创建 HTTP 客户端失败")
+    static CLIENT: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
+    let res = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(concat!("Panfang/", env!("CARGO_PKG_VERSION"), " (watchface-installer)"))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))
+    });
+    res.as_ref().cloned().map_err(|e| anyhow!("{e}"))
 }
 
 // ---------------------------------------------------------------- 登录态
@@ -133,6 +155,7 @@ impl Ctx {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            .filter(|s| cfg!(debug_assertions) || s.starts_with("https://"))
             .unwrap_or_else(|| DEFAULT_BASE.to_string());
 
         let mut ctx = Self {
@@ -179,7 +202,7 @@ impl Ctx {
                 .encrypt(Nonce::from_slice(&nonce), Payload { msg: &plain, aad: &[] })
                 .map_err(|_| anyhow!("登录态加密失败"))?,
         );
-        std::fs::write(self.dir.join("session.enc"), out)?;
+        atomic_write(&self.dir.join("session.enc"), &out)?;
         self.session = Some(s);
         Ok(())
     }
@@ -351,7 +374,7 @@ fn save_install(dir: &Path, rec: InstallRecord) {
     all.retain(|r| !(r.product_id == rec.product_id && r.variant_id == rec.variant_id));
     all.push(rec);
     if let Ok(b) = serde_json::to_vec_pretty(&all) {
-        let _ = std::fs::write(installs_path(dir), b);
+        let _ = atomic_write(&installs_path(dir), &b);
     }
 }
 
@@ -496,12 +519,16 @@ pub async fn manifest(base: &str, token: &str, product_id: &str, variant_id: &st
 }
 
 fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u32 as u8),
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// 设备密钥解包 + 内存解密（返回明文 + 与服务端一致的哈希校验）
@@ -755,13 +782,14 @@ pub async fn paid_set_base(state: tauri::State<'_, AppState>, base: String) -> R
     .map_err(|e| e.to_string())
 }
 
-/// 绑定（当前为联调模式；爱发电审批后此处改为打开授权页 + 回调换绑）
+/// 绑定（仅开发联调模式可用；正式包禁用）
 #[tauri::command]
 pub async fn paid_bind(
     state: tauri::State<'_, AppState>,
     mi_user_id: String,
     device_name: Option<String>,
 ) -> Result<Value, String> {
+    crate::dev_only("联调绑定")?;
     // 没显式给 UID 就用当前登录的小米账号；vivo 用户没有小米账号时用本机稳定主体键
     let mi_user_id = if mi_user_id.trim().is_empty() {
         current_subject_id(&state)?
@@ -849,7 +877,12 @@ pub async fn bind_oauth_start(
 
 /// GET /v1/afdian/oauth/poll?state=… —— 用户在浏览器里授权完没有
 pub async fn bind_oauth_poll(base: &str, state: &str) -> Result<Value> {
-    let v = get_json(base, &format!("/v1/afdian/oauth/poll?state={state}"), None).await?;
+    let v = get_json(
+        base,
+        &format!("/v1/afdian/oauth/poll?state={}", urlencode(state)),
+        None,
+    )
+    .await?;
     Ok(v)
 }
 

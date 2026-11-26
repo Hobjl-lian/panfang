@@ -177,9 +177,19 @@ async fn get_source_list_call(token: &MiAccountToken) -> anyhow::Result<LenientD
         token.c_user_id, token.service_token
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent(LOGIN_UA)
-        .build()?;
+    static MI_HTTP: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    let client = MI_HTTP
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(LOGIN_UA)
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))
+        })
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .clone();
     let resp = client
         .post(format!("https://hlth.io.mi.com{PATH}"))
         .header("Cookie", cookie_header)
@@ -202,7 +212,7 @@ async fn get_source_list_call(token: &MiAccountToken) -> anyhow::Result<LenientD
     let json = String::from_utf8_lossy(&decrypted).into_owned();
 
     let parsed: LenientDeviceList = serde_json::from_str(&json)
-        .with_context(|| format!("解析设备列表失败: {json}"))?;
+        .context("解析设备列表失败（服务端返回格式异常）")?;
     Ok(parsed)
 }
 
@@ -431,7 +441,7 @@ fn spawn_2fa_auto_complete(app: tauri::AppHandle, browser_id: u32) {
     tauri::async_runtime::spawn(async move {
         use inappbrowser::InappbrowserExt;
         let hit = app.inappbrowser().wait_for_intercept(browser_id, None).await;
-        let url = match hit {
+        let _url = match hit {
             Ok(url) => url,
             Err(e) => {
                 log::warn!("[2fa] 未命中拦截（{e}）→ 提示用户重新验证");
@@ -439,7 +449,7 @@ fn spawn_2fa_auto_complete(app: tauri::AppHandle, browser_id: u32) {
                 return;
             }
         };
-        log::info!("[2fa] 拦截命中，自动收尾：{url}");
+        log::info!("[2fa] 拦截命中，自动收尾");
         emit(&app, "verifying", "验证通过，正在完成登录…", None);
         // close_on_intercept 会立刻关窗；给原生层一点时间把会话 cookie 落盘
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -499,7 +509,6 @@ fn spawn_2fa_auto_complete_desktop(app: tauri::AppHandle) {
 fn collect_webview_cookies(
     window: &tauri::WebviewWindow,
 ) -> Result<String, String> {
-    use tauri::Manager;
     let mut pairs: Vec<(String, String)> = Vec::new();
     for url_text in [
         "https://account.xiaomi.com/pass/serviceLoginAuth2",
@@ -657,6 +666,7 @@ async fn finalize_2fa_session(
     ));
     let client = reqwest::Client::builder()
         .user_agent(LOGIN_UA)
+        .timeout(std::time::Duration::from_secs(30))
         .cookie_provider(cookie_store.clone())
         .build()?;
 
@@ -790,20 +800,35 @@ fn token_file_path(state: &State<'_, crate::bridge::AppState>) -> Option<PathBuf
 }
 
 fn save_token_file(state: &State<'_, crate::bridge::AppState>, token: &MiAccountToken) {
-    if let Some(path) = token_file_path(state) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string(token) {
-            let _ = std::fs::write(&path, json);
-        }
-    }
+    let Some(dir) = state.app_data_dir.as_ref() else {
+        return;
+    };
+    let Some(path) = token_file_path(state) else {
+        return;
+    };
+    let Ok(plain) = serde_json::to_vec(token) else {
+        return;
+    };
+    let paid_dir = crate::paid::paid_dir(dir);
+    let data = crate::paid::seal_archive(&paid_dir, &plain).unwrap_or(plain);
+    let _ = crate::paid::atomic_write(&path, &data);
 }
 
 fn load_token_file(state: &State<'_, crate::bridge::AppState>) -> Option<MiAccountToken> {
+    let dir = state.app_data_dir.as_ref()?;
     let path = token_file_path(state)?;
-    let json = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&json).ok()
+    let raw = std::fs::read(&path).ok()?;
+    let was_plain = !crate::paid::is_sealed(&raw);
+    let paid_dir = crate::paid::paid_dir(dir);
+    let plain = crate::paid::open_archive(&paid_dir, &raw).ok()?;
+    let tok: MiAccountToken = serde_json::from_slice(&plain).ok()?;
+    // 兼容老版本明文 mi_token.json，读取成功后顺手加密覆写
+    if was_plain {
+        if let Ok(sealed) = crate::paid::seal_archive(&paid_dir, &plain) {
+            let _ = crate::paid::atomic_write(&path, &sealed);
+        }
+    }
+    Some(tok)
 }
 
 // ---------- Tauri 命令 ----------
@@ -817,7 +842,11 @@ pub async fn xiaomi_login(
     match login(&state, username, password).await {
         Ok(Some(devices)) => Ok(serde_json::json!({ "requires2fa": false, "devices": devices })),
         Ok(None) => {
-            let s = state.mi_2fa.lock().clone().expect("2fa state");
+            let s = state
+                .mi_2fa
+                .lock()
+                .clone()
+                .ok_or_else(|| "二次验证状态失效，请重新登录".to_string())?;
             Ok(serde_json::json!({ "requires2fa": true, "url": s.url }))
         }
         Err(err) => Err(format!("{err:#}")),

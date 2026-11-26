@@ -117,7 +117,7 @@ fn read_meta(dir: &Path) -> Result<Value, String> {
 
 fn write_meta(dir: &Path, meta: &Value) -> Result<(), String> {
     let raw = serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("meta.json"), raw).map_err(|e| format!("保存项目失败: {e}"))
+    paid::atomic_write(&dir.join("meta.json"), &raw).map_err(|e| format!("保存项目失败: {e}"))
 }
 
 fn file_size(p: &Path) -> i64 {
@@ -378,27 +378,59 @@ pub async fn video_project_list(state: tauri::State<'_, AppState>) -> Result<Val
     Ok(json!({ "items": out }))
 }
 
+/// Rust 内部读取视频项目解密后的成品 `.bin`（不跨 IPC 吐给 WebView）。
+pub(crate) fn read_video_project_bin(state: &AppState, project_id: &str) -> Result<Vec<u8>, String> {
+    let dir = project_dir(state, project_id)?;
+    let raw = std::fs::read(dir.join("bin.enc")).map_err(|_| "作品还没有成品".to_string())?;
+    paid::open_archive(&paid::paid_dir(&app_data(state)?), &raw)
+        .map_err(|e| format!("成品留档解密失败: {e:#}"))
+}
+
 #[tauri::command]
 pub async fn video_project_get(
     state: tauri::State<'_, AppState>,
     project_id: String,
     kind: String,
 ) -> Result<Value, String> {
+    if kind != "video" {
+        return Err("成品表盘与帧包不允许直接导出".into());
+    }
     let dir = project_dir(&state, &project_id)?;
-    let file = match kind.as_str() {
-        "video" => "video.enc",
-        "frames" => "frames.enc",
-        "bin" => "bin.enc",
-        _ => return Err("未知的留档类型".into()),
-    };
-    let raw = std::fs::read(dir.join(file)).map_err(|_| "本地没有这份留档".to_string())?;
-    let plain = paid::open_archive(&paid::paid_dir(&app_data(&state)?), &raw)
-        .map_err(|e| format!("留档解密失败: {e:#}"))?;
-    Ok(json!({
-        "kind": kind,
-        "size": plain.len(),
-        "data_b64": base64::engine::general_purpose::STANDARD.encode(plain),
-    }))
+    let paid_dir = paid::paid_dir(&app_data(&state)?);
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw = std::fs::read(dir.join("video.enc")).map_err(|_| "本地没有这份留档".to_string())?;
+        let plain = paid::open_archive(&paid_dir, &raw)
+            .map_err(|e| format!("留档解密失败: {e:#}"))?;
+        Ok(json!({
+            "kind": "video",
+            "size": plain.len(),
+            "data_b64": base64::engine::general_purpose::STANDARD.encode(plain),
+        }))
+    })
+    .await
+    .map_err(|e| format!("读取留档失败: {e}"))?
+}
+
+/// 在 Rust 侧直接解密成品 `.bin` 并安装到设备（不经 JS 中转明文）。
+#[tauri::command]
+pub async fn video_project_install(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    addr: String,
+    project_id: String,
+) -> Result<String, String> {
+    let st_dir = app_data(&state)?;
+    let paid_dir = paid::paid_dir(&st_dir);
+    let dir = project_dir(&state, &project_id)?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let raw = std::fs::read(dir.join("bin.enc")).map_err(|_| "作品还没有成品".to_string())?;
+        paid::open_archive(&paid_dir, &raw).map_err(|e| format!("成品解密失败: {e:#}"))
+    })
+    .await
+    .map_err(|e| format!("读取成品失败: {e}"))??;
+    crate::bridge::install_file_bytes_id(&app, &addr, bytes, "bin".to_string(), None)
+        .await
+        .map(|_| "安装完成".to_string())
 }
 
 #[tauri::command]

@@ -143,7 +143,8 @@ type Props = {
   /** 安装委托给 App 的正式安装流程（复用带进度条的安装页） */
   onInstallPayload?: (payload: {
     addr: string;
-    b64: string;
+    b64?: string;
+    projectId?: string;
     ext: string;
     name: string;
     kind?: "watchface" | "quickapp";
@@ -453,10 +454,20 @@ async function captureByPlaying(
       finish();
     };
     // 片尾 / 播放被中断时 requestVideoFrameCallback 可能不再回调：
-    // 2.5 秒没有任何新帧就直接用最后一帧补满，保证任务能结束。
+    // 若已完成 >= 80% 则补齐余帧；否则判定为截帧超时，避免产出大段黑屏/静止帧。
     const guard = window.setInterval(() => {
       if (done) return;
-      if (Date.now() - lastProgress > 2500) fillToEnd();
+      if (Date.now() - lastProgress > 2500) {
+        const minOk = Math.max(1, Math.ceil(count * 0.8));
+        if (i >= minOk) {
+          fillToEnd();
+        } else {
+          done = true;
+          window.clearInterval(guard);
+          video.pause();
+          reject(new Error(`截帧超时（仅完成 ${i}/${count} 帧），请重试`));
+        }
+      }
     }, 500);
     const schedule = () => {
       if (done) return;
@@ -612,12 +623,31 @@ export default function VideoWatchface({
   const draftCreatedRef = useRef(false);
   /** 退出确认后放行一次返回，避免守卫再弹一次 */
   const exitConfirmedRef = useRef(false);
+  /** 退出弹窗是否由 popstate 触发（浏览器历史已退掉一层） */
+  const exitPoppedHistoryRef = useRef(false);
+  const exitAskRef = useRef(false);
+  exitAskRef.current = exitAsk;
+  /** 复用的离屏缩略图解码器，避免每次缩放轨道都创建/销毁 MediaCodec */
+  const thumbVideoRef = useRef<HTMLVideoElement | null>(null);
+  const thumbVideoUrlRef = useRef("");
 
-  // 离开页面时清掉待执行的 seek
+  // 离开页面时清掉待执行的 seek 与离屏视频解码器
   useEffect(
     () => () => {
       if (seekTimerRef.current) window.clearTimeout(seekTimerRef.current);
       if (scrubEndTimerRef.current) window.clearTimeout(scrubEndTimerRef.current);
+      const tv = thumbVideoRef.current;
+      if (tv) {
+        try {
+          tv.removeAttribute("src");
+          tv.load();
+          tv.remove();
+        } catch {
+          /* 忽略 */
+        }
+        thumbVideoRef.current = null;
+        thumbVideoUrlRef.current = "";
+      }
     },
     []
   );
@@ -655,17 +685,17 @@ export default function VideoWatchface({
     const stack = screensRef.current;
     if (stack.length <= 1) return false;
     if (!exitConfirmedRef.current && screen === "edit" && videoUrl && draftDirty) {
-      // 系统返回已经把 edit 这条历史弹掉了：补回来（不动 navDepth，净变化为 0），
-      // 用户选「继续编辑」后层级不会乱。
-      try {
-        window.history.pushState({ panfang: true, route: "video" }, "", "#video");
-      } catch {
-        /* 忽略 */
+      // 不在 popstate 回调里调用 history.pushState（WebView 会把 canGoBack 弄乱）；
+      // 同步减少 depth，并记住「历史已弹出一格」，用户选取消/保存失败时再补回历史条目。
+      if (!exitAskRef.current) {
+        exitPoppedHistoryRef.current = true;
+        onInternalDepthChange?.(-1);
+        setExitAsk(true);
       }
-      setExitAsk(true);
       return true;
     }
     exitConfirmedRef.current = false;
+    exitPoppedHistoryRef.current = false;
     // 从制作进度退出：不回编辑/模板，直接落到历史记录，让用户能看到任务还在跑
     if (screen === "job") {
       const depthBefore = stack.length - 1;
@@ -683,6 +713,7 @@ export default function VideoWatchface({
 
   /** 页内 Header 的返回：真的走一次历史返回，让 guard / popstate 统一处理 */
   const backFromScreen = () => {
+    exitPoppedHistoryRef.current = false;
     if (screensRef.current.length <= 1) {
       onBack();
       return;
@@ -922,6 +953,8 @@ export default function VideoWatchface({
       if (inflight) return;
       inflight = true;
       let ok = true;
+      let need = false;
+      let fetchedAny = false;
       try {
         const items = await loadProjects(true);
         if (!alive) return;
@@ -930,11 +963,13 @@ export default function VideoWatchface({
           const active = ["queued", "running"].includes(st);
           const doneNoBin = st === "done" && !p.has_bin;
           if (!p.job_id || (!active && !doneNoBin)) continue;
+          need = true;
           try {
             const v = (await inv("video_job_status", { projectId: p.id })) as any;
             if (!alive) return;
             if (v?.job?.status === "done" && !p.has_bin) {
               await inv("video_job_fetch", { projectId: p.id });
+              fetchedAny = true;
               if (!alive) return;
             }
           } catch {
@@ -943,11 +978,11 @@ export default function VideoWatchface({
         }
         if (!alive) return;
         fails = ok ? 0 : fails + 1;
-        await loadProjects(true);
+        if (fetchedAny) await loadProjects(true);
       } finally {
         inflight = false;
       }
-      if (alive) timer = window.setTimeout(tick, nextDelay());
+      if (alive && need) timer = window.setTimeout(tick, nextDelay());
     };
     const onVis = () => {
       if (document.visibilityState !== "visible") return;
@@ -1359,7 +1394,7 @@ export default function VideoWatchface({
   const viewStartSafe = Math.max(0, Math.min(maxViewStart, viewStart));
   const viewEndSafe = viewStartSafe + viewSpan;
   const timeToPct = (t: number) =>
-    viewSpan > 0 ? ((t - viewStartSafe) / viewSpan) * 100 : 0;
+    duration > 0 && viewSpan > 0 ? ((t - viewStartSafe) / viewSpan) * 100 : 0;
   const startPct = timeToPct(trimStart);
   const endPct = timeToPct(trimEnd);
   const playPct = timeToPct(playhead);
@@ -1572,31 +1607,38 @@ export default function VideoWatchface({
     if (!missing.length) return;
 
     let alive = true;
-    let tv: HTMLVideoElement | null = null;
     const timer = window.setTimeout(async () => {
       if (!alive) return;
-      tv = document.createElement("video");
-      tv.src = videoUrl;
-      tv.muted = true;
-      tv.playsInline = true;
-      tv.preload = "auto";
-      tv.style.position = "fixed";
-      tv.style.left = "-9999px";
-      tv.style.width = "1px";
-      tv.style.height = "1px";
-      tv.style.opacity = "0";
-      document.body.appendChild(tv);
-      await new Promise<void>((resolve) => {
-        let done = false;
-        const ok = () => {
-          if (done) return;
-          done = true;
-          resolve();
-        };
-        tv!.addEventListener("loadeddata", ok, { once: true });
-        tv!.addEventListener("error", ok, { once: true });
-        window.setTimeout(ok, 2000);
-      });
+      let tv = thumbVideoRef.current;
+      const needReload = !tv || thumbVideoUrlRef.current !== videoUrl;
+      if (!tv) {
+        tv = document.createElement("video");
+        tv.muted = true;
+        tv.playsInline = true;
+        tv.preload = "auto";
+        tv.style.position = "fixed";
+        tv.style.left = "-9999px";
+        tv.style.width = "1px";
+        tv.style.height = "1px";
+        tv.style.opacity = "0";
+        document.body.appendChild(tv);
+        thumbVideoRef.current = tv;
+      }
+      if (needReload) {
+        thumbVideoUrlRef.current = videoUrl;
+        tv.src = videoUrl;
+        await new Promise<void>((resolve) => {
+          let done = false;
+          const ok = () => {
+            if (done) return;
+            done = true;
+            resolve();
+          };
+          tv!.addEventListener("loadeddata", ok, { once: true });
+          tv!.addEventListener("error", ok, { once: true });
+          window.setTimeout(ok, 2000);
+        });
+      }
       for (const m of missing) {
         if (!alive) break;
         if (thumbCacheRef.current.has(m.k)) continue;
@@ -1613,27 +1655,11 @@ export default function VideoWatchface({
         }
         setTiles((prev) => prev.map((tile) => (tile.key === m.k ? { ...tile, src } : tile)));
       }
-      try {
-        tv.removeAttribute("src");
-        tv.load();
-        tv.remove();
-      } catch {
-        /* 忽略 */
-      }
     }, 180);
 
     return () => {
       alive = false;
       window.clearTimeout(timer);
-      if (tv) {
-        try {
-          tv.removeAttribute("src");
-          tv.load();
-          tv.remove();
-        } catch {
-          /* 忽略 */
-        }
-      }
     };
   }, [videoUrl, duration, viewStartSafe, viewSpan]);
 
@@ -1763,6 +1789,8 @@ export default function VideoWatchface({
     }
     setBusy("正在抽帧…");
     setProgress(0);
+    setKeepScreenOn(true);
+    setInstallBackLock(true);
     if (seekTimerRef.current) {
       window.clearTimeout(seekTimerRef.current);
       seekTimerRef.current = undefined;
@@ -1773,18 +1801,30 @@ export default function VideoWatchface({
       let sent = 0;
       let pending: string[] = [];
       let sendError: unknown = null;
-      const sends: Promise<unknown>[] = [];
+      // 最多 2 条并发 IPC 队列，防止 25 批 Base64 同时滞留 WebView/Rust 桥接导致峰值 OOM
+      const slots: [Promise<void>, Promise<void>] = [Promise.resolve(), Promise.resolve()];
+      let slotIdx = 0;
       const flush = () => {
         if (!pending.length) return;
         const batch = pending;
         pending = [];
         const startIndex = sent;
         sent += batch.length;
-        sends.push(
-          inv("video_frame_put", { projectId, startIndex, framesB64: batch }).catch((e) => {
+        const idx = slotIdx;
+        slotIdx = (slotIdx + 1) % slots.length;
+        slots[idx] = slots[idx].then(async () => {
+          if (sendError) {
+            batch.length = 0;
+            return;
+          }
+          try {
+            await inv("video_frame_put", { projectId, startIndex, framesB64: batch });
+          } catch (e) {
             sendError = sendError || e;
-          })
-        );
+          } finally {
+            batch.length = 0;
+          }
+        });
       };
       await captureByPlaying(
         v,
@@ -1803,7 +1843,7 @@ export default function VideoWatchface({
         (n) => setProgress(Math.round((n / total) * 100))
       );
       flush();
-      await Promise.all(sends);
+      await Promise.all(slots);
       if (sendError) throw sendError;
       setBusy("正在上传帧包…");
       const jobArgs: any = {
@@ -1838,6 +1878,8 @@ export default function VideoWatchface({
     } catch (e) {
       showToast(String(e), "error");
     } finally {
+      setKeepScreenOn(false);
+      setInstallBackLock(false);
       setBusy("");
       setProgress(0);
     }
@@ -1917,26 +1959,14 @@ export default function VideoWatchface({
       showToast("请先连接手表再安装", "error");
       return;
     }
-    let data = binB64;
-    try {
-      if (!data) {
-        const v = (await invoke("video_project_get", {
-          projectId: pid,
-          kind: "bin",
-        })) as { data_b64: string };
-        data = v.data_b64;
-      }
-    } catch (e) {
-      showToast(String(e), "error");
-      return;
-    }
     const title =
       projects.find((x) => x.id === pid)?.title || project?.title || "视频表盘";
-    // 走 App 的正式安装流程：进度条、阶段文案、成功页、失败重试都由那一页负责
+    // 走 App 的正式安装流程：进度条、阶段文案、成功页、失败重试都由那一页负责（仅传 projectId，不经 JS 搬运完整 bin）
     if (onInstallPayload) {
       onInstallPayload({
         addr: deviceAddr,
-        b64: data,
+        b64: binB64,
+        projectId: binB64 ? undefined : pid,
         ext: "bin",
         name: title,
         kind: "watchface",
@@ -1948,12 +1978,19 @@ export default function VideoWatchface({
     setInstallBackLock(true);
     setKeepScreenOn(true);
     try {
-      await invoke("device_install_payload", {
-        addr: deviceAddr,
-        dataB64: data,
-        ext: "bin",
-        rewriteWatchfaceId: null,
-      });
+      if (binB64) {
+        await invoke("device_install_payload", {
+          addr: deviceAddr,
+          dataB64: binB64,
+          ext: "bin",
+          rewriteWatchfaceId: null,
+        });
+      } else {
+        await invoke("video_project_install", {
+          addr: deviceAddr,
+          projectId: pid,
+        });
+      }
       showToast("已安装到手表");
       onInstalled?.();
       void loadProjects();
@@ -2058,9 +2095,24 @@ export default function VideoWatchface({
     void loadProjects();
   };
 
+  /** 退出弹窗：取消离开 */
+  const cancelExitAsk = () => {
+    setExitAsk(false);
+    if (exitPoppedHistoryRef.current) {
+      exitPoppedHistoryRef.current = false;
+      try {
+        window.history.pushState({ panfang: true, route: "video" }, "", "#video");
+        onInternalDepthChange?.(1);
+      } catch {
+        /* 忽略 */
+      }
+    }
+  };
+
   /** 编辑页的返回：有未保存草稿先问 */
   const requestLeaveEdit = () => {
     if (videoUrl && draftDirty) {
+      exitPoppedHistoryRef.current = false;
       setExitAsk(true);
       return;
     }
@@ -2073,9 +2125,30 @@ export default function VideoWatchface({
     setExitAsk(false);
     if (mode === "save") {
       const ok = await saveDraft();
-      if (!ok) return;
+      if (!ok) {
+        if (exitPoppedHistoryRef.current) {
+          exitPoppedHistoryRef.current = false;
+          try {
+            window.history.pushState({ panfang: true, route: "video" }, "", "#video");
+            onInternalDepthChange?.(1);
+          } catch {
+            /* 忽略 */
+          }
+        }
+        return;
+      }
     } else {
       await discardDraft();
+    }
+    if (exitPoppedHistoryRef.current) {
+      exitPoppedHistoryRef.current = false;
+      const stack = screensRef.current;
+      if (stack.length > 1) {
+        const next = stack.slice(0, -1);
+        screensRef.current = next;
+        setScreen(next[next.length - 1]);
+      }
+      return;
     }
     exitConfirmedRef.current = true;
     try {
@@ -2197,7 +2270,7 @@ export default function VideoWatchface({
                     latestActive
                       ? "text-[var(--pf-primary)]"
                       : latestStatus === "done"
-                        ? "text-[#34A853]"
+                        ? "text-[var(--pf-ok)]"
                         : "text-[var(--pf-danger)]"
                   }`}
                 >
@@ -2294,7 +2367,7 @@ export default function VideoWatchface({
                         </span>
                       )}
                       {done && !active && (
-                        <span className="shrink-0 pf-fs-11 font-bold text-[#34A853] bg-[#34A853]/10 px-2 py-0.5 rounded-full">
+                        <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-ok)] bg-[var(--pf-ok-12)] px-2 py-0.5 rounded-full">
                           已完成
                         </span>
                       )}
@@ -2403,7 +2476,7 @@ export default function VideoWatchface({
                     )}
                   </div>
                   {tpl.unlocked ? (
-                    <CheckCircle className="w-5 h-5 text-[#34A853]" />
+                    <CheckCircle className="w-5 h-5 text-[var(--pf-ok)]" />
                   ) : (
                     <LockSimple className="w-5 h-5 text-[var(--pf-i-25)]" />
                   )}
@@ -2439,7 +2512,7 @@ export default function VideoWatchface({
                         <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5">
                           {st.canvas_w}×{st.canvas_h} 画布
                           {st.frame_colors?.length
-                            ? ` · 相框 ${st.frame_colors.length} 色`
+                            ? `，相框 ${st.frame_colors.length} 色`
                             : ""}
                         </p>
                       </div>
@@ -2495,7 +2568,7 @@ export default function VideoWatchface({
         </div>
 
         {/* 顶部固定：设备预览（往下滚不会把画布带走） */}
-        <div className="shrink-0 px-4 pb-1">
+        <div className="shrink-0 px-4 pb-1 relative z-10 bg-[var(--pf-page)]">
           <div
             ref={cropRef}
             className="relative mx-auto overflow-hidden bg-black shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
@@ -2579,219 +2652,213 @@ export default function VideoWatchface({
           onChange={onPickFile}
         />
 
-        <div
-          data-rb="y"
-          data-rb-always="1"
-          className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-4 pb-4 flex flex-col gap-3"
-        >
+        <div className="flex-1 min-h-0 overflow-hidden relative">
+          <div
+            data-rb="y"
+            data-rb-always="1"
+            className="h-full overflow-y-auto overflow-x-hidden no-scrollbar px-4 pt-1 pb-4"
+            style={{ touchAction: "pan-y" }}
+          >
+            <div className="flex flex-col gap-3">
+              {videoUrl && (
+                <button
+                  type="button"
+                  onClick={() => fileRef.current?.click()}
+                  className="w-full bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex items-center justify-between active:scale-[0.99] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-10 h-10 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
+                      <VideoCamera className="w-5 h-5" />
+                    </div>
+                    <div className="min-w-0 text-left">
+                      <p className="pf-fs-15 font-bold text-[var(--pf-ink)]">更换视频</p>
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
+                        {videoName || "已选视频"}
+                      </p>
+                    </div>
+                  </div>
+                  <CaretRight className="w-5 h-5 text-[var(--pf-i-20)] shrink-0" />
+                </button>
+              )}
 
-          {frameColors.length > 0 && (
-            <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
-              <div className="flex items-center justify-between">
-                <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] flex items-center gap-2">
-                  <Palette className="w-4 h-4 text-[var(--pf-primary)]" />
-                  相框颜色
-                </h3>
-                <span className="pf-fs-12 font-bold text-[var(--pf-i-40)]">
-                  {frameColors.find((c) => String(c.i) === frameColor)?.name || ""}
-                </span>
-              </div>
-              <div className="flex flex-wrap gap-2.5">
-                {frameColors.map((c) => {
-                  const active = String(c.i) === frameColor;
-                  return (
-                    <button
-                      key={c.i}
-                      type="button"
-                      aria-label={c.name}
-                      title={c.name}
-                      onClick={() => setFrameColor(String(c.i))}
-                      className={`w-9 h-9 rounded-full transition-all cursor-pointer ${
-                        active
-                          ? "ring-2 ring-[var(--pf-primary)] ring-offset-2 ring-offset-white"
-                          : "ring-1 ring-[var(--pf-bd-10)]"
-                      }`}
-                      style={{ background: c.swatch }}
+              <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3 overflow-hidden">
+                <div className="flex items-center justify-between">
+                  <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] flex items-center gap-2">
+                    <Scissors className="w-4 h-4 text-[var(--pf-primary)]" />
+                    截取片段
+                  </h3>
+                  <span className="pf-fs-12 font-bold text-[var(--pf-i-40)]">
+                    {duration > 0
+                      ? tlZoom > 1.01
+                        ? `${tlZoom.toFixed(1)}x，已选 ${fmtTime(clipLen)}`
+                        : `已选 ${fmtTime(clipLen)}`
+                      : "—"}
+                  </span>
+                </div>
+
+                {/* 轨道：缩略图 + 选区；单指拖选区/平移，双指缩放 */}
+                <div
+                  ref={trimTrackRef}
+                  data-no-rb="1"
+                  className="relative h-14 rounded-xl bg-[var(--pf-bg-6)]"
+                  style={{ touchAction: "none" }}
+                  onPointerDown={onTrackDown}
+                  onPointerMove={onTrackMove}
+                  onPointerUp={onTrackUp}
+                  onPointerCancel={onTrackUp}
+                >
+                  <div className="absolute inset-0 rounded-xl overflow-hidden">
+                    {/* 序列帧：16 格铺满当前视野，放大后按新视野重新取帧 */}
+                    <div className="absolute inset-0 flex h-full">
+                      {Array.from({ length: THUMB_TILES }).map((_, i) => {
+                        const src = tiles[i]?.src;
+                        return src ? (
+                          <img key={i} src={src} alt="" className="h-full flex-1 object-cover" />
+                        ) : (
+                          <div key={i} className="h-full flex-1 bg-[var(--pf-bg-5)]" />
+                        );
+                      })}
+                    </div>
+
+                    {/* 选区外压暗（全部裁在轨道里，蓝色不会跑到外面） */}
+                    <div
+                      className="absolute inset-y-0 left-0 bg-[var(--pf-mask-soft)]"
+                      style={{ width: `${Math.max(0, Math.min(100, startPct))}%` }}
                     />
-                  );
-                })}
-              </div>
-              <p className="pf-fs-11 font-medium text-[var(--pf-i-35)]">
-                只换相框颜色；相框外的画面会被遮住。
-              </p>
-            </section>
-          )}
+                    <div
+                      className="absolute inset-y-0 right-0 bg-[var(--pf-mask-soft)]"
+                      style={{
+                        width: `${Math.max(0, 100 - Math.max(0, Math.min(100, endPct)))}%`,
+                      }}
+                    />
+                    <div
+                      className="absolute inset-y-0 bg-[var(--pf-primary-20)]"
+                      style={{
+                        left: `${startPct}%`,
+                        width: `${Math.max(0, endPct - startPct)}%`,
+                      }}
+                    />
+                    <div
+                      className="absolute inset-y-0 w-0.5 bg-[var(--pf-primary-solid)]"
+                      style={{ left: `${startPct}%` }}
+                    />
+                    <div
+                      className="absolute inset-y-0 w-0.5 bg-[var(--pf-primary-solid)]"
+                      style={{ left: `${endPct}%` }}
+                    />
+                    <div
+                      className="absolute inset-y-0 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.2)]"
+                      style={{ left: `${playPct}%` }}
+                    />
+                  </div>
 
-          {videoUrl && (
-            <button
-              type="button"
-              onClick={() => fileRef.current?.click()}
-              className="w-full bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex items-center justify-between active:scale-[0.99] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
-            >
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="w-10 h-10 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
-                  <VideoCamera className="w-5 h-5" />
-                </div>
-                <div className="min-w-0 text-left">
-                  <p className="pf-fs-15 font-bold text-[var(--pf-ink)]">更换视频</p>
-                  <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
-                    {videoName || "已选视频"}
-                  </p>
-                </div>
-              </div>
-              <CaretRight className="w-5 h-5 text-[var(--pf-i-20)] shrink-0" />
-            </button>
-          )}
-
-          <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] flex items-center gap-2">
-                <Scissors className="w-4 h-4 text-[var(--pf-primary)]" />
-                截取片段
-              </h3>
-              <span className="pf-fs-12 font-bold text-[var(--pf-i-40)]">
-                {duration > 0
-                  ? tlZoom > 1.01
-                    ? `${tlZoom.toFixed(1)}x，已选 ${fmtTime(clipLen)}`
-                    : `已选 ${fmtTime(clipLen)}`
-                  : "—"}
-              </span>
-            </div>
-
-            {/* 轨道：缩略图 + 选区；单指拖选区/平移，双指缩放 */}
-            <div
-              ref={trimTrackRef}
-              className="relative h-14 rounded-xl bg-[var(--pf-bg-6)]"
-              style={{ touchAction: "none" }}
-              onPointerDown={onTrackDown}
-              onPointerMove={onTrackMove}
-              onPointerUp={onTrackUp}
-              onPointerCancel={onTrackUp}
-            >
-              <div className="absolute inset-0 rounded-xl overflow-hidden">
-                {/* 序列帧：16 格铺满当前视野，放大后按新视野重新取帧 */}
-                <div className="absolute inset-0 flex h-full">
-                  {Array.from({ length: THUMB_TILES }).map((_, i) => {
-                    const src = tiles[i]?.src;
-                    return src ? (
-                      <img key={i} src={src} alt="" className="h-full flex-1 object-cover" />
-                    ) : (
-                      <div key={i} className="h-full flex-1 bg-[var(--pf-bg-5)]" />
+                  {/* 两端把手（在裁切层外面，靠边也不会被切掉） */}
+                  {(["start", "end"] as const).map((which) => {
+                    const pct = which === "start" ? startPct : endPct;
+                    const inView = pct >= -0.5 && pct <= 100.5;
+                    if (duration <= 0 || !inView) return null;
+                    return (
+                      <div
+                        key={which}
+                        role="slider"
+                        aria-valuemin={0}
+                        aria-valuemax={duration}
+                        aria-valuenow={which === "start" ? trimStart : trimEnd}
+                        onPointerDown={onTrimDown(which)}
+                        onPointerMove={onTrimMove}
+                        onPointerUp={onTrimUp}
+                        onPointerCancel={onTrimUp}
+                        className="absolute inset-y-0 w-6 -translate-x-1/2 flex items-center justify-center cursor-grab active:cursor-grabbing"
+                        style={{
+                          left: `${pct}%`,
+                          touchAction: "none",
+                        }}
+                      >
+                        <div className="w-3.5 h-10 rounded-md bg-white shadow-[0_1px_4px_rgba(0,0,0,0.22)] flex items-center justify-center">
+                          <div className="w-0.5 h-4 rounded-full bg-[var(--pf-primary-solid)]" />
+                        </div>
+                      </div>
                     );
                   })}
                 </div>
 
-                {/* 选区外压暗（全部裁在轨道里，蓝色不会跑到外面） */}
-                <div
-                  className="absolute inset-y-0 left-0 bg-white/55"
-                  style={{ width: `${Math.max(0, Math.min(100, startPct))}%` }}
-                />
-                <div
-                  className="absolute inset-y-0 right-0 bg-white/55"
-                  style={{
-                    width: `${Math.max(0, 100 - Math.max(0, Math.min(100, endPct)))}%`,
-                  }}
-                />
-                <div
-                  className="absolute inset-y-0 bg-[var(--pf-primary-20)]"
-                  style={{
-                    left: `${startPct}%`,
-                    width: `${Math.max(0, endPct - startPct)}%`,
-                  }}
-                />
-                <div
-                  className="absolute inset-y-0 w-0.5 bg-[var(--pf-primary-solid)]"
-                  style={{ left: `${startPct}%` }}
-                />
-                <div
-                  className="absolute inset-y-0 w-0.5 bg-[var(--pf-primary-solid)]"
-                  style={{ left: `${endPct}%` }}
-                />
-                <div
-                  className="absolute inset-y-0 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.2)]"
-                  style={{ left: `${playPct}%` }}
-                />
-              </div>
-
-              {/* 两端把手（在裁切层外面，靠边也不会被切掉） */}
-              {(["start", "end"] as const).map((which) => {
-                const pct = which === "start" ? startPct : endPct;
-                const inView = pct >= -0.5 && pct <= 100.5;
-                return (
-                  <div
-                    key={which}
-                    role="slider"
-                    aria-valuemin={0}
-                    aria-valuemax={duration}
-                    aria-valuenow={which === "start" ? trimStart : trimEnd}
-                    onPointerDown={onTrimDown(which)}
-                    onPointerMove={onTrimMove}
-                    onPointerUp={onTrimUp}
-                    onPointerCancel={onTrimUp}
-                    className="absolute inset-y-0 w-6 -translate-x-1/2 flex items-center justify-center cursor-grab active:cursor-grabbing"
-                    style={{
-                      left: `${pct}%`,
-                      touchAction: "none",
-                      opacity: inView ? 1 : 0,
-                      pointerEvents: inView ? "auto" : "none",
-                    }}
+                {/* 播放控制：播放/暂停 + 选区内的进度条（点按跳转、拖动找画面） */}
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    aria-label={playing ? "暂停" : "播放"}
+                    disabled={!videoReady}
+                    onClick={togglePlay}
+                    className={`w-9 h-9 shrink-0 rounded-full flex items-center justify-center transition-all ${
+                      videoReady
+                        ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)] active:scale-95 active:bg-[var(--pf-primary-20)] cursor-pointer"
+                        : "bg-[var(--pf-bg-5)] text-[var(--pf-i-25)]"
+                    }`}
                   >
-                    <div className="w-3.5 h-10 rounded-md bg-white shadow-[0_1px_4px_rgba(0,0,0,0.22)] flex items-center justify-center">
-                      <div className="w-0.5 h-4 rounded-full bg-[var(--pf-primary-solid)]" />
-                    </div>
+                    {playing ? (
+                      <Pause weight="fill" className="w-5 h-5" />
+                    ) : (
+                      <Play weight="fill" className="w-5 h-5" />
+                    )}
+                  </button>
+                  <ClipScrubBar
+                    value={Math.min(clipLen, Math.max(0, playhead - trimStart))}
+                    max={clipLen}
+                    disabled={!videoReady}
+                    onScrubStart={() => {
+                      if (playing) {
+                        videoRef.current?.pause();
+                        setPlaying(false);
+                      }
+                    }}
+                    onScrub={(v) => scrubTo(trimStart + v)}
+                  />
+                  <span className="w-[84px] shrink-0 text-right pf-fs-11 font-mono font-medium text-[var(--pf-i-40)] tabular-nums">
+                    {fmtTime(Math.min(clipLen, Math.max(0, playhead - trimStart)))} / {fmtTime(clipLen)}
+                  </span>
+                </div>
+              </section>
+
+              <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4">
+                <GenSlider
+                  icon={<ArrowsOutSimple className="w-4 h-4" />}
+                  label="缩放"
+                  value={zoom}
+                  ctl={{ default: 1, min: 1, max: 3, step: 0.01, adjustable: true }}
+                  text={`${zoom.toFixed(2)}x`}
+                  onChange={(v) => setZoom(v)}
+                  disabled={!videoDim}
+                />
+              </section>
+
+              {frameColors.length > 0 && (
+                <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
+                  <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] flex items-center gap-2">
+                    <Palette className="w-4 h-4 text-[var(--pf-primary)]" />
+                    相框颜色
+                  </h3>
+                  <div className="grid grid-cols-6 gap-x-3 gap-y-3.5 justify-items-center px-1 py-1">
+                    {frameColors.map((c) => {
+                      const active = String(c.i) === frameColor;
+                      return (
+                        <button
+                          key={c.i}
+                          type="button"
+                          aria-label={c.name}
+                          title={c.name}
+                          onClick={() => setFrameColor(String(c.i))}
+                          className={`w-9 h-9 rounded-full transition-all cursor-pointer ${
+                            active
+                              ? "ring-2 ring-[var(--pf-primary)] ring-offset-2 ring-offset-[var(--pf-card)]"
+                              : "ring-1 ring-[var(--pf-bd-10)]"
+                          }`}
+                          style={{ background: c.swatch }}
+                        />
+                      );
+                    })}
                   </div>
-                );
-              })}
-            </div>
-
-            {/* 播放控制：播放/暂停 + 选区内的进度条（点按跳转、拖动找画面） */}
-            <div className="flex items-center gap-3">
-              <button
-                type="button"
-                aria-label={playing ? "暂停" : "播放"}
-                disabled={!videoReady}
-                onClick={togglePlay}
-                className={`w-9 h-9 shrink-0 rounded-full flex items-center justify-center transition-all ${
-                  videoReady
-                    ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)] active:scale-95 active:bg-[var(--pf-primary-20)] cursor-pointer"
-                    : "bg-[var(--pf-bg-5)] text-[var(--pf-i-25)]"
-                }`}
-              >
-                {playing ? (
-                  <Pause weight="fill" className="w-5 h-5" />
-                ) : (
-                  <Play weight="fill" className="w-5 h-5" />
-                )}
-              </button>
-              <ClipScrubBar
-                value={Math.min(clipLen, Math.max(0, playhead - trimStart))}
-                max={clipLen}
-                disabled={!videoReady}
-                onScrubStart={() => {
-                  if (playing) {
-                    videoRef.current?.pause();
-                    setPlaying(false);
-                  }
-                }}
-                onScrub={(v) => scrubTo(trimStart + v)}
-              />
-              <span className="w-[84px] shrink-0 text-right pf-fs-11 font-mono font-medium text-[var(--pf-i-40)] tabular-nums">
-                {fmtTime(Math.min(clipLen, Math.max(0, playhead - trimStart)))} / {fmtTime(clipLen)}
-              </span>
-            </div>
-          </section>
-
-          <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4">
-            <GenSlider
-              icon={<ArrowsOutSimple className="w-4 h-4" />}
-              label="缩放"
-              value={zoom}
-              ctl={{ default: 1, min: 1, max: 3, step: 0.01, adjustable: true }}
-              text={`${zoom.toFixed(2)}x`}
-              onChange={(v) => setZoom(v)}
-              disabled={!videoDim}
-            />
-          </section>
+                </section>
+              )}
 
           <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
             <div className="flex items-center justify-between">
@@ -2905,9 +2972,10 @@ export default function VideoWatchface({
               >
                 播放一次
               </button>
+              </div>
+            </section>
             </div>
-
-          </section>
+          </div>
         </div>
 
         <div
@@ -2952,7 +3020,7 @@ export default function VideoWatchface({
         {exitAsk && (
           <div
             className="absolute inset-0 z-50 bg-[var(--pf-mask)] flex items-center justify-center p-6"
-            onClick={() => setExitAsk(false)}
+            onClick={cancelExitAsk}
           >
             <div
               className="bg-[var(--pf-card)] pf-card-border w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] text-center"
@@ -3000,58 +3068,55 @@ export default function VideoWatchface({
         <div className="px-4 safe-top pb-1 shrink-0">
           <Header title="制作进度" onBackPress={backFromScreen} />
         </div>
-        <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-6 pb-10 flex flex-col items-center justify-center">
-          <div
-            className={`w-16 h-16 rounded-full flex items-center justify-center ${
-              done ? "bg-[#34A853]/10 text-[#34A853]" : failed ? "bg-[var(--pf-danger-10)] text-[var(--pf-danger)]" : "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
-            }`}
-          >
-            {done ? (
-              <CheckCircle className="w-8 h-8" />
-            ) : failed ? (
-              <WarningCircle className="w-8 h-8" />
-            ) : (
-              <ArrowClockwise className="w-8 h-8 animate-spin" />
+        <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-6 pb-[116px] flex flex-col items-center justify-center">
+          <div className="w-full flex flex-col items-center">
+            <div
+              className={`w-16 h-16 rounded-full flex items-center justify-center ${
+                done ? "bg-[var(--pf-ok-12)] text-[var(--pf-ok)]" : failed ? "bg-[var(--pf-danger-10)] text-[var(--pf-danger)]" : "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
+              }`}
+            >
+              {done ? (
+                <CheckCircle className="w-8 h-8" />
+              ) : failed ? (
+                <WarningCircle className="w-8 h-8" />
+              ) : (
+                <ArrowClockwise className="w-8 h-8 animate-spin" />
+              )}
+            </div>
+            <h2 className="pf-fs-20 font-bold text-[var(--pf-ink)] mt-4">
+              {done ? "视频表盘已生成" : failed ? "制作失败" : statusLabel(st)}
+            </h2>
+            <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-2 text-center leading-relaxed">
+              {done
+                ? "成品已保存，可以安装到手表了。"
+                : failed
+                  ? friendlyJobError(job?.error)
+                  : "预计 5~6 分钟，制作期间可以退出 App"}
+            </p>
+            {done && (
+              <button
+                type="button"
+                onClick={() => projectId && void installBin(projectId)}
+                className="mt-6 w-full max-w-xs h-12 rounded-2xl bg-[var(--pf-primary-solid)] text-white pf-fs-16 font-bold active:scale-[0.99] transition-all cursor-pointer flex items-center justify-center gap-2"
+              >
+                <DeviceMobile className="w-5 h-5" />
+                安装到手表
+              </button>
+            )}
+            {(failed || done) && (
+              <button
+                type="button"
+                onClick={() => {
+                  const p = projects.find((x) => x.id === projectId) || project;
+                  if (p) void editExisting(p, "replace");
+                  else backFromScreen();
+                }}
+                className={`${done ? "mt-3" : "mt-6"} w-full max-w-xs h-12 rounded-2xl bg-[var(--pf-card)] pf-card-border pf-fs-16 font-bold text-[var(--pf-i-70)] active:scale-[0.99] transition-all cursor-pointer flex items-center justify-center`}
+              >
+                {failed ? "调整后重试" : "继续制作"}
+              </button>
             )}
           </div>
-          <h2 className="pf-fs-20 font-bold text-[var(--pf-ink)] mt-4">
-            {done ? "视频表盘已生成" : failed ? "制作失败" : statusLabel(st)}
-          </h2>
-          <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-2 text-center leading-relaxed">
-            {done
-              ? "成品已保存，可以安装到手表了。"
-              : failed
-                ? friendlyJobError(job?.error)
-                : "预计 5~6 分钟，制作期间可以退出 App。"}
-          </p>
-          {!done && !failed && (
-            <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-4">
-              任务 {job?.id || "—"}
-            </p>
-          )}
-          {done && (
-            <button
-              type="button"
-              onClick={() => projectId && void installBin(projectId)}
-              className="mt-6 w-full max-w-xs h-12 rounded-2xl bg-[var(--pf-primary-solid)] text-white pf-fs-16 font-bold active:scale-[0.99] transition-all cursor-pointer flex items-center justify-center gap-2"
-            >
-              <DeviceMobile className="w-5 h-5" />
-              安装到手表
-            </button>
-          )}
-          {(failed || done) && (
-            <button
-              type="button"
-              onClick={() => {
-                const p = projects.find((x) => x.id === projectId) || project;
-                if (p) void editExisting(p, "replace");
-                else backFromScreen();
-              }}
-              className="mt-3 h-11 px-5 rounded-full bg-[var(--pf-card)] pf-card-border pf-fs-14 font-bold text-[var(--pf-i-60)] active:scale-95 transition-all cursor-pointer"
-            >
-              {failed ? "调整后重试" : "继续制作"}
-            </button>
-          )}
         </div>
         {busy && (
           <div className="fixed inset-0 z-[80] bg-[var(--pf-mask-soft)] flex items-center justify-center px-8">
@@ -3234,7 +3299,7 @@ export default function VideoWatchface({
       )}
 
       {confirmDelete && p && (
-        <div className="fixed inset-0 z-[90] bg-[var(--pf-bg-35)] flex items-end justify-center px-4 pb-6">
+        <div className="fixed inset-0 z-[90] bg-[var(--pf-mask)] flex items-end justify-center px-4 pb-6">
           <div className="w-full max-w-sm bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 text-center">
             <h3 className="pf-fs-18 font-bold text-[var(--pf-ink)]">删除这个作品？</h3>
             <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-2 leading-relaxed">
@@ -3261,7 +3326,7 @@ export default function VideoWatchface({
       )}
 
       {clearBinAsk && p && (
-        <div className="fixed inset-0 z-[90] bg-[var(--pf-bg-35)] flex items-end justify-center px-4 pb-6">
+        <div className="fixed inset-0 z-[90] bg-[var(--pf-mask)] flex items-end justify-center px-4 pb-6">
           <div className="w-full max-w-sm bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 text-center">
             <h3 className="pf-fs-18 font-bold text-[var(--pf-ink)]">清理表盘文件？</h3>
             <p className="pf-fs-13 font-medium text-[var(--pf-i-45)] mt-2 leading-relaxed">

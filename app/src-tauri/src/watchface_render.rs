@@ -165,12 +165,22 @@ pub struct LayerModelDoc {
 
 // ---------------------------------------------------------------- 表（内部）
 
+fn read_u16le(d: &[u8], o: usize) -> Option<u16> {
+    let slice = d.get(o..o.checked_add(2)?)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32le(d: &[u8], o: usize) -> Option<u32> {
+    let slice = d.get(o..o.checked_add(4)?)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
 fn u16le(d: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([d[o], d[o + 1]])
+    read_u16le(d, o).unwrap_or(0)
 }
 
 fn u32le(d: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+    read_u32le(d, o).unwrap_or(0)
 }
 
 /// 块 7 记录（数据项）。
@@ -315,8 +325,12 @@ fn detect_action_item_size(d: &[u8], styles: &[(usize, watchface_bin::StyleSecti
             }
             for (i, isz) in [(0usize, 8usize), (1, 12)] {
                 let base = 0x2C + isz * n;
-                if len == base || len == base + 8 {
-                    let ok = (0..n).all(|k| valid(u32le(d, o + 0x2C + isz * k + 4)));
+                if (len == base || len == base + 8)
+                    && o.checked_add(base).is_some_and(|e| e <= d.len())
+                {
+                    let ok = (0..n).all(|k| {
+                        read_u32le(d, o + 0x2C + isz * k + 4).is_some_and(valid)
+                    });
                     if ok {
                         score[i] += 1;
                     }
@@ -337,25 +351,34 @@ fn parse_array_frames(
     data_off: usize,
     data_len: usize,
 ) -> Option<(u32, u32, Vec<(usize, usize)>)> {
-    if data_len < 12 || data_off + 12 > d.len() {
+    let head_end = data_off.checked_add(12)?;
+    if data_len < 12 || head_end > d.len() {
         return None;
     }
-    let w = u16le(d, data_off + 4) as u32;
-    let h = u16le(d, data_off + 6) as u32;
-    let total = u32le(d, data_off + 8) as usize;
-    if total + 12 > data_len {
+    let w = read_u16le(d, data_off + 4)? as u32;
+    let h = read_u16le(d, data_off + 6)? as u32;
+    let total = read_u32le(d, data_off + 8)? as usize;
+    if total.checked_add(12)? > data_len {
         return None;
     }
     let n = (data_len - total - 12) / 4;
     if n == 0 || w == 0 || h == 0 {
         return None;
     }
-    let mut frames = Vec::with_capacity(n);
-    let mut pos = data_off + 12 + n * 4;
+    let table_bytes = n.checked_mul(4)?;
+    let mut pos = head_end.checked_add(table_bytes)?;
+    if pos > d.len() {
+        return None;
+    }
+    let mut frames = Vec::with_capacity(n.min(4096));
     for i in 0..n {
-        let size = u32le(d, data_off + 12 + i * 4) as usize;
+        let size = read_u32le(d, data_off + 12 + i * 4)? as usize;
+        let end = pos.checked_add(size)?;
+        if end > d.len() {
+            return None;
+        }
         frames.push((pos, size));
-        pos += size;
+        pos = end;
     }
     Some((w, h, frames))
 }
@@ -408,10 +431,10 @@ impl Tables {
                         continue;
                     }
                     let o = rec.data_offset as usize;
-                    if rec.data_len < 12 || o + 14 > d.len() {
+                    if rec.data_len < 12 || o.checked_add(14).is_none_or(|e| e > d.len()) {
                         continue;
                     }
-                    let long = rec.data_len >= 20;
+                    let long = rec.data_len >= 20 && o.checked_add(20).is_some_and(|e| e <= d.len());
                     let unit = if long { u32le(d, o + 16) } else { 0 };
                     let flags = d[o + 3];
                     let type_id = flags >> 4;
@@ -432,7 +455,7 @@ impl Tables {
                     };
                     // 指针（type 3，32 字节，实测偏移）：
                     // +C 值起点(u32) / +11 值域(u16) / +14,+16 轴心 / +18,+1A 角度×10
-                    if type_id == 3 && rec.data_len >= 28 {
+                    if type_id == 3 && rec.data_len >= 28 && o.checked_add(28).is_some_and(|e| e <= d.len()) {
                         r.value_start = u32le(d, o + 12) as i32;
                         r.value_range = u16le(d, o + 17) as i32;
                         r.pivot_x = u16le(d, o + 20) as f32;
@@ -443,7 +466,7 @@ impl Tables {
                     // 线性进度（type 5，40 字节，实测偏移）：
                     // +8 进度图 / +C 背景图 / +14 值起点(u32) / +19 值域(u16) /
                     // +1B,+1D 线起点 / +20,+22 线终点 / +26 线宽
-                    if type_id == 5 && rec.data_len >= 40 {
+                    if type_id == 5 && rec.data_len >= 40 && o.checked_add(40).is_some_and(|e| e <= d.len()) {
                         let bar = u32le(d, o + 8);
                         let bg = u32le(d, o + 12);
                         if (bar >> 24) & 0x7F == 0x02 {
@@ -462,7 +485,7 @@ impl Tables {
                     }
                     // 环形进度（type 4）：引用字段位置随记录变体浮动（+8 或 +9），
                     // 用「连续两个 0x02xxxxxx 引用」定位；尾部字段位置固定（实测 +26 起）。
-                    if type_id == 4 && rec.data_len >= 40 {
+                    if type_id == 4 && rec.data_len >= 40 && o.checked_add(41).is_some_and(|e| e <= d.len()) {
                         for off in [8usize, 9, 10, 11, 12] {
                             let bar = u32le(d, o + off);
                             let bg = u32le(d, o + off + 4);
@@ -513,9 +536,11 @@ impl Tables {
                     }
                     let o = rec.data_offset as usize;
                     let len = rec.data_len as usize;
-                    if len < 0x30 || o + 0x30 > d.len() {
+                    if len < 0x30 || o.checked_add(0x30).is_none_or(|e| e > d.len()) {
                         continue;
                     }
+                    let rec_end = o.saturating_add(len).min(d.len());
+                    let avail_len = rec_end - o;
                     let name = d[o..o + 32]
                         .split(|b| *b == 0)
                         .next()
@@ -527,10 +552,13 @@ impl Tables {
                     // 项尺寸随版本变体：8 字节（多数）或 12 字节（如"时序"，12 张块表）。
                     // 由文件级统计判定（见 detect_action_item_size）。
                     let isz = t.act_item_size;
-                    let n = n.min(len.saturating_sub(0x2C) / isz).min(64);
+                    let n = n.min(avail_len.saturating_sub(0x2C) / isz).min(64);
                     let mut items = Vec::with_capacity(n);
                     for i in 0..n {
                         let p = o + 0x2C + i * isz;
+                        if p.checked_add(8).is_none_or(|e| e > rec_end) {
+                            break;
+                        }
                         items.push(ActItem {
                             x: u16le(d, p) as i32,
                             y: u16le(d, p + 2) as i32,
@@ -543,7 +571,7 @@ impl Tables {
                     // 另有变体把「高,宽」直接放在项后（首字段非图片引用），随后可能还有 4 字节附加。
                     let mut tail = o + 0x2C + n * isz;
                     let read_hw = |p: usize| -> Option<(u32, u32)> {
-                        if p + 4 > o + len {
+                        if p.checked_add(4).is_none_or(|e| e > rec_end) {
                             return None;
                         }
                         let (h, w) = (u16le(d, p) as u32, u16le(d, p + 2) as u32);
@@ -552,14 +580,16 @@ impl Tables {
                         }
                         Some((h, w))
                     };
-                    if tail + 4 <= o + len && (u32le(d, tail) >> 24) & 0x7F == 0x02 {
+                    if tail.checked_add(4).is_some_and(|e| e <= rec_end)
+                        && (u32le(d, tail) >> 24) & 0x7F == 0x02
+                    {
                         tail += 4; // 附加图引用（组件缩略图）
                     }
                     let (h, w) = if let Some(hw) = read_hw(tail) {
                         hw
                     } else {
                         // 尺寸字段为 0 的变体：再跳过 4 字节取尺寸
-                        read_hw(tail + 4).unwrap_or((0, 0))
+                        read_hw(tail.saturating_add(4)).unwrap_or((0, 0))
                     };
                     t.acts.insert(
                         idx,
@@ -1763,6 +1793,9 @@ fn draw_photo(
             }
             let si = ((sy as u32 * sw + sx as u32) * 4) as usize;
             let di = ((dy as u32 * cw + dx as u32) * 4) as usize;
+            if si + 4 > src.len() || di + 4 > canvas.len() {
+                continue;
+            }
             let a = src[si + 3] as u32;
             if a == 255 {
                 canvas[di..di + 4].copy_from_slice(&src[si..si + 4]);

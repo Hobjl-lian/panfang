@@ -198,7 +198,7 @@ export interface ArchiveEntry {
   lua?: boolean;
 }
 export interface ArchiveData extends ArchiveEntry {
-  dataB64: string;
+  dataB64?: string;
 }
 
 /** bridge.rs `SavedPhoto` */

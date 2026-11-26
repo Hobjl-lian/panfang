@@ -666,33 +666,27 @@ const TAB_TITLES: Record<TabKey, string | null> = {
  * 叠加后会多出一大截空白（2026-10-30 试过，页面被顶下去太多）。
  */
 const HEADER_H = 82;
-const TITLE_START_TOP = HEADER_H + 12;
-const TITLE_START_LEFT = 28;
-const TITLE_END_TOP = 54;
-/** 滚动超过这个距离就切到小标题（不带中间态，避免停在半途的畸形标题） */
-const TITLE_SWITCH_AT = 10;
+const TOPBAR_H = "calc(var(--pf-status-bar-h, 38px) + 48px)";
+const TITLE_END_TOP = "calc(var(--pf-status-bar-h, 38px) + 12px)";
+/** 大标题回归滚动流后，scrollTop 与橡皮筋上推之和超过 44px（迟滞 32px）自动切换为小标题 */
+const TITLE_SWITCH_AT = 44;
 
 /**
  * 二级页统一顶栏：渲染在页面滚动容器**外面**（App 根层的绝对定位覆盖层），
- * 因此滚动、overscroll 回弹都不会带走它。内容顶部由 subpage-top 留出 94px。
- * 渐进模糊底 + 左侧返回 + 屏幕正中 17px 标题（与一级页折叠后的小标题同一水平线）。
+ * 因此滚动、overscroll 回弹都不会带走它。内容顶部由 subpage-top 留出状态栏 + 56px。
+ * 无遮罩 2 层裁切高度纯渐进模糊底 + 左侧返回 + 屏幕正中 17px 标题（与一级页折叠后的小标题同一水平线）。
  */
 function SubPageTopBar({ title, onBack }: { title: string; onBack: () => void }) {
   return (
-    <div className="absolute top-0 left-0 right-0 z-40 pointer-events-none" style={{ height: HEADER_H }}>
-      <div className="pf-topbar-blur" style={{ height: HEADER_H }} aria-hidden="true">
+    <div className="absolute top-0 left-0 right-0 z-40 pointer-events-none" style={{ height: TOPBAR_H }}>
+      <div className="pf-topbar-blur" style={{ height: TOPBAR_H }} aria-hidden="true">
         <span className="pf-frost pf-frost-1" />
-
         <span className="pf-frost pf-frost-2" />
-
-        <span className="pf-frost pf-frost-3" />
-
-        <span className="pf-frost pf-frost-4" />
-
-        <span className="pf-frost pf-frost-5" />
-        <span className="pf-topbar-tint" />
       </div>
-      <div className="relative z-40 h-full px-6" style={{ paddingTop: 42 }}>
+      <div
+        className="relative z-40 h-full px-6"
+        style={{ paddingTop: "var(--pf-status-bar-h, 38px)" }}
+      >
         <div className="relative flex h-11 items-center">
           <button
             type="button"
@@ -1248,29 +1242,103 @@ function DeviceCard({
 }
 
 /**
- * 全局橡皮筋：滚动容器加 data-rb="y" 或 data-rb="x" 即可。
- * 手指把容器拖到边界外时，容器跟手位移；松手用带轻微过冲的缓动弹回。
- * 只改 transform，不 setState，不触发 React 重渲染。
- * 页面级列表加 data-rb-always="1"：内容不够长也允许回弹。
+ * Miuix 同源物理橡皮筋（对照 `clients/panfang-chat` 所用 `miuix-ui` `SpringMath` / `SpringOperator`）：
+ * - 全程 `{ passive: true }` 监听，绝不调用 `preventDefault()` 阻断 Android Chromium 原生 120Hz 滚动与 Fling 甩出惯性；
+ * - 纯 `translate3d` 整块平移，不做 `scaleY`/`scaleX` 拉伸，文字卡片零形变；
+ * - 三次阻尼曲线（起手 1:1 跟手，上限为容器跨度的 1/3）+ Web Animations API（GPU 合成器线程）临界阻尼解析弹簧回弹；
+ * - 连续滑动撞边零停顿切入橡皮筋，回传竖向位移驱动短/长页大小标题平滑切换。
  */
-function useRubberBand() {
+function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
+  const onTabOverscrollRef = useRef(onTabOverscroll);
+  onTabOverscrollRef.current = onTabOverscroll;
+
   useEffect(() => {
+    type SpringState = {
+      anim: Animation;
+      A: number;
+      B: number;
+      omega: number;
+      durationMs: number;
+      axis: "x" | "y";
+      headerTimer: number | null;
+    };
+    const activeSprings = new WeakMap<HTMLElement, SpringState>();
+    const runningSet = new Set<HTMLElement>();
+
     let node: HTMLElement | null = null;
     let root: HTMLElement | null = null;
     let target: HTMLElement | null = null;
     let axis: "x" | "y" = "y";
     let startX = 0;
     let startY = 0;
-    let start = 0;
-    let dragging = false;
+    let prevCur = 0;
+    let prevScrollPos = 0;
+    let rawDrag = 0;
+    let currentPos = 0;
+    let overscrollSign = 0;
+    let releaseVel = 0;
+    let lastMoveTime = 0;
+    let lockedAxis = false;
     let always = false;
-    let atTop = false;
-    let atBottom = false;
-    let scrollable = false;
-    const MAX = 36;
+    let cachedScrollable = false;
+    let cachedMax = 0;
+    let cachedRange = 360;
+    let dragVel = 0;
+    let lastDragTime = 0;
+    let flingCleanup: (() => void) | null = null;
 
-    /** 按手势方向找最近的同轴滚动容器：横滑就找 data-rb="x"，竖滑找 y。
-     *  内层列表没内容可滚时跳过，交给外层页面，避免短列表挡住整页滚动。 */
+    const calcEmaVel = (prevVel: number, prevTs: number, deltaPos: number) => {
+      const now = performance.now();
+      const dt = (now - prevTs) / 1000;
+      if (dt <= 0.001) return null;
+      const inst = Math.max(-6000, Math.min(6000, deltaPos / dt));
+      return { vel: prevVel * 0.45 + inst * 0.55, ts: now };
+    };
+
+    const updateVel = (deltaPos: number) => {
+      const next = calcEmaVel(releaseVel, lastMoveTime, deltaPos);
+      if (next) {
+        releaseVel = next.vel;
+        lastMoveTime = next.ts;
+      }
+    };
+
+    const updateDragVel = (deltaPos: number) => {
+      const next = calcEmaVel(dragVel, lastDragTime, deltaPos);
+      if (next) {
+        dragVel = next.vel;
+        lastDragTime = next.ts;
+      }
+    };
+
+    const stopFlingWatch = () => {
+      if (flingCleanup) {
+        flingCleanup();
+        flingCleanup = null;
+      }
+    };
+
+    const rangeOf = (el: HTMLElement, ax: "x" | "y") =>
+      ax === "y" ? Math.max(360, el.clientHeight) : Math.max(240, el.clientWidth);
+
+    /** Miuix SpringMath.obtainDampingDistance: (x - x^2 + x^3/3) * range, x in [0, 1] */
+    const miuixDamping = (raw: number, range: number) => {
+      if (raw === 0) return 0;
+      const x = Math.min(1, Math.max(0, Math.abs(raw) / range));
+      return Math.sign(raw) * (x - x * x + (x * x * x) / 3) * range;
+    };
+
+    /** Miuix SpringMath.obtainTouchDistance: 三次阻尼精确反函数，回弹中途接住时无跳变 */
+    const miuixTouchDistance = (offset: number, range: number) => {
+      const maxOffset = range / 3;
+      const abs = Math.min(Math.abs(offset), maxOffset);
+      if (abs <= 0) return 0;
+      const inner = range - 3 * abs;
+      const term =
+        Math.pow(range, 2 / 3) * Math.sign(inner) * Math.pow(Math.abs(inner), 1 / 3);
+      return Math.sign(offset) * (range - term);
+    };
+
     const find = (el: HTMLElement | null, want: "x" | "y") => {
       while (el && el !== document.body) {
         if (el.dataset.rb === want) {
@@ -1284,21 +1352,136 @@ function useRubberBand() {
       return null;
     };
 
-    const settle = (el: HTMLElement) => {
-      el.style.transition = "transform 420ms cubic-bezier(0.22, 1.35, 0.36, 1)";
-      el.style.transform = "";
-      const done = () => {
-        el.style.transition = "";
-        el.removeEventListener("transitionend", done);
-      };
-      el.addEventListener("transitionend", done);
+    const notifyTabOffset = (offsetY: number) => {
+      onTabOverscrollRef.current(offsetY);
     };
 
-    /** 只给本次手势挂 touchmove，避免全局 non-passive 监听拖慢正常滚动 */
+    const evalSpringPos = (st: SpringState): number => {
+      const ct = st.anim.currentTime;
+      const tMs = typeof ct === "number" ? ct : 0;
+      const t = Math.max(0, Math.min(st.durationMs, tMs)) / 1000;
+      return (st.A + st.B * t) * Math.exp(-st.omega * t);
+    };
+
+    const stopSpring = (el: HTMLElement): { pos: number; axis: "x" | "y" } | null => {
+      const st = activeSprings.get(el);
+      if (!st) return null;
+      const pos = evalSpringPos(st);
+      if (st.headerTimer !== null) {
+        window.clearTimeout(st.headerTimer);
+      }
+      activeSprings.delete(el);
+      runningSet.delete(el);
+      st.anim.cancel();
+      return { pos, axis: st.axis };
+    };
+
+    const startSpring = (el: HTMLElement, initPos: number, initVel: number, ax: "x" | "y") => {
+      stopSpring(el);
+      const isTab = el.dataset.rbTab === "1";
+      if (Math.abs(initPos) < 0.3 && Math.abs(initVel) < 120) {
+        el.style.transition = "";
+        el.style.transform = "";
+        if (isTab && ax === "y") notifyTabOffset(0);
+        return;
+      }
+      if (typeof el.animate !== "function") {
+        el.style.transition = "";
+        el.style.transform = "";
+        if (isTab && ax === "y") notifyTabOffset(0);
+        return;
+      }
+
+      // Miuix SpringMath 临界阻尼（zeta = 1.0）精确解析解：x(t) = (A + B*t) * e^(-omega*t)
+      const clampVel = Math.max(-2500, Math.min(2500, Math.abs(initVel) < 80 ? 0 : initVel));
+      const period = Math.abs(clampVel) > 1800 ? 0.52 : 0.4;
+      const omega = (2 * Math.PI) / period;
+      const A = initPos;
+      const B = clampVel + omega * initPos;
+
+      let durationSec = 0.56;
+      for (let t = 0.24; t <= 0.56; t += 0.02) {
+        const expTerm = Math.exp(-omega * t);
+        const x = (A + B * t) * expTerm;
+        const v = (clampVel - omega * B * t) * expTerm;
+        if (Math.abs(x) < 0.5 && Math.abs(v) < 15) {
+          durationSec = t;
+          break;
+        }
+      }
+      const durationMs = Math.round(durationSec * 1000);
+
+      const SAMPLES = 40;
+      const keyframes: Keyframe[] = [];
+      for (let i = 0; i < SAMPLES; i++) {
+        const t = (i / SAMPLES) * durationSec;
+        const x = (A + B * t) * Math.exp(-omega * t);
+        keyframes.push({
+          transform:
+            ax === "y" ? `translate3d(0, ${x.toFixed(2)}px, 0)` : `translate3d(${x.toFixed(2)}px, 0, 0)`,
+        });
+      }
+      keyframes.push({
+        transform: ax === "y" ? "translate3d(0, 0px, 0)" : "translate3d(0px, 0, 0)",
+      });
+
+      // 不使用 fill: "forwards"，避免动画结束后遗留合成层；启动同时清除内联样式交由合成器接管
+      const anim = el.animate(keyframes, { duration: durationMs, easing: "linear" });
+      el.style.transition = "";
+      el.style.transform = "";
+
+      const st: SpringState = {
+        anim,
+        A,
+        B,
+        omega,
+        durationMs,
+        axis: ax,
+        headerTimer: null,
+      };
+      activeSprings.set(el, st);
+      runningSet.add(el);
+
+      if (isTab && ax === "y") {
+        if (initPos < -32) {
+          let expandMs = durationMs;
+          const stepSec = 0.008;
+          for (let t = stepSec; t <= durationSec; t += stepSec) {
+            const x = (A + B * t) * Math.exp(-omega * t);
+            if (x >= -32) {
+              expandMs = Math.round(t * 1000);
+              break;
+            }
+          }
+          st.headerTimer = window.setTimeout(() => {
+            if (activeSprings.get(el) === st) {
+              st.headerTimer = null;
+              notifyTabOffset(0);
+            }
+          }, expandMs);
+        } else {
+          notifyTabOffset(0);
+        }
+      }
+
+      anim.onfinish = () => {
+        if (activeSprings.get(el) !== st) return;
+        if (st.headerTimer !== null) {
+          window.clearTimeout(st.headerTimer);
+          st.headerTimer = null;
+        }
+        activeSprings.delete(el);
+        runningSet.delete(el);
+        el.style.transition = "";
+        el.style.transform = "";
+        if (isTab && ax === "y") notifyTabOffset(0);
+      };
+    };
+
     function attach(el: HTMLElement) {
       detach();
       root = el;
-      el.addEventListener("touchmove", onMove, { passive: false });
+      el.addEventListener("touchmove", onMove, { passive: true });
       el.addEventListener("touchend", onEnd, { passive: true });
       el.addEventListener("touchcancel", onEnd, { passive: true });
     }
@@ -1311,79 +1494,337 @@ function useRubberBand() {
       root = null;
     }
 
+    const watchFling = (
+      el: HTMLElement,
+      ax: "x" | "y",
+      fingerVel: number
+    ) => {
+      stopFlingWatch();
+      const flingDir = fingerVel > 0 ? 1 : -1;
+      const startTs = performance.now();
+      const initPos = ax === "y" ? el.scrollTop : el.scrollLeft;
+      const initMax = Math.max(
+        0,
+        ax === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth
+      );
+      if (initMax <= 2) return;
+
+      // 松手瞬间已贴死边界且余速可观：直接转化为边界溢出弹性回弹
+      if ((flingDir > 0 && initPos <= 1) || (flingDir < 0 && initPos >= initMax - 1)) {
+        const impactVel = Math.min(1800, Math.abs(fingerVel) * 0.45);
+        if (impactVel >= 200) {
+          startSpring(el, 0, flingDir * impactVel, ax);
+        }
+        return;
+      }
+
+      let prevPos = initPos;
+      let prevTs = startTs;
+      let scrollSpeed = 0;
+      let sampleCount = 0;
+      let idleTimer = 0;
+      let rafCheck = 0;
+
+      const finish = () => {
+        if (idleTimer) window.clearTimeout(idleTimer);
+        if (rafCheck) cancelAnimationFrame(rafCheck);
+        el.removeEventListener("scroll", onFlingScroll);
+        if (flingCleanup === finish) flingCleanup = null;
+      };
+
+      const checkEdge = (cur: number, realMax: number, now: number) => {
+        if ((flingDir > 0 && cur <= 1) || (flingDir < 0 && realMax > 2 && cur >= realMax - 1)) {
+          const sinceSample = Math.max(0, (now - prevTs) / 1000);
+          const sinceStart = Math.max(0, (now - startTs) / 1000);
+          const rawRemain =
+            sampleCount >= 2 && scrollSpeed > 0
+              ? scrollSpeed * Math.exp(-2.5 * sinceSample)
+              : Math.abs(fingerVel) * Math.exp(-3.0 * sinceStart);
+          finish();
+          const impactVel = Math.min(1800, rawRemain * 0.48);
+          if (impactVel >= 200 && el.isConnected && !activeSprings.has(el)) {
+            startSpring(el, 0, flingDir * impactVel, ax);
+          }
+          return true;
+        }
+        return false;
+      };
+
+      const resetIdle = () => {
+        if (idleTimer) window.clearTimeout(idleTimer);
+        idleTimer = window.setTimeout(finish, 110);
+      };
+
+      const onFlingScroll = () => {
+        if (!el.isConnected) {
+          finish();
+          return;
+        }
+        const now = performance.now();
+        const cur = ax === "y" ? el.scrollTop : el.scrollLeft;
+        const realMax = Math.max(
+          0,
+          ax === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth
+        );
+        const dt = (now - prevTs) / 1000;
+        const moved = cur - prevPos;
+        // flingDir > 0 (手指向下) => scrollTop 减小 (moved < 0)；反之亦然
+        if (dt > 0.004 && moved * flingDir < 0) {
+          const inst = Math.min(6000, Math.abs(moved) / dt);
+          scrollSpeed = sampleCount === 0 ? inst : scrollSpeed * 0.4 + inst * 0.6;
+          sampleCount++;
+          prevPos = cur;
+          prevTs = now;
+        }
+        if (checkEdge(cur, realMax, now)) return;
+        resetIdle();
+      };
+
+      flingCleanup = finish;
+      el.addEventListener("scroll", onFlingScroll, { passive: true });
+      resetIdle();
+      // 下一帧兜底检查：防止离边仅剩数像素、首帧直接滑到头却尚未派发 scroll 时漏触发
+      rafCheck = requestAnimationFrame(() => {
+        rafCheck = 0;
+        if (flingCleanup !== finish || !el.isConnected) return;
+        const cur = ax === "y" ? el.scrollTop : el.scrollLeft;
+        const realMax = Math.max(
+          0,
+          ax === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth
+        );
+        checkEdge(cur, realMax, performance.now());
+      });
+    };
+
     const onStart = (event: TouchEvent) => {
       detach();
+      stopFlingWatch();
       node = null;
+      rawDrag = 0;
+      currentPos = 0;
+      prevScrollPos = 0;
+      overscrollSign = 0;
+      releaseVel = 0;
+      dragVel = 0;
+      lockedAxis = false;
+      lastMoveTime = performance.now();
+      lastDragTime = lastMoveTime;
       target =
         event.touches.length === 1 && event.target instanceof Element
           ? (event.target as HTMLElement)
           : null;
       if (!target) return;
-      // 输入框里拖拽是选字/移动光标，不能当列表回弹吃掉
-      if (target.closest("input, textarea, [contenteditable='true']")) {
+      if (target.closest("input, textarea, [contenteditable='true'], [role='slider'], [data-no-rb]")) {
         target = null;
         return;
       }
+
+      // 若命中的滚动容器仍在回弹中（>= 4px），立即停止弹簧并用反函数无缝接手
       let box: HTMLElement | null = target;
-      while (box && box !== document.body && !box.dataset.rb) box = box.parentElement;
-      if (!box || box === document.body) {
+      let resuming: { el: HTMLElement; spring: SpringState } | null = null;
+      let rbContainer: HTMLElement | null = null;
+      while (box && box !== document.body) {
+        if (box.dataset.rb) {
+          if (!rbContainer) rbContainer = box;
+          const sp = activeSprings.get(box);
+          if (sp) {
+            const curSpringPos = evalSpringPos(sp);
+            if (Math.abs(curSpringPos) < 4) {
+              stopSpring(box);
+              box.style.transition = "";
+              box.style.transform = "";
+              if (box.dataset.rbTab === "1" && sp.axis === "y") notifyTabOffset(0);
+            } else {
+              resuming = { el: box, spring: sp };
+              break;
+            }
+          }
+        }
+        box = box.parentElement;
+      }
+      if (!rbContainer) {
         target = null;
         return;
       }
+
       startX = event.touches[0].clientX;
       startY = event.touches[0].clientY;
-      dragging = false;
-      attach(box);
+
+      if (resuming) {
+        const sp = stopSpring(resuming.el)!;
+        node = resuming.el;
+        axis = sp.axis;
+        always = node.dataset.rbAlways === "1";
+        cachedMax = Math.max(
+          0,
+          axis === "y"
+            ? node.scrollHeight - node.clientHeight
+            : node.scrollWidth - node.clientWidth
+        );
+        cachedScrollable = cachedMax > 2;
+        cachedRange = rangeOf(node, axis);
+        prevScrollPos = axis === "y" ? node.scrollTop : node.scrollLeft;
+        currentPos = sp.pos;
+        rawDrag = miuixTouchDistance(sp.pos, cachedRange);
+        overscrollSign = sp.pos >= 0 ? 1 : -1;
+        prevCur = axis === "y" ? startY : startX;
+        lockedAxis = true;
+        node.style.transition = "none";
+        node.style.transform =
+          axis === "y"
+            ? `translate3d(0, ${currentPos.toFixed(2)}px, 0)`
+            : `translate3d(${currentPos.toFixed(2)}px, 0, 0)`;
+        if (node.dataset.rbTab === "1" && axis === "y") notifyTabOffset(currentPos);
+        attach(resuming.el);
+        return;
+      }
+
+      attach(rbContainer);
     };
 
     const onMove = (event: TouchEvent) => {
       if (!target || event.touches.length !== 1) return;
       const curX = event.touches[0].clientX;
       const curY = event.touches[0].clientY;
-      if (!node) {
+
+      if (!lockedAxis) {
         const dx = curX - startX;
         const dy = curY - startY;
-        if (Math.max(Math.abs(dx), Math.abs(dy)) < 6) return;
+        if (Math.max(Math.abs(dx), Math.abs(dy)) < 3) return;
         const want: "x" | "y" = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
         const el = find(target, want);
         if (!el) {
           target = null;
+          detach();
           return;
         }
+        const sp = stopSpring(el);
         node = el;
         axis = want;
         always = el.dataset.rbAlways === "1";
-        const pos = axis === "y" ? el.scrollTop : el.scrollLeft;
-        const max =
-          axis === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth;
-        scrollable = max > 2;
-        atTop = pos <= 1;
-        atBottom = pos >= max - 1;
-        el.style.transition = "none";
-        start = axis === "y" ? curY : curX;
+        cachedMax = Math.max(
+          0,
+          axis === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth
+        );
+        cachedScrollable = cachedMax > 2;
+        cachedRange = rangeOf(el, axis);
+        prevScrollPos = axis === "y" ? el.scrollTop : el.scrollLeft;
+        prevCur = axis === "y" ? startY : startX;
+        if (sp && Math.abs(sp.pos) >= 4) {
+          currentPos = sp.pos;
+          rawDrag = miuixTouchDistance(sp.pos, cachedRange);
+          overscrollSign = sp.pos >= 0 ? 1 : -1;
+          el.style.transition = "none";
+          el.style.transform =
+            axis === "y"
+              ? `translate3d(0, ${currentPos.toFixed(2)}px, 0)`
+              : `translate3d(${currentPos.toFixed(2)}px, 0, 0)`;
+        } else if (sp) {
+          el.style.transition = "";
+          el.style.transform = "";
+        }
+        lockedAxis = true;
       }
+
       const el = node;
+      if (!el) return;
       const cur = axis === "y" ? curY : curX;
-      const delta = cur - start;
-      if (!dragging) {
-        if (Math.abs(delta) < 4) return;
-        const outward = scrollable
-          ? (atTop && delta > 0) || (atBottom && delta < 0)
-          : always;
-        if (!outward) return;
-        dragging = true;
-        start = cur;
-        return;
+      const step = cur - prevCur;
+      prevCur = cur;
+      const pos = axis === "y" ? el.scrollTop : el.scrollLeft;
+
+      if (rawDrag === 0) {
+        if (!cachedScrollable) {
+          if (!always) {
+            prevScrollPos = pos;
+            return;
+          }
+          overscrollSign = step >= 0 ? 1 : -1;
+          rawDrag = step;
+        } else {
+          const atTop = pos <= 1;
+          const atBottom = pos >= cachedMax - 1;
+          if (atTop && step > 0) {
+            const consumed = Math.max(0, prevScrollPos - pos);
+            const excess = step - consumed;
+            if (excess <= 0) {
+              prevScrollPos = pos;
+              return;
+            }
+            const activeSp = stopSpring(el);
+            const baseRaw =
+              activeSp && activeSp.pos > 0 ? miuixTouchDistance(activeSp.pos, cachedRange) : 0;
+            overscrollSign = 1;
+            rawDrag = baseRaw + excess;
+          } else if (atBottom && step < 0) {
+            const realMax = Math.max(
+              0,
+              axis === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth
+            );
+            cachedMax = realMax;
+            cachedScrollable = cachedMax > 2;
+            if (pos < cachedMax - 1) {
+              prevScrollPos = pos;
+              return;
+            }
+            const consumed = Math.max(0, pos - prevScrollPos);
+            const excess = step + consumed;
+            if (excess >= 0) {
+              prevScrollPos = pos;
+              return;
+            }
+            const activeSp = stopSpring(el);
+            const baseRaw =
+              activeSp && activeSp.pos < 0 ? miuixTouchDistance(activeSp.pos, cachedRange) : 0;
+            overscrollSign = -1;
+            rawDrag = baseRaw + excess;
+          } else {
+            updateDragVel(step);
+            prevScrollPos = pos;
+            return;
+          }
+        }
+        el.style.transition = "none";
+        lastMoveTime = performance.now();
+        releaseVel = 0;
+      } else {
+        if (cachedScrollable && step * overscrollSign < 0) {
+          const leftEdge = overscrollSign > 0 ? pos > 2 : pos < cachedMax - 2;
+          if (leftEdge) {
+            if (Math.abs(currentPos) > 1) {
+              startSpring(el, currentPos, 0, axis);
+            } else {
+              el.style.transform = "";
+              if (el.dataset.rbTab === "1" && axis === "y") notifyTabOffset(0);
+            }
+            rawDrag = 0;
+            currentPos = 0;
+            releaseVel = 0;
+            prevScrollPos = pos;
+            return;
+          }
+        }
+        rawDrag += step;
+        if (cachedScrollable && overscrollSign * rawDrag <= 0) {
+          rawDrag = 0;
+          currentPos = 0;
+          releaseVel = 0;
+          el.style.transform = "";
+          if (el.dataset.rbTab === "1" && axis === "y") notifyTabOffset(0);
+          prevScrollPos = pos;
+          return;
+        }
       }
-      if (event.cancelable) event.preventDefault();
-      const raw = cur - start;
-      let d = Math.sign(raw) * Math.min(MAX, Math.abs(raw) * 0.42);
-      if (scrollable) {
-        if (atTop && d < 0) d = 0;
-        if (atBottom && d > 0) d = 0;
-      }
+      prevScrollPos = pos;
+
+      const nextPos = miuixDamping(rawDrag, cachedRange);
+      updateVel(nextPos - currentPos);
+      currentPos = nextPos;
       el.style.transform =
-        axis === "y" ? `translate3d(0, ${d}px, 0)` : `translate3d(${d}px, 0, 0)`;
+        axis === "y"
+          ? `translate3d(0, ${nextPos.toFixed(2)}px, 0)`
+          : `translate3d(${nextPos.toFixed(2)}px, 0, 0)`;
+      if (el.dataset.rbTab === "1" && axis === "y") notifyTabOffset(nextPos);
     };
 
     const onEnd = () => {
@@ -1391,20 +1832,42 @@ function useRubberBand() {
       const el = node;
       node = null;
       if (el) {
-        if (dragging) {
-          dragging = false;
-          settle(el);
+        if (Math.abs(currentPos) > 0.3) {
+          const vel = performance.now() - lastMoveTime > 45 ? 0 : releaseVel;
+          startSpring(el, currentPos, vel, axis);
         } else {
-          el.style.transition = "";
-          el.style.transform = "";
+          if (el.style.transition) el.style.transition = "";
+          if (el.style.transform) el.style.transform = "";
+          notifyTabOffset(0);
+          const fVel = performance.now() - lastDragTime > 60 ? 0 : dragVel;
+          if (cachedScrollable && Math.abs(fVel) > 160) {
+            watchFling(el, axis, fVel);
+          }
         }
+      } else {
+        notifyTabOffset(0);
       }
+      rawDrag = 0;
+      currentPos = 0;
+      prevScrollPos = 0;
+      dragVel = 0;
       detach();
     };
 
     document.addEventListener("touchstart", onStart, { passive: true });
     return () => {
       document.removeEventListener("touchstart", onStart);
+      stopFlingWatch();
+      runningSet.forEach(el => {
+        const st = activeSprings.get(el);
+        if (st) {
+          if (st.headerTimer !== null) window.clearTimeout(st.headerTimer);
+          st.anim.cancel();
+        }
+        activeSprings.delete(el);
+      });
+      runningSet.clear();
+      notifyTabOffset(0);
       detach();
     };
   }, []);
@@ -1457,8 +1920,12 @@ function WebViewGateScreen({ major, onContinue }: { major: number; onContinue: (
 }
 
 export default function App() {
-  // 所有标了 data-rb 的滚动容器共用一套橡皮筋手势
-  useRubberBand();
+  // 全页 Miuix 物理橡皮筋：Tab 上拉越过顶部/底部时同步回传竖向位移，联动大小标题平滑切换
+  useRubberBand(offsetY => {
+    if (rbOffsetYRef.current === offsetY) return;
+    rbOffsetYRef.current = offsetY;
+    updateTabHeader();
+  });
 
   // 启动时读一次上次退出时的界面态：页面栈 + 账号资料 / 设备 / 表盘列表 / 编辑中的表盘
   const [boot] = useState(() => {
@@ -1696,23 +2163,47 @@ export default function App() {
   const INSTALL_STALL_MS = 35000;
   /** 最近一次收到安装/传输进度事件的时刻（看门狗据此判断「还在动」） */
   const installBeat = useRef(0);
+  /** 停滞超过 25 秒时允许用户主动取消安装，防止底层链路死等时完全卡死在全屏遮罩 */
+  const [installStallCanCancel, setInstallStallCanCancel] = useState(false);
+  const installStallAbortRef = useRef<(() => void) | null>(null);
   const withStallGuard = <T,>(p: Promise<T>): Promise<T> =>
     new Promise<T>((resolve, reject) => {
       const startedAt = Date.now();
+      setInstallStallCanCancel(false);
+      let settled = false;
+      const cleanup = () => {
+        window.clearInterval(timer);
+        setInstallStallCanCancel(false);
+        installStallAbortRef.current = null;
+      };
+      installStallAbortRef.current = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error("已取消安装（设备长时间无响应）"));
+      };
       const timer = window.setInterval(() => {
+        if (settled) return;
         const beat = Math.max(installBeat.current, startedAt);
-        if (Date.now() - beat > INSTALL_STALL_MS) {
-          window.clearInterval(timer);
+        const idle = Date.now() - beat;
+        if (idle >= 25000) setInstallStallCanCancel(true);
+        if (idle > INSTALL_STALL_MS) {
+          settled = true;
+          cleanup();
           reject(new Error("设备长时间无响应（安装停滞）"));
         }
       }, 1000);
       p.then(
         v => {
-          window.clearInterval(timer);
+          if (settled) return;
+          settled = true;
+          cleanup();
           resolve(v);
         },
         e => {
-          window.clearInterval(timer);
+          if (settled) return;
+          settled = true;
+          cleanup();
           reject(e);
         }
       );
@@ -2007,20 +2498,22 @@ export default function App() {
   /** 点了安装、正在读包体列表的资源（按钮转「准备中…」；与 installBusyRef 一起挡连点） */
   const [installPreparing, setInstallPreparing] = useState<string | null>(null);
 
+  // —— 全局折叠标题与顶栏模糊 ——
   // —— 全局折叠标题 ——
-  // 只切两态（大标题 / 小标题），直接用 ref 改 data 属性，不走 setState。
-  const collapseTitleRef = useRef<HTMLDivElement | null>(null);
+  // 大标题在滚动流内部 1:1 跟手滚动；有效上推距离（scrollTop + 橡皮筋向上位移动量）超过阈值时平滑切换为居中顶栏小标题，
+  // 静止或轻滑（<44px）保持大标题不误切，短页继续上推越过顶栏也能正常切成小标题而不被白推出屏幕。
+  const collapseTitleRef = useRef<HTMLHeadingElement | null>(null);
   const collapseSmallRef = useRef<HTMLDivElement | null>(null);
   /** 当前是不是「小标题」态：只在翻转时写一次 DOM */
   const collapseCollapsedRef = useRef(false);
   const collapseScrollRef = useRef(0);
-  const collapseRafRef = useRef<number | null>(null);
+  const rbOffsetYRef = useRef(0);
 
-  /** 滚动离开顶部 → 大标题淡出、小标题在顶部淡入；回到顶部则反过来。中间不做位移/缩放。
-      两个阈值做迟滞：切过去要 10px、切回来只要 4px，手指在临界点轻微抖动不会来回闪。 */
-  const applyCollapse = (top: number) => {
+  /** 根据 scrollTop + 橡皮筋上推量同步大小标题显隐（迟滞：>44px 折叠，<=32px 展开） */
+  const updateTabHeader = () => {
+    const effective = collapseScrollRef.current + Math.max(0, -rbOffsetYRef.current);
     const wasCollapsed = collapseCollapsedRef.current;
-    const collapsed = wasCollapsed ? top > 4 : top > TITLE_SWITCH_AT;
+    const collapsed = wasCollapsed ? effective > 32 : effective > TITLE_SWITCH_AT;
     if (collapsed === wasCollapsed) return;
     collapseCollapsedRef.current = collapsed;
     const big = collapseTitleRef.current;
@@ -2031,17 +2524,14 @@ export default function App() {
 
   const handleTabScroll = (e: React.UIEvent<HTMLDivElement>) => {
     collapseScrollRef.current = e.currentTarget.scrollTop;
-    if (collapseRafRef.current !== null) return;
-    collapseRafRef.current = requestAnimationFrame(() => {
-      collapseRafRef.current = null;
-      applyCollapse(collapseScrollRef.current);
-    });
+    updateTabHeader();
   };
 
-  // 切 Tab / 回到主界面：标题复位到「大标题在起点」
+  // 切 Tab / 回到主界面：大小标题复位到顶部初态
   useEffect(() => {
     if (currentStep !== "main") return;
     collapseScrollRef.current = 0;
+    rbOffsetYRef.current = 0;
     collapseCollapsedRef.current = false;
     const big = collapseTitleRef.current;
     const small = collapseSmallRef.current;
@@ -2064,18 +2554,12 @@ export default function App() {
     if (!el) return;
     const top = marketScrollTopRef.current;
     el.scrollTop = top;
-    // 顶栏大标题的折叠进度也跟着回到原样（上面那个 effect 刚把它复位成 0）
+    // 顶栏大小标题状态也跟着回到原样（上面那个 effect 刚把它复位成 0）
     collapseScrollRef.current = top;
-    applyCollapse(top);
+    rbOffsetYRef.current = 0;
+    updateTabHeader();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentStep, activeTab]);
-
-  useEffect(
-    () => () => {
-      if (collapseRafRef.current !== null) cancelAnimationFrame(collapseRafRef.current);
-    },
-    []
-  );
 
   const installBusyRef = useRef(false);
   /** 这次本地安装装的是什么：表盘有「设为当前」那一步，快应用没有 → 进度文案要分开 */
@@ -2114,10 +2598,11 @@ export default function App() {
   const [dialName, setDialName] = useState("雾屿蓝");
   /** 这次安装来自哪里：兑换流程（演示）/ 本地 .bin 文件 / 集市 → 决定失败后「重试安装」怎么重试 */
   const [installSource, setInstallSource] = useState<"paid" | "local" | "market">("paid");
-  /** 本地安装的待装文件（失败重试要用同一份字节，不再让用户重选文件） */
+  /** 本地安装的待装文件（失败重试要用同一份字节或作品 ID，不再让用户重选文件） */
   const localInstall = useRef<{
     addr: string;
-    b64: string;
+    b64?: string;
+    projectId?: string;
     ext: string;
     rewriteId?: string;
   } | null>(null);
@@ -2443,6 +2928,11 @@ export default function App() {
     setActiveActionSheetDial(null);
     setUninstallConfirmDial(null);
     setShowLogoutConfirm(false);
+    setPaidAccountConfirm(null);
+    setDeviceRemoveConfirm(null);
+    setShowConnectHelpPrompt(false);
+    setDeviceMenu(null);
+    setGenExitAsk(false);
     // 从「怎么连上手环」返回 → 把设备浮窗还回去（它才是上一级界面，用户 2026-10-07 要求）
     if (helpFromDrawer.current && step !== "connect_help") {
       helpFromDrawer.current = false;
@@ -2616,6 +3106,8 @@ export default function App() {
    * 最终落在历史第一条 → canGoBack=false → 侧滑直接退出 App（真机 bug）。
    */
   const resetStackTo = (route: string, thenRoute?: string) => {
+    modalSentinelRef.current = false;
+    modalClosedByPopRef.current = false;
     navStack.current = thenRoute ? [route, thenRoute] : [route];
     const depth = navDepth.current;
     pendingReset.current = route;
@@ -2674,8 +3166,21 @@ export default function App() {
   const archivedIds = useRef<Record<string, boolean>>({});
   /** 其中有留档但属于 Lua 图层的表盘：能装不能编辑，管理页要如实标出来 */
   const luaIds = useRef<Record<string, boolean>>({});
-  /** 编辑页当前会话：留档 .bin 字节 + 图层模型 */
-  const binSession = useRef<{ faceId: string; dataB64: string; model: LayerModelDoc | null } | null>(null);
+  /** 编辑页当前会话：表盘源码定位（留档句柄或视频作品 ID，大文件走 Rust 侧 LRU 缓存） + 图层模型 */
+  const binSession = useRef<{
+    faceId: string;
+    dataB64?: string;
+    archiveAddr?: string;
+    archiveFaceId?: string;
+    videoProjectId?: string;
+    model: LayerModelDoc | null;
+  } | null>(null);
+  const binSourceArgs = (s: NonNullable<typeof binSession.current>) =>
+    s.videoProjectId
+      ? { videoProjectId: s.videoProjectId }
+      : s.archiveAddr && s.archiveFaceId
+        ? { archiveAddr: s.archiveAddr, archiveFaceId: s.archiveFaceId }
+        : { dataB64: s.dataB64 ?? null };
   const dialPreviewSeq = useRef(0); // 预览渲染序号：只让最新一次请求的结果上画布
   const dialSessionSeq = useRef(0); // 编辑会话序号：快速切换表盘时只让最后一次载入落在界面上
   /** 编辑页选项与真实 id 的对应关系（界面只显示文案，下发要用真实序号） */
@@ -2956,28 +3461,27 @@ export default function App() {
     showToast("可在「设置 → 后台保持连接」里允许盘坊后台运行", "error");
   };
 
-  /** 「照片」角标判据：读本地留档 .bin，亮屏样式 backImageId 高字节 0x82（与后端 derive_model 同源） */
+  /** 「照片」角标判据：由 Rust 批量检查留档并仅返回布尔映射，避免把整包 .bin 搬运到 WebView */
   const markPhotoDials = async (addr: string, faceIds: string[]) => {
     if (!invoke) return;
-    for (const faceId of faceIds) {
-      if (photoDialCache.current[faceId] !== undefined) continue;
-      try {
-        const a = (await invoke("watchface_archive_get", { addr, faceId })) as ArchiveData | null;
-        if (!a?.dataB64) {
-          photoDialCache.current[faceId] = false;
-          continue;
-        }
-        const summary = (await invoke("watchface_bin_inspect", { dataB64: a.dataB64 })) as
-          | { styles?: BinStyleSection[] }
-          | null;
-        const isPhoto = isPhotoDialBinSummary(summary);
+    const pending = faceIds.filter(faceId => photoDialCache.current[faceId] === undefined);
+    if (!pending.length) return;
+    try {
+      const flags = (await invoke("watchface_archive_photo_flags", {
+        addr,
+        faceIds: pending
+      })) as Record<string, boolean> | null;
+      const hits: Record<string, boolean> = {};
+      for (const faceId of pending) {
+        const isPhoto = !!flags?.[faceId];
         photoDialCache.current[faceId] = isPhoto;
-        if (isPhoto) {
-          setDials(prev => prev.map(d => (d.id === faceId ? { ...d, isPhotoDial: true } : d)));
-        }
-      } catch {
-        photoDialCache.current[faceId] = false;
+        if (isPhoto) hits[faceId] = true;
       }
+      if (Object.keys(hits).length > 0) {
+        setDials(prev => prev.map(d => (hits[d.id] ? { ...d, isPhotoDial: true } : d)));
+      }
+    } catch {
+      for (const faceId of pending) photoDialCache.current[faceId] = false;
     }
   };
 
@@ -3426,7 +3930,7 @@ export default function App() {
     const mySeq = ++dialPreviewSeq.current;
     try {
       const png = (await invoke("watchface_render_preview", {
-        dataB64: session.dataB64,
+        ...binSourceArgs(session),
         themeIndex: themeIndexOf(styleName),
         photoB64: isPhoto && meta?.b64 ? meta.b64 : null,
         deviceModel: connected.current.model || null,
@@ -3465,7 +3969,12 @@ export default function App() {
     if (currentStep !== "dial_edit") return;
     const session = binSession.current;
     const m = session?.model;
-    if (!invoke || !session?.dataB64 || !m?.photoAlbum) {
+    if (
+      !invoke ||
+      !session ||
+      (!session.dataB64 && !session.videoProjectId && !(session.archiveAddr && session.archiveFaceId)) ||
+      !m?.photoAlbum
+    ) {
       setDialDefaultPhoto(null);
       setDialDefaultLoading(false);
       return;
@@ -3480,7 +3989,7 @@ export default function App() {
     void (async () => {
       try {
         const png = (await invoke("watchface_default_wallpaper", {
-          dataB64: session.dataB64,
+          ...binSourceArgs(session),
           themeIndex,
           deviceModel: connected.current.model || null,
           colorGroup: useCg
@@ -3512,27 +4021,21 @@ export default function App() {
     const stale = () => mySeq !== dialSessionSeq.current;
     const deviceModel = connected.current.model;
     try {
-      // 视频表盘没有普通留档：直接读这个作品的成品 bin（预览会只用序列帧首帧，静态）
-      let dataB64: string;
-      if (videoProject) {
-        const v = (await invoke("video_project_get", {
-          projectId: videoProject.id,
-          kind: "bin"
-        })) as { data_b64?: string } | null;
-        if (!v?.data_b64) throw new Error("作品还没有成品");
-        dataB64 = v.data_b64;
-      } else {
+      // 直接在 Rust 侧通过句柄读取本地视频成品 / 留档 .bin（不在 WebView 内存搬运大体积 Base64）
+      const sourceSession: NonNullable<typeof binSession.current> = videoProject
+        ? { faceId: dial.id, videoProjectId: videoProject.id, model: null }
+        : { faceId: dial.id, archiveAddr: addr, archiveFaceId: dial.id, model: null };
+      if (!videoProject) {
         const a = (await invoke("watchface_archive_get", { addr, faceId: dial.id })) as ArchiveData | null;
-        if (!a?.dataB64) throw new Error("留档为空");
-        dataB64 = a.dataB64;
+        if (!a?.size) throw new Error("留档为空");
       }
       if (stale()) return; // 期间又点了别的表盘 → 这次结果作废
       const model = (await invoke("watchface_layer_model", {
-        dataB64,
+        ...binSourceArgs(sourceSession),
         deviceModel: deviceModel || null
       })) as LayerModelDoc | null;
       if (stale()) return;
-      binSession.current = { faceId: dial.id, dataB64, model };
+      binSession.current = { ...sourceSession, model };
       // 壁纸方案：照片表盘一律进生成器（有方案套模板，没方案用本地通用方案）
       setGenPlan(null);
       setGenPlanError(null);
@@ -3654,8 +4157,97 @@ export default function App() {
   const installLockRef = useRef(false);
   /** 制作壁纸页有东西没保存时：系统返回/侧滑先弹「是否保存」，别直接退走（返回 true = 已拦下） */
   const genBackGuardRef = useRef<(() => boolean) | null>(null);
+  const genPoppedHistoryRef = useRef(false);
   /** 视频表盘页的内部层级（模板/编辑/进度/详情）：返回 true = 已在页内退了一级 */
   const videoBackGuardRef = useRef<(() => boolean) | null>(null);
+  /** 弹窗/菜单的硬件返回拦截器：当前打开了顶部浮层时按返回键仅收起浮层 */
+  const closeTopModalRef = useRef<(() => boolean) | null>(null);
+  const modalSentinelRef = useRef(false);
+  const modalClosedByPopRef = useRef(false);
+
+  const hasModalOverlay = !!(
+    deviceMenu ||
+    uninstallConfirmDial ||
+    activeActionSheetDial ||
+    paidAccountConfirm ||
+    deviceRemoveConfirm ||
+    showLogoutConfirm ||
+    showConnectHelpPrompt ||
+    (appUpdatePrompt && !appUpdate?.mandatory)
+  );
+  closeTopModalRef.current = () => {
+    if (deviceMenu) {
+      modalClosedByPopRef.current = true;
+      setDeviceMenu(null);
+      return true;
+    }
+    if (uninstallConfirmDial) {
+      modalClosedByPopRef.current = true;
+      setUninstallConfirmDial(null);
+      return true;
+    }
+    if (activeActionSheetDial) {
+      modalClosedByPopRef.current = true;
+      setActiveActionSheetDial(null);
+      return true;
+    }
+    if (paidAccountConfirm) {
+      modalClosedByPopRef.current = true;
+      setPaidAccountConfirm(null);
+      return true;
+    }
+    if (deviceRemoveConfirm) {
+      modalClosedByPopRef.current = true;
+      setDeviceRemoveConfirm(null);
+      return true;
+    }
+    if (showLogoutConfirm) {
+      modalClosedByPopRef.current = true;
+      setShowLogoutConfirm(false);
+      return true;
+    }
+    if (showConnectHelpPrompt) {
+      modalClosedByPopRef.current = true;
+      setShowConnectHelpPrompt(false);
+      return true;
+    }
+    if (appUpdatePrompt && !appUpdate?.mandatory) {
+      modalClosedByPopRef.current = true;
+      setAppUpdatePrompt(false);
+      return true;
+    }
+    return false;
+  };
+  useEffect(() => {
+    if (hasModalOverlay && !modalSentinelRef.current) {
+      modalSentinelRef.current = true;
+      modalClosedByPopRef.current = false;
+      navDepth.current += 1;
+      try {
+        window.history.pushState(
+          { panfang: true, route: currentRoute(), overlay: "modal" },
+          "",
+          `#${currentRoute()}`
+        );
+      } catch {
+        /* 忽略 */
+      }
+    } else if (!hasModalOverlay && modalSentinelRef.current) {
+      modalSentinelRef.current = false;
+      if (modalClosedByPopRef.current) {
+        modalClosedByPopRef.current = false;
+      } else if (navDepth.current > 0) {
+        navDepth.current -= 1;
+        expectSelfPop(currentRoute());
+        try {
+          window.history.back();
+        } catch {
+          cancelSelfPop();
+        }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasModalOverlay]);
   useEffect(() => {
     const locked = currentStep === "redeem_installing" && !installError;
     installLockRef.current = locked;
@@ -3725,25 +4317,21 @@ export default function App() {
   }, [currentStep, activeTab, dials.length]);
   useEffect(() => {
     const onPop = (event: PopStateEvent) => {
-      // 安装中锁死返回键：把历史退回本页（一步也走不了），并告诉用户原因
+      // 安装中锁死返回键：硬件/侧滑已在原生侧通过 InstallBackLock 拦截；若历史仍触发 popstate，只提示、不重推 history
       if (installLockRef.current) {
         showToast("安装中，请勿退出", "error");
-        try {
-          window.history.pushState({ panfang: true, route: "install" }, "", "#install");
-        } catch {
-          /* 无 history 环境：忽略 */
-        }
-        navDepth.current += 1;
+        navDepth.current = Math.max(0, navDepth.current - 1);
         return;
       }
-      // 制作壁纸页还有没保存的东西：把历史退回本页，先问「是否保存」
+      // 顶部弹窗/菜单处于打开状态：系统返回先收起浮层（哨兵历史已被弹出）
+      if (closeTopModalRef.current?.()) {
+        navDepth.current = Math.max(0, navDepth.current - 1);
+        return;
+      }
+      // 制作壁纸页还有没保存的东西：不再在 popstate 里重推 history，只同步减 depth，并在用户取消退出时恢复历史
       if (genBackGuardRef.current?.()) {
-        try {
-          window.history.pushState({ panfang: true, route: "generator" }, "", "#generator");
-        } catch {
-          /* 无 history 环境：忽略 */
-        }
-        navDepth.current += 1;
+        genPoppedHistoryRef.current = true;
+        navDepth.current = Math.max(0, navDepth.current - 1);
         return;
       }
       // 视频表盘页内的层级：它自己已经退了一屏并同步了 navDepth；
@@ -5924,7 +6512,8 @@ export default function App() {
    */
   const runLocalInstall = (payload: {
     addr: string;
-    b64: string;
+    b64?: string;
+    projectId?: string;
     ext: string;
     name: string;
     /** 文件类型（watchface / quickapp / unknown）：决定进度文案，也区分 vivo 表盘与小米快应用 */
@@ -5937,6 +6526,7 @@ export default function App() {
     localInstall.current = {
       addr: payload.addr,
       b64: payload.b64,
+      projectId: payload.projectId,
       ext: payload.ext,
       rewriteId: payload.rewriteId
     };
@@ -5967,7 +6557,7 @@ export default function App() {
         // 型号防呆：文件画布 ≠ 本机屏幕 → 直接阻断
         // （例：小米手环10 Pro（336×480）不能装手环10（212×520）或红米手表5（432×514）的表盘）
         // 只识别 .bin；.mwz/.rpk 是容器格式，这里不解析（交给安装流程）。
-        if (payload.ext === "bin") {
+        if (payload.ext === "bin" && payload.b64) {
           try {
             const info = (await inv("bin_inspect_info", { dataB64: payload.b64 })) as {
               canvas?: [number, number] | null;
@@ -5998,12 +6588,17 @@ export default function App() {
         }
         const msg = (await withStallGuard(
           linkLostRace(
-            inv("device_install_payload", {
-              addr: payload.addr,
-              dataB64: payload.b64,
-              ext: payload.ext,
-              rewriteWatchfaceId: payload.rewriteId ?? null
-            })
+            payload.projectId && !payload.b64
+              ? inv("video_project_install", {
+                  addr: payload.addr,
+                  projectId: payload.projectId
+                })
+              : inv("device_install_payload", {
+                  addr: payload.addr,
+                  dataB64: payload.b64 ?? "",
+                  ext: payload.ext,
+                  rewriteWatchfaceId: payload.rewriteId ?? null
+                })
           )
         )) as string | null;
         setInstallProgress(100);
@@ -6047,6 +6642,7 @@ export default function App() {
     input.accept = ".bin,.mwz,.rpk,application/octet-stream";
     input.style.display = "none";
     document.body.appendChild(input);
+    input.addEventListener("cancel", () => input.remove());
     input.addEventListener("change", () => {
       const file = input.files && input.files[0];
       input.remove();
@@ -6276,6 +6872,7 @@ export default function App() {
     input.accept = "image/*";
     input.style.display = "none";
     document.body.appendChild(input);
+    input.addEventListener("cancel", () => input.remove());
     input.addEventListener("change", () => {
       const file = input.files && input.files[0];
       input.remove();
@@ -6651,6 +7248,38 @@ export default function App() {
   /** 这一页有需要问「是否保存」东西：做好的 + 还没生成的 */
   const genDirty = genSessionMade > 0 || genPendingEdit;
 
+  const restoreGenPoppedHistory = () => {
+    if (!genPoppedHistoryRef.current) return;
+    genPoppedHistoryRef.current = false;
+    navDepth.current += 1;
+    try {
+      window.history.pushState({ panfang: true, route: "generator" }, "", "#generator");
+    } catch {
+      /* 忽略 */
+    }
+  };
+
+  const cancelGenExitAsk = () => {
+    setGenExitAsk(false);
+    restoreGenPoppedHistory();
+  };
+
+  const leavePhotoGeneratorPage = (toastMsg: string) => {
+    genBackGuardRef.current = null;
+    if (genPoppedHistoryRef.current) {
+      genPoppedHistoryRef.current = false;
+      if (navStack.current.length <= 1) {
+        resetStackTo("main/manage");
+      } else {
+        navStack.current = navStack.current.slice(0, -1);
+        applyRoute(currentRoute());
+      }
+    } else {
+      goBackOr("main/manage");
+    }
+    showToast(toastMsg);
+  };
+
   /**
    * 保存：**没生成的先按当前编辑生成一张**，再回编辑页（用户 2026-10-16：
    * 「点了保存却没生成，会觉得东西丢了」）。生成失败就留在本页给报错，不走。
@@ -6671,6 +7300,7 @@ export default function App() {
         showToast(humanize(err, "generator"), "error");
         setGenRendering(false);
         setGenSaving(false);
+        restoreGenPoppedHistory();
         return;
       }
       setGenRendering(false);
@@ -6679,9 +7309,7 @@ export default function App() {
     const n = genSessionMade + (genPendingEdit ? 1 : 0);
     // 主动返回（不是系统返回/侧滑）：不要触发「是否保存」守卫。
     // 守卫只在用户自己按返回时问；保存动作已经生成并清场了。
-    genBackGuardRef.current = null;
-    goBackOr("main/manage");
-    showToast(n > 0 ? `已保存 ${n} 张壁纸，在编辑页点「应用」推到手环` : "已返回");
+    leavePhotoGeneratorPage(n > 0 ? `已保存 ${n} 张壁纸，在编辑页点「应用」推到手环` : "已返回");
   };
 
   /** 不保存 = 把这次做的从列表里去掉，回编辑页 */
@@ -6694,9 +7322,7 @@ export default function App() {
       setCurrentWallpaperIndex(0);
     }
     // 用户已经明确选了「不保存」：这是主动离开，不要再次被返回守卫拦下
-    genBackGuardRef.current = null;
-    goBackOr("main/manage");
-    showToast(drop > 0 ? "已放弃这次做的壁纸" : "已返回");
+    leavePhotoGeneratorPage(drop > 0 ? "已放弃这次做的壁纸" : "已返回");
   };
 
   /** 制作壁纸页有东西没保存时：系统返回/侧滑先弹「是否保存」（原生那侧的返回也走 popstate） */
@@ -6766,7 +7392,7 @@ export default function App() {
                 continue;
               }
               const png = (await invoke("watchface_compose_photo", {
-                dataB64: session.dataB64,
+                ...binSourceArgs(session),
                 themeIndex: themeIndexOf(styleName),
                 photoB64: meta.b64,
                 photoTransform: meta.crop,
@@ -6874,9 +7500,19 @@ export default function App() {
 
   return (
     <IconContext.Provider value={{ weight: "bold" }}>
-    <div className="min-h-screen bg-[var(--pf-page)] md:bg-[#0C0D0E] flex items-center justify-center p-0 md:p-6 select-none font-sans">
-      {/* 手机容器：400px 上限只给桌面预览（手机视口比 400 宽时留黑边，见 411dp 的小米机型） */}
-      <div className="w-full md:max-w-[400px] h-[100dvh] md:h-[844px] bg-[var(--pf-page)] md:rounded-[44px] relative flex flex-col overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.3)]">
+    <div
+      className={`min-h-screen bg-[var(--pf-page)] ${
+        invoke ? "" : "md:bg-[#0C0D0E] md:p-6"
+      } flex items-center justify-center p-0 select-none font-sans`}
+    >
+      {/* 手机容器：400px 上限只给桌面浏览器预览；Android/桌面打包端直接全屏铺满 */}
+      <div
+        className={`w-full h-[100dvh] ${
+          invoke
+            ? ""
+            : "md:max-w-[400px] md:h-[844px] md:rounded-[44px] md:shadow-[0_20px_50px_rgba(0,0,0,0.3)]"
+        } bg-[var(--pf-page)] relative flex flex-col overflow-hidden`}
+      >
         
         {/* 核心内容视口容器（普通滚动，不再有全局拖拽形变；顶部假 iOS 状态栏已删） */}
         <div className="flex-1 flex flex-col overflow-hidden relative">
@@ -6970,7 +7606,7 @@ export default function App() {
 
           {/* 0b. vivo 连接引导：先讲两步准备，再开始搜索 */}
           {currentStep === "vivo_scan" && (
-            <div className="flex-1 flex flex-col px-6 pb-10 page-enter-anim subpage-top">
+            <div data-rb="y" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
 
               <div>
                 <p className="pf-fs-17 font-medium text-[var(--pf-i-45)]">
@@ -7073,7 +7709,7 @@ export default function App() {
 
           {/* 1. 登录页 */}
           {currentStep === "login" && (
-            <div className="flex-1 flex flex-col justify-between px-7 pb-12 page-enter-anim subpage-top">
+            <div data-rb="y" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-7 pb-12 page-enter-anim subpage-top">
               <div>
                 <p className="pf-fs-17 font-medium text-[var(--pf-i-45)]">
                   登录小米账号以连接手环
@@ -7252,7 +7888,7 @@ export default function App() {
                             }
                             setMockDevicesList(MOCK_DEVICES);
                           }}
-                          className="h-[44px] px-5 rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold pf-fs-16 cursor-pointer active:scale-95 transition-all"
+                          className="h-[44px] px-5 rounded-full bg-[var(--pf-xiaomi-10)] hover:bg-[var(--pf-xiaomi-15)] text-[var(--pf-xiaomi-ink)] font-bold pf-fs-16 cursor-pointer active:scale-95 transition-all"
                         >
                           重新导入小米设备
                         </button>
@@ -7310,45 +7946,25 @@ export default function App() {
           {currentStep === "main" && (
             <div className="flex-1 flex flex-col overflow-hidden relative">
 
-              {/* 全局顶栏：Miuix 式渐进模糊（5 层递进 + 独立着色渐变，见 index.css）。
-                  标题不在滚动容器里，靠 transform 跟着滚动缩小并滑到顶部居中，所以不会被顶栏裁掉。 */}
-              <div className="pf-topbar-blur" style={{ height: HEADER_H }} aria-hidden="true">
+              {/* 全局顶栏：无遮罩 2 层裁切高度纯渐进模糊（常驻热备不销毁离屏缓冲），
+                  大标题回归滚动流内部 1:1 滚动，这里只留折叠后居中的小标题。 */}
+              <div className="pf-topbar-blur" style={{ height: TOPBAR_H }} aria-hidden="true">
                 <span className="pf-frost pf-frost-1" />
-
                 <span className="pf-frost pf-frost-2" />
-
-                <span className="pf-frost pf-frost-3" />
-
-                <span className="pf-frost pf-frost-4" />
-
-                <span className="pf-frost pf-frost-5" />
-                <span className="pf-topbar-tint" />
               </div>
               {TAB_TITLES[activeTab] && (
-                <>
-                  {/* 大标题：只在页面顶部出现 */}
-                  <div
-                    key={`big-${activeTab}`}
-                    ref={collapseTitleRef}
-                    className="pf-title-big absolute z-30 pointer-events-none whitespace-nowrap pf-fs-32 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
-                    style={{ left: TITLE_START_LEFT, top: TITLE_START_TOP }}
-                  >
-                    {TAB_TITLES[activeTab]}
-                  </div>
-                  {/* 小标题：固定在顶部居中，滚动后淡入 */}
-                  <div
-                    ref={collapseSmallRef}
-                    className="pf-title-small absolute z-30 pointer-events-none whitespace-nowrap pf-fs-19 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
-                    style={{ top: TITLE_END_TOP, left: 0, right: 0, textAlign: "center" }}
-                  >
-                    {TAB_TITLES[activeTab]}
-                  </div>
-                </>
+                <div
+                  ref={collapseSmallRef}
+                  className="pf-title-small absolute z-[31] pointer-events-none whitespace-nowrap pf-fs-19 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
+                  style={{ top: TITLE_END_TOP, left: 0, right: 0, textAlign: "center" }}
+                >
+                  {TAB_TITLES[activeTab]}
+                </div>
               )}
               
               {/* Tab 1: 首页 */}
               {activeTab === "home" && (
-                <div key="tab-home" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-home" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   {/* 首屏没有大标题：内容从 68px 起点开始 */}
                   <div>
                     <div className="flex justify-center">
@@ -7534,13 +8150,23 @@ export default function App() {
               )}
 
               {/* Tab 2: 集市（免费表盘） */}
-              {activeTab === "market" && (
+              {activeTab === "market" && (() => {
+                const marketTags = marketTagOptions(marketFaces);
+                const filteredMarketFaces = filterMarketFaces(marketFaces, marketTag, marketQuery);
+                return (
                 <div key="tab-market" ref={marketListRef} onScroll={e => {
-                  handleTabScroll(e);
-                  marketScrollTopRef.current = e.currentTarget.scrollTop;
-                }} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
-                  {/* 大标题在全局顶栏里（折叠动画）；这里留出同样的高度，标题到设备卡仍是 28px */}
-                  <div className="h-[60px] shrink-0" aria-hidden="true" />
+                  const top = e.currentTarget.scrollTop;
+                  marketScrollTopRef.current = top;
+                  collapseScrollRef.current = top;
+                  updateTabHeader();
+                }} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                  {/* 大标题回归滚动流：1:1 跟手滚出顶栏，短页不折叠 */}
+                  <h1
+                    ref={collapseTitleRef}
+                    className="pf-title-big h-[60px] shrink-0 pl-1 pf-fs-32 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
+                  >
+                    {TAB_TITLES.market}
+                  </h1>
 
                   {/* 搜索框 + 设备胶囊 + 标签胶囊：上面搜索，下面两颗胶囊共用一行 */}
                   <div className="mb-5 shrink-0">
@@ -7580,7 +8206,7 @@ export default function App() {
                         <CaretRight className="w-3.5 h-3.5 text-[var(--pf-i-25)] stroke-[2] shrink-0" />
                       </button>
 
-                      {!marketError && marketLoaded && marketTagOptions(marketFaces).length > 0 && (
+                      {!marketError && marketLoaded && marketTags.length > 0 && (
                         <button
                           type="button"
                           onClick={() => setMarketTagMenu(v => !v)}
@@ -7597,9 +8223,9 @@ export default function App() {
                     </div>
 
                     {/* 展开的标签菜单：整行宽度铺在卡片下面，三列网格 */}
-                    {!marketError && marketLoaded && marketTagMenu && marketTagOptions(marketFaces).length > 0 && (
+                    {!marketError && marketLoaded && marketTagMenu && marketTags.length > 0 && (
                       <div className="mt-3 bg-[var(--pf-card)] pf-card-border rounded-2xl p-3.5 grid grid-cols-3 gap-2 page-enter-anim">
-                        {[null as string | null, ...marketTagOptions(marketFaces)].map(tag => {
+                        {[null as string | null, ...marketTags].map(tag => {
                           const active = marketTag === tag;
                           return (
                             <button
@@ -7688,7 +8314,7 @@ export default function App() {
                     </div>
                   )}
 
-                  {!marketError && marketLoaded && filterMarketFaces(marketFaces, marketTag, marketQuery).length === 0 && (
+                  {!marketError && marketLoaded && filteredMarketFaces.length === 0 && (
                     <div className="py-16 text-center">
                       <p className="pf-fs-16 font-medium text-[var(--pf-i-40)]">
                         {marketQuery.trim()
@@ -7700,9 +8326,9 @@ export default function App() {
                     </div>
                   )}
 
-                  {!marketError && filterMarketFaces(marketFaces, marketTag, marketQuery).length > 0 && (
+                  {!marketError && filteredMarketFaces.length > 0 && (
                     <div ref={marketGridRef} className="grid grid-cols-3 gap-x-3 gap-y-5">
-                      {filterMarketFaces(marketFaces, marketTag, marketQuery).map(face => {
+                      {filteredMarketFaces.map(face => {
                         // 一排 3 个、没有白卡：预览按「高 200 的自然宽度」算，列宽放不下就等比缩
                         const naturalW = Math.max(
                           1,
@@ -7719,7 +8345,7 @@ export default function App() {
                             key={face.id}
                             type="button"
                             onClick={() => openMarketFace(face)}
-                            className="min-w-0 flex flex-col items-center text-center cursor-pointer active:scale-[0.97] transition-transform"
+                            className="pf-list-item min-w-0 flex flex-col items-center text-center cursor-pointer active:scale-[0.97] transition-transform"
                           >
                             <div
                               className="relative overflow-hidden shrink-0"
@@ -7732,7 +8358,10 @@ export default function App() {
                               <img
                                 src={face.coverUrl}
                                 alt=""
+                                width={previewW}
+                                height={previewH}
                                 loading="lazy"
+                                decoding="async"
                                 className="w-full h-full block"
                               />
                               {face.has_update && (
@@ -7753,13 +8382,19 @@ export default function App() {
                     </div>
                   )}
                 </div>
-              )}
+                );
+              })()}
 
               {/* Tab 3: 管理 */}
               {activeTab === "manage" && (
-                <div key="tab-manage" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
-                  {/* 大标题在全局顶栏里（折叠动画）；这里留出同样的高度，标题到卡片仍是 28px */}
-                  <div className="h-[60px] shrink-0" aria-hidden="true" />
+                <div key="tab-manage" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                  {/* 大标题回归滚动流：1:1 跟手滚出顶栏，短页不折叠 */}
+                  <h1
+                    ref={collapseTitleRef}
+                    className="pf-title-big h-[60px] shrink-0 pl-1 pf-fs-32 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
+                  >
+                    {TAB_TITLES.manage}
+                  </h1>
 
                   {/* 长方形设备连接状态卡片：堆在下方表盘卡片上方 */}
                   <div className="mb-4">
@@ -7798,11 +8433,18 @@ export default function App() {
                   </div>
 
                   {!isDeviceConnected ? (
-                    /* 未连接设备：不显示任何表盘卡片（也没有预设假数据）；提示放在屏幕正中 */
-                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                    /* 未连接设备：不显示任何表盘卡片（也没有预设假数据）；居中提示并给直达连接入口 */
+                    <div className="flex-1 flex flex-col items-center justify-center gap-3 py-12">
                       <p className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
                         请连接设备后再查看表盘列表
                       </p>
+                      <button
+                        type="button"
+                        onClick={openDeviceDrawer}
+                        className="h-10 px-5 rounded-full bg-[var(--pf-primary-solid)] text-white pf-fs-13 font-bold active:scale-95 transition-all cursor-pointer"
+                      >
+                        连接设备
+                      </button>
                     </div>
                   ) : (
                   <div className={`grid grid-cols-2 gap-3 pb-3 transition-opacity duration-300 ${
@@ -7841,7 +8483,7 @@ export default function App() {
                           <div
                             key={dial.id}
                             onClick={() => handleOpenDialEdit(dial)}
-                            className={`rounded-3xl p-4 cursor-pointer active:scale-[0.96] transition-all flex flex-col justify-between min-h-[142px] bg-[var(--pf-card)] border-2 shadow-[0_1px_3px_rgba(0,0,0,0.02)] relative group ${
+                            className={`pf-list-item rounded-3xl p-4 cursor-pointer active:scale-[0.96] transition-transform duration-150 flex flex-col justify-between min-h-[142px] bg-[var(--pf-card)] border-2 shadow-[0_1px_3px_rgba(0,0,0,0.02)] relative group ${
                               isMenuOpen ? "z-40" : "z-0"
                             } ${
                               dial.isCurrent
@@ -7985,12 +8627,28 @@ export default function App() {
                               </h4>
                             </div>
 
-                            <div className="flex items-center justify-between pt-2 border-t border-[var(--pf-bd-5)] pf-fs-12 font-medium text-[var(--pf-i-25)]">
-                              <span>{luaIds.current[dial.id] ? "Lua 表盘" : "轻触编辑"}</span>
-                              {!luaIds.current[dial.id] && (
-                                <CaretRight className="w-3.5 h-3.5 text-[var(--pf-i-25)] stroke-[2]" />
-                              )}
-                            </div>
+                            {(() => {
+                              const editable =
+                                !luaIds.current[dial.id] &&
+                                selectedDevice.brand !== "vivo" &&
+                                (!invoke || !!archivedIds.current[dial.id] || !!videoDialProjects[dial.id]);
+                              return (
+                                <div className="flex items-center justify-between pt-2 border-t border-[var(--pf-bd-5)] pf-fs-12 font-medium text-[var(--pf-i-25)]">
+                                  <span>
+                                    {luaIds.current[dial.id]
+                                      ? "Lua 表盘"
+                                      : editable
+                                        ? "轻触编辑"
+                                        : selectedDevice.brand === "vivo"
+                                          ? "已安装"
+                                          : "未留档"}
+                                  </span>
+                                  {editable && (
+                                    <CaretRight className="w-3.5 h-3.5 text-[var(--pf-i-25)] stroke-[2]" />
+                                  )}
+                                </div>
+                              );
+                            })()}
                           </div>
                         );
                       })
@@ -8002,10 +8660,15 @@ export default function App() {
 
               {/* Tab 3: 设置（极简纯列表页） */}
               {activeTab === "settings" && (
-                <div key="tab-settings" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-settings" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   <div>
-                    {/* 大标题在全局顶栏里（折叠动画）；这里只留高度 */}
-                    <div className="h-[60px] shrink-0" aria-hidden="true" />
+                    {/* 大标题回归滚动流：1:1 跟手滚出顶栏，短页不折叠 */}
+                    <h1
+                      ref={collapseTitleRef}
+                      className="pf-title-big h-[60px] shrink-0 pl-1 pf-fs-32 font-bold text-[var(--pf-ink)] tracking-tight leading-none"
+                    >
+                      {TAB_TITLES.settings}
+                    </h1>
 
                     {/* 使用指引（4 步上手）：做成与「安装已购表盘」同尺寸的大卡，第一眼就能看到 */}
                     <div className="mb-3">
@@ -8139,25 +8802,6 @@ export default function App() {
                       </button>
                     </div>
 
-                  </div>
-
-                  {/* 最底下一行版本号小字 */}
-                  <div className="text-center pt-6 pb-2">
-                    <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] tracking-wide">
-                      盘坊 v{appVersion ?? "0.4.6"}
-                    </p>
-                    {/* 备案号（工信部要求：显著位置标明编号并链接备案管理系统） */}
-                    <a
-                      href={BEIAN_URL}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      onClick={(e) => {
-                        openLink(e, BEIAN_URL);
-                      }}
-                      className="inline-block mt-1.5 pf-fs-12 font-medium text-[var(--pf-i-30)] hover:text-[var(--pf-primary)] transition-colors cursor-pointer"
-                    >
-                      {APP_BEIAN_NO}
-                    </a>
                   </div>
                 </div>
               )}
@@ -8816,7 +9460,7 @@ export default function App() {
                         <span
                           className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${
                             s.done
-                              ? "bg-[#34C759]/12 text-[var(--pf-ok)]"
+                              ? "bg-[var(--pf-ok-12)] text-[var(--pf-ok)]"
                               : "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
                           }`}
                         >
@@ -9042,6 +9686,7 @@ export default function App() {
                       href={paidShopUrl}
                       target="_blank"
                       rel="noreferrer"
+                      onClick={e => openLink(e, paidShopUrl)}
                       className="mt-6 w-full h-[52px] rounded-full bg-[var(--pf-primary-solid)] text-white font-bold pf-fs-17 active:scale-[0.98] transition-all flex items-center justify-center tracking-tight"
                     >
                       去爱发电看看
@@ -9058,7 +9703,7 @@ export default function App() {
                     return (
                       <div
                         key={p.product_id}
-                        className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3"
+                        className="pf-list-item bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3"
                       >
                         <div className="flex items-baseline justify-between">
                           <div className="flex items-center gap-2 min-w-0">
@@ -9088,7 +9733,7 @@ export default function App() {
                             type="button"
                             disabled={installPreparing === p.product_id}
                             onClick={() => runPaidInstall(p, v)}
-                            className={`mt-4 w-full h-[44px] rounded-full text-white font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer ${
+                            className={`mt-4 w-full h-[44px] rounded-full text-white font-bold pf-fs-16 active:scale-[0.98] transition-transform duration-150 cursor-pointer ${
                               installPreparing === p.product_id ? "bg-[var(--pf-primary-60)]" : "bg-[var(--pf-primary-solid)]"
                             }`}
                           >
@@ -9588,12 +10233,34 @@ export default function App() {
             </div>
           )}
 
+          {/* 单包安装停滞 25 秒后的应急退出：放在锁屏层之上（z-130），防止底层链路无响应时无限期卡死 */}
+          {currentStep === "redeem_installing" &&
+            !installError &&
+            !installStoppable &&
+            installStallCanCancel && (
+              <div
+                className="fixed left-0 right-0 z-[130] px-7 flex flex-col items-center"
+                style={{ bottom: "calc(28px + env(safe-area-inset-bottom, 0px))" }}
+              >
+                <button
+                  type="button"
+                  onClick={() => installStallAbortRef.current?.()}
+                  className="h-[44px] px-6 rounded-full bg-[var(--pf-bg-7)] text-[var(--pf-i-75)] font-bold pf-fs-16 active:scale-95 transition-all cursor-pointer flex items-center justify-center"
+                >
+                  取消安装
+                </button>
+                <p className="pf-fs-12 font-medium text-[var(--pf-i-35)] mt-2 text-center">
+                  设备长时间未响应，可取消后重试
+                </p>
+              </div>
+            )}
+
           {/* 6. 成功页 */}
           {currentStep === "redeem_success" && (
             <div className="flex-1 flex flex-col justify-between px-7 safe-top pb-10 page-enter-anim">
               <div />
               <div className="flex flex-col items-center text-center">
-                <div className="w-20 h-20 rounded-full bg-[#34C759]/15 text-[var(--pf-ok)] flex items-center justify-center mb-6">
+                <div className="w-20 h-20 rounded-full bg-[var(--pf-ok-15)] text-[var(--pf-ok)] flex items-center justify-center mb-6">
                   <Check className="w-10 h-10 stroke-[2.2]" />
                 </div>
 
@@ -9631,7 +10298,7 @@ export default function App() {
                         : `「${dialName}」已生效`
                     );
                   }}
-                  className="w-full h-[52px] rounded-full bg-black text-white font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
+                  className="w-full h-[52px] rounded-full bg-[var(--pf-inverse)] text-[var(--pf-inverse-ink)] font-bold pf-fs-17 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center tracking-tight"
                 >
                   完成
                 </button>
@@ -9780,7 +10447,7 @@ export default function App() {
                         )}
 
                         {selectedStyle.includes("息屏常显") && (
-                          <div className="absolute inset-0 bg-[var(--pf-bg-80)] backdrop-grayscale z-20 flex flex-col items-center justify-center pointer-events-none">
+                          <div className="absolute inset-0 bg-[var(--pf-mask)] backdrop-grayscale z-20 flex flex-col items-center justify-center pointer-events-none">
                             <span className="text-[34px] font-bold text-white font-mono tracking-tighter">09:41</span>
                             <span className="text-[11px] text-white/40 font-medium mt-1">AOD 常亮</span>
                           </div>
@@ -9988,7 +10655,7 @@ export default function App() {
                                     e.stopPropagation();
                                     handleRemoveWallpaper(idx);
                                   }}
-                                  className="absolute top-1 right-1 w-6 h-6 rounded-full bg-[var(--pf-bg-55)] text-white flex items-center justify-center active:scale-90 transition-transform cursor-pointer"
+                                  className="absolute top-1 right-1 w-6 h-6 rounded-full bg-[var(--pf-mask)] text-white flex items-center justify-center active:scale-90 transition-transform cursor-pointer"
                                 >
                                   <X className="w-3.5 h-3.5 stroke-[2.5]" />
                                 </span>
@@ -10520,8 +11187,10 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => {
-                      if (genDirty) setGenExitAsk(true);
-                      else goBackOr("main/manage");
+                      if (genDirty) {
+                        genPoppedHistoryRef.current = false;
+                        setGenExitAsk(true);
+                      } else goBackOr("main/manage");
                     }}
                     className="h-9 px-4 rounded-full bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-95 transition-all text-[var(--pf-i-80)] pf-fs-13 font-semibold cursor-pointer flex items-center justify-center"
                   >
@@ -10777,7 +11446,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.4.6"}`}
+                            : `当前版本 v${appVersion ?? "0.4.7"}`}
                         </p>
                       </div>
                     </div>
@@ -11156,7 +11825,7 @@ export default function App() {
               <span className="relative">
                 <Storefront className="w-6 h-6 stroke-[2.2]" />
                 {marketUpdateCount > 0 && (
-                  <span className="absolute -top-0.5 -right-1 w-2 h-2 rounded-full bg-[var(--pf-amber-solid)] ring-2 ring-white" />
+                  <span className="absolute -top-0.5 -right-1 w-2 h-2 rounded-full bg-[var(--pf-amber-solid)] ring-2 ring-[var(--pf-card)]" />
                 )}
               </span>
               <span className="pf-fs-12 font-semibold">集市</span>
@@ -11222,7 +11891,7 @@ export default function App() {
               >
                 <span
                   className={`h-1 rounded-full transition-all duration-150 ${
-                    sheetDragging ? "w-11 bg-[var(--pf-bg-45)]" : "w-9 bg-[var(--pf-bg-15)]"
+                    sheetDragging ? "w-11 bg-[var(--pf-bd-15)]" : "w-9 bg-[var(--pf-bg-15)]"
                   }`}
                 />
               </div>
@@ -11325,7 +11994,7 @@ export default function App() {
                       // 浏览器预览：把演示列表恢复原样（删除过的设备一并回来）
                       setMockDevicesList(MOCK_DEVICES);
                     }}
-                    className="w-full h-[44px] rounded-full bg-[#FF6A00]/10 hover:bg-[#FF6A00]/15 text-[#E85D04] font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
+                    className="w-full h-[44px] rounded-full bg-[var(--pf-xiaomi-10)] hover:bg-[var(--pf-xiaomi-15)] text-[var(--pf-xiaomi-ink)] font-bold pf-fs-16 active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-2"
                   >
                     <ArrowsClockwise className="w-4 h-4 stroke-[2]" />
                     <span>重新导入小米设备</span>
@@ -11666,7 +12335,7 @@ export default function App() {
         {genExitAsk && (
           <div
             className="absolute inset-0 z-50 bg-[var(--pf-mask)] flex items-center justify-center p-6"
-            onClick={() => setGenExitAsk(false)}
+            onClick={cancelGenExitAsk}
           >
             <div
               className="bg-[var(--pf-card)] pf-card-border w-full max-w-[280px] rounded-3xl overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.10)] text-center"

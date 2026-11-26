@@ -10,8 +10,11 @@ import android.provider.Settings
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import moe.astralsight.astrobox.plugin.inappbrowser.InstallBackLock
 import java.io.File
@@ -20,6 +23,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : TauriActivity() {
   /** 本进程读到的系统 WebView UA（onCreate 早期取一次，Rust 侧启动时也要用）。 */
   private var webViewUa: String? = null
+  private var activeWebView: WebView? = null
+  @Volatile private var statusBarDp: Float = 0f
 
   override fun onCreate(savedInstanceState: Bundle?) {
     // App 以浅色页为主：系统栏透明（WebView 顶栏条上色）、图标强制深色，
@@ -29,12 +34,54 @@ class MainActivity : TauriActivity() {
       statusBarStyle = SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT),
       navigationBarStyle = SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT),
     )
+    // 动态获取系统状态栏真实高度并注入 WebView CSS 变量 --pf-status-bar-h（替代写死的 paddingTop）
+    ViewCompat.setOnApplyWindowInsetsListener(window.decorView) { _, insets ->
+      val topPx = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top
+      if (topPx > 0) {
+        val dp = topPx / resources.displayMetrics.density
+        statusBarDp = dp
+        injectStatusBarInset()
+      }
+      insets
+    }
+    // 兼容 Android 14+ 预测性返回手势的兜底拦截（InstallBackLock）
+    onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+      override fun handleOnBackPressed() {
+        if (InstallBackLock.locked) {
+          InstallBackLock.notifyBackBlocked()
+          return
+        }
+        isEnabled = false
+        onBackPressedDispatcher.onBackPressed()
+        isEnabled = true
+      }
+    })
     // WebView 版本探测必须赶在 super.onCreate 之前落盘：Rust 的 setup 在 super 里跑，
     // 过了那一刻它再读就只能是上一次启动的值（见 diag::report_webview_probe）。
     webViewUa = runCatching { WebSettings.getDefaultUserAgent(this) }.getOrNull()
     webViewUa?.let { writeWebViewProbe(it) }
     super.onCreate(savedInstanceState)
     warnIfWebViewTooOld(webViewUa ?: runCatching { WebSettings.getDefaultUserAgent(this) }.getOrNull())
+  }
+
+  override fun onWebViewCreate(webView: WebView) {
+    super.onWebViewCreate(webView)
+    activeWebView = webView
+    injectStatusBarInset()
+  }
+
+  override fun onWindowFocusChanged(hasFocus: Boolean) {
+    super.onWindowFocusChanged(hasFocus)
+    if (hasFocus) injectStatusBarInset()
+  }
+
+  private fun injectStatusBarInset() {
+    val dp = statusBarDp
+    if (dp <= 0f) return
+    val wv = activeWebView ?: return
+    val pxStr = String.format(java.util.Locale.US, "%.1fpx", dp)
+    val js = "document.documentElement&&document.documentElement.style.setProperty('--pf-status-bar-h','$pxStr');"
+    wv.post { runCatching { wv.evaluateJavascript(js, null) } }
   }
 
   /**

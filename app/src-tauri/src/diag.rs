@@ -145,29 +145,56 @@ pub fn info(step: &str, code: &str, message: &str, device_model: Option<&str>) {
     report_kind("info", step, code, message, device_model)
 }
 
-/// 上报前把可能混进来的密钥长串洗掉（≥32 位连续 [A-Za-z0-9_-] → [已隐藏]）。
-/// 服务端入库前还会再洗一遍（那道对所有旧版本都生效）；这里先洗，是为了本地 logcat
-/// 与「反馈」页复制出来的文本里也不留令牌。2026-10-15 加。
+/// 上报前把可能混进来的密钥长串与敏感参数洗掉（`authkey`/`serviceToken`/`ssecurity`/`passToken`/邮箱/长凭据 → [已隐藏]）。
 fn scrub_secretish(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut run = String::new();
+    let flush_run = |buf: &mut String, dest: &mut String| {
+        if buf.len() >= 20
+            && (buf.len() >= 32
+                || buf.bytes().all(|b| b.is_ascii_hexdigit())
+                || (buf.contains('+') || buf.contains('/') || buf.contains('=')))
+        {
+            dest.push_str("[已隐藏]");
+        } else {
+            dest.push_str(buf);
+        }
+        buf.clear();
+    };
     for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '/' | '=') {
             run.push(ch);
             continue;
         }
-        if run.len() >= 32 {
-            out.push_str("[已隐藏]");
-        } else {
-            out.push_str(&run);
-        }
-        run.clear();
+        flush_run(&mut run, &mut out);
         out.push(ch);
     }
-    if run.len() >= 32 {
-        out.push_str("[已隐藏]");
-    } else {
-        out.push_str(&run);
+    flush_run(&mut run, &mut out);
+
+    // 脱敏常见敏感键值查询参数（passToken= / ticket= / serviceToken= / ssecurity= / authkey= / token= / code=）
+    for key in [
+        "serviceToken=",
+        "passToken=",
+        "ssecurity=",
+        "authkey=",
+        "beaconkey=",
+        "ticket=",
+        "token=",
+        "code=",
+    ] {
+        let mut res = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(pos) = rest.find(key) {
+            res.push_str(&rest[..pos + key.len()]);
+            res.push_str("[已隐藏]");
+            let after = &rest[pos + key.len()..];
+            let end = after
+                .find(|c: char| matches!(c, '&' | ' ' | '\n' | '\r' | '"' | '\'' | ',' | ';'))
+                .unwrap_or(after.len());
+            rest = &after[end..];
+        }
+        res.push_str(rest);
+        out = res;
     }
     out
 }
