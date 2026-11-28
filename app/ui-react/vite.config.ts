@@ -36,7 +36,7 @@ export default defineConfig(({ mode }) => {
       cssTarget: legacyWebview ? 'chrome83' : undefined,
     },
     // 依赖包（React 等）的语法也要跟着降级，只设 build.target 管不到它们
-    esbuild: legacyWebview ? { target: 'chrome83' } : undefined,
+    esbuild: legacyWebview ? ({ target: 'chrome83' } as any) : undefined,
     plugins: [
 react(),
       ...(legacyWebview ? [legacyWebviewCss()] : []),

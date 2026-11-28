@@ -54,25 +54,47 @@ fn local_status(_app: &tauri::AppHandle) -> Result<apkinstaller::ApkStatus, Stri
 }
 
 /// GET /v1/app/latest：返回 Some(JSON) 或 None（服务端还没有发布过版本）。
+///
+/// 网络抖动（手机信号切换、地铁进隧道）与 nginx 限流（429/503：同一出口 IP 的并发连接被
+/// 自己的集市封面图打满时会连累到这一条）都是**一过性**的，所以这里统一再试一次；
+/// 仍然是失败才把原因交给界面。
 async fn fetch_latest(base: &str) -> Result<Option<Value>, String> {
     let url = format!("{}/v1/app/latest", base.trim_end_matches('/'));
-    let resp = crate::paid::http()
-        .map_err(|e| format!("{e:#}"))?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|_| "连不上更新服务器，请检查网络后重试".to_string())?;
-    if resp.status().as_u16() == 404 {
-        return Ok(None);
+    let mut last_err = "连不上更新服务器，请检查网络后重试".to_string();
+    for attempt in 0..2u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        }
+        let resp = match crate::paid::http()
+            .map_err(|e| format!("{e:#}"))?
+            .get(&url)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                last_err = "连不上更新服务器，请检查网络后重试".to_string();
+                continue;
+            }
+        };
+        let code = resp.status().as_u16();
+        if code == 404 {
+            return Ok(None);
+        }
+        if resp.status().is_success() {
+            let d: Value = resp
+                .json()
+                .await
+                .map_err(|_| "更新信息解析失败".to_string())?;
+            return Ok(Some(d));
+        }
+        if code == 429 || code >= 500 {
+            last_err = format!("更新服务正忙（HTTP {code}），请稍后重试");
+            continue;
+        }
+        return Err(format!("更新服务器返回 HTTP {code}"));
     }
-    if !resp.status().is_success() {
-        return Err(format!("更新服务器返回 HTTP {}", resp.status().as_u16()));
-    }
-    let d: Value = resp
-        .json()
-        .await
-        .map_err(|_| "更新信息解析失败".to_string())?;
-    Ok(Some(d))
+    Err(last_err)
 }
 
 /// 下载安装包用的客户端：复用连接池，超时放宽到 10 分钟。

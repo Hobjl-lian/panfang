@@ -185,8 +185,11 @@ class ApkInstallerPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("APK_NOT_FOUND", "安装包不存在或为空")
             return
         }
-        if (!verifyApkMatchesSelf(apk)) {
-            invoke.reject("APK_SIGNATURE_MISMATCH", "安装包签名或包名校验不通过，已拒绝安装")
+        val mismatch = verifyApkMismatch(apk)
+        if (mismatch != null) {
+            // 把两侧证书指纹带进 reject 文本：屏幕上只会显示 humanize 的一句人话，
+            // 原始串进 console 与「客户端诊断」，下次再有人遇到能直接看出是哪一侧不对。
+            invoke.reject("APK_SIGNATURE_MISMATCH", "安装包签名或包名校验不通过，已拒绝安装（$mismatch）")
             return
         }
         val authority = "${activity.packageName}.fileprovider"
@@ -209,37 +212,66 @@ class ApkInstallerPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun verifyApkMatchesSelf(apk: File): Boolean {
+    /**
+     * 校验下载包与已装版本同包名、同签名。
+     *
+     * ★ 2026-11-27 修复：**两个标志必须一起传**。Android 9/10 的
+     *   `PackageManager.getPackageArchiveInfo()` 只在 flags 里带 `GET_SIGNATURES` 时才真的去
+     *   解析证书（只传 `GET_SIGNING_CERTIFICATES` 时 `signingInfo` 恒为 null），于是新包证书
+     *   永远读成空集 → 每次更新都被判「签名不一致」，安卓 9/10 用户点更新只能看到「操作失败」。
+     *   （AOSP android-9/10 的 PackageManager.java 里那句 `if ((flags & GET_SIGNATURES) != 0)
+     *   collectCertificates()` 就是这个坑；安卓 11 起才两种标志都解析。）
+     *
+     * 返回 null = 通过；否则返回一句能定位差异的原因（进诊断，不上屏）。
+     */
+    private fun verifyApkMismatch(apk: File): String? {
         return try {
             val pm = activity.packageManager
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                PackageManager.GET_SIGNING_CERTIFICATES
-            } else {
-                @Suppress("DEPRECATION")
-                PackageManager.GET_SIGNATURES
-            }
+            @Suppress("DEPRECATION")
+            val flags = PackageManager.GET_SIGNATURES or PackageManager.GET_SIGNING_CERTIFICATES
             val selfInfo = pm.getPackageInfo(activity.packageName, flags)
-            val archInfo = pm.getPackageArchiveInfo(apk.absolutePath, flags) ?: return false
-            if (archInfo.packageName != activity.packageName) return false
-
-            val selfSigs = signingCertDigests(selfInfo)
-            val archSigs = signingCertDigests(archInfo)
-            selfSigs.isNotEmpty() && selfSigs == archSigs
-        } catch (_: Exception) {
-            false
+            val archInfo = pm.getPackageArchiveInfo(apk.absolutePath, flags) ?: return "系统读不出这个安装包"
+            if (archInfo.packageName != activity.packageName) {
+                return "包名不符：本机 ${activity.packageName} / 新包 ${archInfo.packageName}"
+            }
+            val selfSigs = signerDigests(selfInfo)
+            val archSigs = signerDigests(archInfo)
+            if (selfSigs.isEmpty()) return "读不到本机签名证书"
+            if (archSigs.isEmpty()) return "读不到安装包签名证书"
+            if (selfSigs == archSigs) null
+            else "签名不符：本机 ${selfSigs.first().take(16)} / 新包 ${archSigs.first().take(16)}"
+        } catch (e: Exception) {
+            "校验安装包失败：${e.message}"
         }
     }
 
-    private fun signingCertDigests(info: android.content.pm.PackageInfo): Set<String> {
+    /**
+     * 取「当前签名者」的 SHA-256 集合。
+     *
+     * 只比当前签名者，不比历史证书链：轮换过密钥的包，两个包的历史链长度可能不同，
+     * 那属于正常情况；`GET_SIGNATURES` 在老系统上还会回退成最老的证书，口径也不一致。
+     */
+    private fun signerDigests(info: android.content.pm.PackageInfo): Set<String> {
+        // SigningInfo 在没有证书时会抛 IllegalStateException：读不出来就按「没有」处理（宁拒绝不错放）
+        val raw: Array<android.content.pm.Signature>? = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val si = info.signingInfo
+                when {
+                    si == null -> null
+                    si.hasMultipleSigners() -> si.apkContentsSigners
+                    si.apkContentsSigners?.isNotEmpty() == true -> si.apkContentsSigners
+                    else -> si.signingCertificateHistory
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                info.signatures
+            }
+        } catch (_: Exception) {
+            null
+        }
+        if (raw.isNullOrEmpty()) return emptySet()
         val sha256 = MessageDigest.getInstance("SHA-256")
-        val rawSigs: Array<android.content.pm.Signature> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val si = info.signingInfo ?: return emptySet()
-            if (si.hasMultipleSigners()) si.apkContentsSigners else si.signingCertificateHistory
-        } else {
-            @Suppress("DEPRECATION")
-            info.signatures ?: return emptySet()
-        } ?: return emptySet()
-        return rawSigs.map { sig ->
+        return raw.map { sig ->
             sha256.digest(sig.toByteArray()).joinToString("") { "%02x".format(it) }
         }.toSet()
     }

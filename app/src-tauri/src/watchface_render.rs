@@ -293,6 +293,8 @@ struct Tables {
     images: HashMap<u32, Vec<(u32, usize)>>,
     /// idx -> 各配色的图片组 (w, h, 各帧字节范围)
     arrays: HashMap<u32, Vec<(u32, (u32, u32, Vec<(usize, usize)>))>>,
+    /// 块 4 动画精灵 idx -> 引用的图片组 idx（0x03xxxxxx）
+    sprites: HashMap<u32, u32>,
     recs: HashMap<u32, Rec>,
     acts: HashMap<u32, Act>,
     slots: HashMap<u32, Vec<u32>>,
@@ -389,6 +391,7 @@ impl Tables {
         let styles = watchface_bin::walk_styles(d, &header)?;
         let mut t = Tables {
             arrays: HashMap::new(),
+            sprites: HashMap::new(),
             images: HashMap::new(),
             recs: HashMap::new(),
             acts: HashMap::new(),
@@ -421,6 +424,22 @@ impl Tables {
                         parse_array_frames(d, rec.data_offset as usize, rec.data_len as usize)
                     {
                         e.push((cg, (w, h, frames)));
+                    }
+                }
+            }
+            if let Some(b) = block(4) {
+                for rec in watchface_bin::block_records(d, b.count, b.offset) {
+                    let idx = rec.idx as u32;
+                    if t.sprites.contains_key(&idx) {
+                        continue;
+                    }
+                    let o = rec.data_offset as usize;
+                    if rec.data_len < 4 || o.checked_add(4).is_none_or(|e| e > d.len()) {
+                        continue;
+                    }
+                    let target = u32le(d, o);
+                    if ((target >> 24) & 0x7F) == 0x03 {
+                        t.sprites.insert(idx, target & 0x00FF_FFFF);
                     }
                 }
             }
@@ -663,6 +682,17 @@ impl Tables {
 
     fn array(&self, idx: u32) -> Option<&(u32, u32, Vec<(usize, usize)>)> {
         self.array_at(idx, self.color_group())
+    }
+
+    /// 动画精灵（块 4 idx -> 图片组，无块 4 记录时兼容直接把 idx 当图片组）
+    fn sprite_array(&self, idx: u32) -> Option<&(u32, u32, Vec<(usize, usize)>)> {
+        if let Some(&arr_idx) = self.sprites.get(&idx) {
+            return self.array(arr_idx);
+        }
+        if self.sprites.is_empty() {
+            return self.array(idx);
+        }
+        None
     }
 
     /// 数据项 target 的尺寸（高字节决定是图片组 0x03 还是单图 0x02）
@@ -974,7 +1004,7 @@ pub fn derive_model(d: &[u8], device_model: Option<&str>) -> Result<LayerModelDo
             let best_sprite = layers
                 .iter()
                 .filter(|l| l.kind == "sprite")
-                .filter_map(|l| t.array(l.r).map(|(w, h, _)| (*w as u64) * (*h as u64)))
+                .filter_map(|l| t.sprite_array(l.r).map(|(w, h, _)| (*w as u64) * (*h as u64)))
                 .max();
             match (best_image, best_sprite) {
                 (Some((idx, ia)), Some(sa)) if ia >= sa => Some(idx),
@@ -1032,7 +1062,7 @@ pub fn derive_model(d: &[u8], device_model: Option<&str>) -> Result<LayerModelDo
                 th.layers
                     .iter()
                     .filter(|l| l.kind == "sprite")
-                    .filter_map(|l| t.array(l.r).map(|(w, h, _)| (*w, *h)))
+                    .filter_map(|l| t.sprite_array(l.r).map(|(w, h, _)| (*w, *h)))
                     .max_by_key(|(w, h)| (*w as u64) * (*h as u64))
             })
         })
@@ -1678,8 +1708,8 @@ pub fn render_preview(
                 r.draw_action(chosen, layer.x, layer.y, 0);
             }
             "sprite" => {
-                // 动画精灵：取图片组第 1 帧（静态预览）
-                if let Some((aw, ah, frames)) = t.array(layer.r).cloned() {
+                // 动画精灵：通过块 4 解析出图片组，取第 1 帧（静态预览）
+                if let Some((aw, ah, frames)) = t.sprite_array(layer.r).cloned() {
                     if let Some((off, _)) = frames.first() {
                         if let Some(rgba) = decode_array_frame(d, *off, aw, ah) {
                             blit(&mut r.canvas, cw, ch, &rgba, aw, ah, layer.x, layer.y);

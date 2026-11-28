@@ -208,6 +208,8 @@ pub fn run() {
             video::video_project_clear,
             video::video_project_delete,
             video::video_project_update_meta,
+            video::video_bg_photo_put,
+            video::video_compose_bg,
             video::video_frame_reset,
             video::video_frame_put,
             video::video_job_create,

@@ -6,21 +6,26 @@
  *
  * 界面上不出现任何模板工程文件：客户端只拿到模板封面和最终 .bin。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowClockwise,
+  ArrowCounterClockwise,
   ArrowsOutSimple,
   CaretLeft,
   CaretRight,
   CheckCircle,
   DeviceMobile,
+  Drop,
   FilmStrip,
+  Image as ImageIcon,
+  ListChecks,
   LockSimple,
   Palette,
   Pause,
   Play,
   Plus,
   Scissors,
+  SunDim,
   Trash,
   VideoCamera,
   WarningCircle,
@@ -31,11 +36,14 @@ import {
   bytesToB64,
   frameSizeFor,
   invoke,
+  rotateVec,
   setInstallBackLock,
   setKeepScreenOn,
   type ScreenInfo,
 } from "./tauri";
-import { GenSlider } from "./Slider";
+import { GenCustomColorPanel, GenSlider } from "./Slider";
+import DialPreviewFrame, { previewImageScale } from "./DialPreviewFrame";
+import { resetScroll, resetScrollGroup, useScrollMemory } from "./useScrollMemory";
 
 const API_BASE = "https://api.hobjl-shop.top";
 const MAX_VIDEO_BYTES = 80 * 1024 * 1024;
@@ -63,6 +71,29 @@ type FrameColor = {
   swatch: string;
 };
 
+type SlotWindow = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  radius: number;
+  rot: number;
+};
+
+type SpriteBox = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+type DualSlotConfig = {
+  window: SlotWindow;
+  bg_defaults?: { blur?: number; darken?: number };
+  solid_colors?: string[];
+  sprite_box: SpriteBox;
+};
+
 type Style = {
   id: string;
   name: string;
@@ -77,6 +108,7 @@ type Style = {
   overlay_url?: string;
   has_frame?: boolean;
   frame_colors?: FrameColor[];
+  slot_config?: DualSlotConfig | null;
 };
 
 type Template = {
@@ -107,6 +139,19 @@ type Project = {
   mode?: string;
   frame_color?: string;
   frame_colors?: FrameColor[];
+  slot_config?: DualSlotConfig | null;
+  has_slot?: boolean;
+  has_bg_photo?: boolean;
+  bg_mode?: "photo" | "solid" | "";
+  bg_fill?: string;
+  bg_scale?: number;
+  bg_rot?: number;
+  bg_dx?: number;
+  bg_dy?: number;
+  bg_blur?: number;
+  bg_darken?: number;
+  bg_flip_x?: boolean;
+  bg_flip_y?: boolean;
   watchface_id?: string;
   watchface_ids?: string[];
   job_id?: string;
@@ -156,6 +201,16 @@ type Props = {
 };
 
 type Screen = "home" | "projects" | "templates" | "edit" | "job" | "project";
+
+/** 页内各屏的滚动记忆 key（每次整页重新打开时按前缀清空，回到首页从顶部开始） */
+const SCREEN_SCROLL_KEYS: Record<Screen, string> = {
+  home: "video:home",
+  projects: "video:projects",
+  templates: "video:templates",
+  edit: "video:edit",
+  job: "video:job",
+  project: "video:project",
+};
 
 /** 截取轨道上的手势：单指拖选择框 / 单指平移视野 / 双指缩放 */
 type TimelineGesture =
@@ -288,11 +343,16 @@ function previewSrc(p: { preview_b64?: string; preview_url?: string }): string {
 }
 
 /** 缩略图按画布比例：高度固定，宽度随画布宽高比（212 细长、432 偏方）；未知画布回退 336×480 */
-function thumbBox(cw?: number, ch?: number, h = 56): { width: string; height: string } {
+function thumbSize(cw?: number, ch?: number, h = 56): { w: number; h: number } {
   const w = cw && ch ? cw : 336;
   const hh = cw && ch ? ch : 480;
-  const width = Math.max(16, Math.round((h * w) / hh));
-  return { width: `${width}px`, height: `${h}px` };
+  return { w: Math.max(16, Math.round((h * w) / hh)), h };
+}
+
+/** 模板样式缩略图：在列宽（约 84px）与最大高度 116px 内等比缩放 */
+function styleThumbSize(cw: number, ch: number, maxW = 84, maxH = 116): { w: number; h: number } {
+  const k = Math.min(maxW / cw, maxH / ch);
+  return { w: Math.max(1, Math.round(cw * k)), h: Math.max(1, Math.round(ch * k)) };
 }
 
 function fmtDate(ts?: number): string {
@@ -336,7 +396,29 @@ function friendlyJobError(err?: string): string {
   return s || "这次没有制作成功，请稍后重试。";
 }
 
-/** 把视频当前帧按「cover + 缩放 + 平移」画进画布（与预览的 CSS 同一套算法）。 */
+function roundedRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  radius: number
+) {
+  const r = Math.max(0, Math.min(radius, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/**
+ * 把视频当前帧按「cover + 缩放 + 平移」画进画布（与预览的 CSS 同一套算法）。
+ * 双槽位模式传入 `slotClip` 时：画布尺寸是包围盒 `(box.w, box.h)`，
+ * 按 `window` 倾斜圆角裁剪后绘制，透明边界留给相框与底图透出。
+ */
 function drawCropped(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,
@@ -344,10 +426,30 @@ function drawCropped(
   ch: number,
   zoom: number,
   panX: number,
-  panY: number
+  panY: number,
+  slotClip?: { win: SlotWindow; box: SpriteBox }
 ) {
   const vw = video.videoWidth || cw;
   const vh = video.videoHeight || ch;
+  if (slotClip) {
+    const { win, box } = slotClip;
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.save();
+    ctx.translate(win.x + win.w / 2 - box.x, win.y + win.h / 2 - box.y);
+    if (win.rot) ctx.rotate((win.rot * Math.PI) / 180);
+    roundedRectPath(ctx, -win.w / 2, -win.h / 2, win.w, win.h, win.radius || 0);
+    ctx.clip();
+    const cover = Math.max(win.w / vw, win.h / vh) * Math.max(1, zoom);
+    const dw = vw * cover;
+    const dh = vh * cover;
+    const maxX = Math.max(0, (dw - win.w) / 2);
+    const maxY = Math.max(0, (dh - win.h) / 2);
+    const ox = panX * maxX;
+    const oy = panY * maxY;
+    ctx.drawImage(video, -dw / 2 + ox, -dh / 2 + oy, dw, dh);
+    ctx.restore();
+    return;
+  }
   const cover = Math.max(cw / vw, ch / vh) * Math.max(1, zoom);
   const dw = vw * cover;
   const dh = vh * cover;
@@ -417,7 +519,8 @@ async function captureByPlaying(
   panX: number,
   panY: number,
   onFrame: (b64: string) => void,
-  onProgress: (n: number) => void
+  onProgress: (n: number) => void,
+  slotClip?: { win: SlotWindow; box: SpriteBox }
 ): Promise<void> {
   await seek(video, start);
   // 先让首帧真正解出来，避免抓到黑帧
@@ -442,7 +545,7 @@ async function captureByPlaying(
       resolve();
     };
     const grab = () => {
-      drawCropped(ctx, video, cw, ch, zoom, panX, panY);
+      drawCropped(ctx, video, cw, ch, zoom, panX, panY, slotClip);
       const data = canvas.toDataURL("image/png");
       onFrame(data.slice(data.indexOf(",") + 1));
       i++;
@@ -545,6 +648,20 @@ export default function VideoWatchface({
   const [frameColors, setFrameColors] = useState<FrameColor[]>([]);
   const [frameColor, setFrameColor] = useState("");
   const [framePreviewUrl, setFramePreviewUrl] = useState("");
+  /** 双槽位底图参数（不设默认选定：必须由用户主动选照片或纯色） */
+  const [bgMode, setBgMode] = useState<"" | "photo" | "solid">("");
+  const [bgFill, setBgFill] = useState("");
+  const [bgPhotoUrl, setBgPhotoUrl] = useState("");
+  const [bgPhotoB64, setBgPhotoB64] = useState("");
+  const [bgScale, setBgScale] = useState(1);
+  const [bgRot, setBgRot] = useState(0);
+  const [bgDx, setBgDx] = useState(0);
+  const [bgDy, setBgDy] = useState(0);
+  const [bgBlur, setBgBlur] = useState(8);
+  const [bgDarken, setBgDarken] = useState(0.3);
+  const [bgFlipX, setBgFlipX] = useState(false);
+  const [bgFlipY, setBgFlipY] = useState(false);
+  const [dragTarget, setDragTarget] = useState<"video" | "bg">("video");
 
   const [videoUrl, setVideoUrl] = useState("");
   const [videoName, setVideoName] = useState("");
@@ -579,17 +696,55 @@ export default function VideoWatchface({
     error?: string;
   } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  /** 历史记录批量管理：勾选模式、已选项目、删除方式弹窗 */
+  const [manageMode, setManageMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [batchDeleteAsk, setBatchDeleteAsk] = useState(false);
   /** 清理表盘文件前确认：删掉后编辑页读不到成品 bin，作品就不能继续编辑了 */
   const [clearBinAsk, setClearBinAsk] = useState(false);
   /** 本次新选的视频还没保存到历史记录（退出编辑页要问一下） */
   const [draftDirty, setDraftDirty] = useState(false);
   const [exitAsk, setExitAsk] = useState(false);
+  /** 模板卡片展开状态：样式超过 6 个时默认折叠，按模板 id 记 */
+  const [expandedTemplates, setExpandedTemplates] = useState<Record<string, boolean>>({});
+
+  // —— 页内各屏的滚动位置记忆 ——
+  // 整页每次重新打开（组件重新挂载）都先清掉上一次的位置：前进进入从顶部开始。
+  // 这段 layout effect 必须排在下面几个 useScrollMemory 之前 —— 同一次提交里按声明顺序执行，
+  // 先清空、后恢复，返回时才拿得到本次会话里离开时的位置。
+  useLayoutEffect(() => {
+    resetScrollGroup("video:");
+  }, []);
+  /** 首页：从历史记录 / 模板返回时回到原位置 */
+  const homeScroll = useScrollMemory(SCREEN_SCROLL_KEYS.home, { active: screen === "home" });
+  /** 历史记录：从作品详情 / 制作进度返回时回到原位置（列表异步读取，就绪后补一次） */
+  const projectsScroll = useScrollMemory(SCREEN_SCROLL_KEYS.projects, {
+    active: screen === "projects",
+    ready: !loadingProjects,
+    itemCount: projects.length,
+  });
+  /** 选择模板：从制作页返回时要停在点进去的那个模板上（展开状态保留，高度才够） */
+  const templatesScroll = useScrollMemory(SCREEN_SCROLL_KEYS.templates, {
+    active: screen === "templates",
+    ready: !loadingTemplates,
+    itemCount: templates.length,
+  });
+  /** 作品详情：从制作页 / 制作进度返回时回到原位置 */
+  const projectScroll = useScrollMemory(SCREEN_SCROLL_KEYS.project, {
+    active: screen === "project" && !!project,
+    ready: !!project,
+  });
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const cropRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const bgFileRef = useRef<HTMLInputElement | null>(null);
+  const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const bgCardRef = useRef<HTMLElement | null>(null);
+  const bgImgRef = useRef<HTMLImageElement | null>(null);
   const frameUrlRef = useRef("");
-  const dragRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
+  const dragRef = useRef<{ x: number; y: number; px: number; py: number; target: "video" | "bg" } | null>(null);
+  const bgLiveDragRef = useRef<{ dx: number; dy: number } | null>(null);
   const fetchedRef = useRef(false);
   const videoUrlRef = useRef("");
   const restoreRef = useRef<{
@@ -661,6 +816,8 @@ export default function VideoWatchface({
   const pushScreen = (next: Screen) => {
     if (screensRef.current[screensRef.current.length - 1] === next) return;
     screensRef.current = [...screensRef.current, next];
+    // 前进进入新屏 = 从顶部开始；返回走 popScreen，不清位置
+    resetScroll(SCREEN_SCROLL_KEYS[next]);
     setScreen(next);
     try {
       window.history.pushState({ panfang: true, route: "video" }, "", "#video");
@@ -672,6 +829,8 @@ export default function VideoWatchface({
 
   const replaceScreen = (next: Screen) => {
     screensRef.current = [...screensRef.current.slice(0, -1), next];
+    // 就地换屏视同前进进入：新屏从顶部开始
+    resetScroll(SCREEN_SCROLL_KEYS[next]);
     setScreen(next);
     try {
       window.history.replaceState({ panfang: true, route: "video" }, "", "#video");
@@ -684,15 +843,19 @@ export default function VideoWatchface({
   const popScreen = (): boolean => {
     const stack = screensRef.current;
     if (stack.length <= 1) return false;
-    if (!exitConfirmedRef.current && screen === "edit" && videoUrl && draftDirty) {
-      // 不在 popstate 回调里调用 history.pushState（WebView 会把 canGoBack 弄乱）；
-      // 同步减少 depth，并记住「历史已弹出一格」，用户选取消/保存失败时再补回历史条目。
-      if (!exitAskRef.current) {
-        exitPoppedHistoryRef.current = true;
-        onInternalDepthChange?.(-1);
-        setExitAsk(true);
+    if (!exitConfirmedRef.current && screen === "edit" && draftDirty) {
+      if (!videoUrl && draftCreatedRef.current) {
+        void discardDraft();
+      } else if (videoUrl) {
+        // 不在 popstate 回调里调用 history.pushState（WebView 会把 canGoBack 弄乱）；
+        // 同步减少 depth，并记住「历史已弹出一格」，用户选取消/保存失败时再补回历史条目。
+        if (!exitAskRef.current) {
+          exitPoppedHistoryRef.current = true;
+          onInternalDepthChange?.(-1);
+          setExitAsk(true);
+        }
+        return true;
       }
-      return true;
     }
     exitConfirmedRef.current = false;
     exitPoppedHistoryRef.current = false;
@@ -734,8 +897,64 @@ export default function VideoWatchface({
 
   const cw = style?.canvas_w || 336;
   const ch = style?.canvas_h || 480;
+  const slotConfig = style?.slot_config || null;
+  const frameW = slotConfig ? slotConfig.sprite_box.w : cw;
+  const frameH = slotConfig ? slotConfig.sprite_box.h : ch;
+  const bgReady =
+    !slotConfig ||
+    (bgMode === "photo" && !!bgPhotoUrl) ||
+    (bgMode === "solid" && /^#[0-9a-fA-F]{6}$/.test(bgFill));
   // 布局叠层：和视频预览同尺寸的透明前景层（时间/日期等），由 worker 从模板渲染
   const overlayUrl = style?.overlay_url ? `${API_BASE}${style.overlay_url}` : "";
+
+  /** 实时重绘双槽位底层背景到 Canvas（与 Rust `video_compose_bg` 同一套坐标语义） */
+  const drawBgPreview = useCallback(() => {
+    const cv = bgCanvasRef.current;
+    if (!cv) return;
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;
+    if (cv.width !== cw || cv.height !== ch) {
+      cv.width = cw;
+      cv.height = ch;
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+    if (!slotConfig) return;
+    if (bgMode === "solid" && /^#[0-9a-fA-F]{6}$/.test(bgFill)) {
+      ctx.fillStyle = bgFill;
+      ctx.fillRect(0, 0, cw, ch);
+      return;
+    }
+    if (bgMode !== "photo") return;
+    const img = bgImgRef.current;
+    if (!img || !img.complete || !img.naturalWidth) return;
+    const live = bgLiveDragRef.current;
+    const dx = live ? live.dx : bgDx;
+    const dy = live ? live.dy : bgDy;
+    const cover = Math.max(cw / img.naturalWidth, ch / img.naturalHeight) * 1.15;
+    const sc = cover * Math.max(0.2, bgScale);
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.filter = bgBlur > 0.5 ? `blur(${bgBlur.toFixed(1)}px)` : "none";
+    ctx.translate(cw / 2 + dx, ch / 2 + dy);
+    if (bgRot) ctx.rotate((bgRot * Math.PI) / 180);
+    ctx.scale(sc * (bgFlipX ? -1 : 1), sc * (bgFlipY ? -1 : 1));
+    ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    if (bgDarken > 0) {
+      ctx.globalAlpha = Math.max(0, Math.min(1, bgDarken));
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(-img.naturalWidth / 2, -img.naturalHeight / 2, img.naturalWidth, img.naturalHeight);
+      ctx.globalAlpha = 1;
+    }
+    ctx.filter = "none";
+    ctx.restore();
+  }, [cw, ch, slotConfig, bgMode, bgFill, bgScale, bgRot, bgDx, bgDy, bgBlur, bgDarken, bgFlipX, bgFlipY]);
+
+  useEffect(() => {
+    if (screen !== "edit") return;
+    drawBgPreview();
+  }, [screen, drawBgPreview, bgPhotoUrl]);
   const clipLen = Math.max(0, trimEnd - trimStart);
   const fps = clipLen > 0 ? count / clipLen : 0;
   const fpsBad = fps > 60.001 || (clipLen > 0 && fps < 0.999);
@@ -799,6 +1018,32 @@ export default function VideoWatchface({
       setLoadingProjects(false);
     }
   }, []);
+
+  /** 历史记录里可批量处理的条目：制作中的任务不允许删除，也不可勾选 */
+  const selectableIds = useMemo(
+    () =>
+      projects
+        .filter((p) => !["queued", "running"].includes(p.job_status || ""))
+        .map((p) => p.id),
+    [projects]
+  );
+
+  // 离开历史记录页或记录清空时，退出管理模式并清掉选择状态
+  useEffect(() => {
+    if (screen !== "projects" || projects.length === 0) {
+      setManageMode(false);
+      setSelectedIds([]);
+      setBatchDeleteAsk(false);
+    }
+  }, [screen, projects.length]);
+
+  // 记录变化后只保留仍然可选的勾选，避免把已删/进行中的项目带到下一次批量操作
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      const next = prev.filter((id) => selectableIds.includes(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [selectableIds]);
 
   /** 服务端已 done 但本地没有 bin（断网/清理过）时手动补下载 */
   const refetchBin = async (p: Project) => {
@@ -1092,6 +1337,22 @@ export default function VideoWatchface({
     setStyle(st);
     setFrameColors(st.frame_colors || []);
     setFrameColor(st.frame_colors?.length ? String(st.frame_colors[0].i) : "");
+    // 双槽位：不预设默认照片或纯色，必须由用户主动选
+    setBgMode("");
+    setBgFill("");
+    setBgPhotoUrl("");
+    setBgPhotoB64("");
+    bgImgRef.current = null;
+    bgLiveDragRef.current = null;
+    setBgScale(1);
+    setBgRot(0);
+    setBgDx(0);
+    setBgDy(0);
+    setBgBlur(st.slot_config?.bg_defaults?.blur ?? 8);
+    setBgDarken(st.slot_config?.bg_defaults?.darken ?? 0.3);
+    setBgFlipX(false);
+    setBgFlipY(false);
+    setDragTarget("video");
     setProject(null);
     setProjectId("");
     setVideoName("");
@@ -1151,6 +1412,7 @@ export default function VideoWatchface({
         frame_count: p.frame_count || 0,
         preview_url: p.preview_url || "",
         frame_colors: p.frame_colors || [],
+        slot_config: p.slot_config ?? null,
       };
       // 老作品快照里没有叠层/相框/上限：统一按 style_id 从模板接口补齐一次。
       // 离线就用本地快照（叠层不显示，但编辑/生成不受影响）。
@@ -1167,6 +1429,7 @@ export default function VideoWatchface({
           }
           if (found?.overlay_url) st.overlay_url = found.overlay_url;
           if (found?.max_bin) st.max_bin = found.max_bin;
+          if ("slot_config" in (found || {})) st.slot_config = found.slot_config ?? null;
         } catch {
           /* 离线：用本地快照，没有叠层就不显示 */
         }
@@ -1179,6 +1442,42 @@ export default function VideoWatchface({
           ? String(colors[0].i)
           : "";
       setFrameColor(savedColor);
+      const sc = st.slot_config;
+      setBgMode(p.bg_mode || "");
+      setBgFill(p.bg_fill || "");
+      setBgScale(p.bg_scale ?? 1);
+      setBgRot(p.bg_rot ?? 0);
+      setBgDx(p.bg_dx ?? 0);
+      setBgDy(p.bg_dy ?? 0);
+      setBgBlur(p.bg_blur ?? (sc?.bg_defaults?.blur ?? 8));
+      setBgDarken(p.bg_darken ?? (sc?.bg_defaults?.darken ?? 0.3));
+      setBgFlipX(!!p.bg_flip_x);
+      setBgFlipY(!!p.bg_flip_y);
+      setBgPhotoUrl("");
+      setBgPhotoB64("");
+      bgImgRef.current = null;
+      bgLiveDragRef.current = null;
+      setDragTarget(p.has_video ? "video" : p.bg_mode === "photo" ? "bg" : "video");
+      if (p.bg_mode === "photo" && p.has_bg_photo) {
+        try {
+          const bp = (await invoke("video_project_get", {
+            projectId: p.id,
+            kind: "bg_photo",
+          })) as { data_b64: string };
+          if (bp?.data_b64) {
+            const mime = bp.data_b64.startsWith("iVBOR") ? "image/png" : "image/jpeg";
+            const durl = `data:${mime};base64,${bp.data_b64}`;
+            const im = new Image();
+            im.onload = () => drawBgPreview();
+            im.src = durl;
+            bgImgRef.current = im;
+            setBgPhotoB64(bp.data_b64);
+            setBgPhotoUrl(durl);
+          }
+        } catch {
+          /* 底图照片未留档时，由用户重选 */
+        }
+      }
       setStyle(st);
       setTemplate(null);
       setProject(p);
@@ -1277,6 +1576,45 @@ export default function VideoWatchface({
     }
   };
 
+  /** 为双槽位底图提前落盘一个草稿项目（用户先选底图再选视频时也有地方放图） */
+  const buildDraftMeta = (id: string, extra?: Record<string, any>) => ({
+    id,
+    title: project?.title || videoName || "我的视频表盘",
+    template_id: template?.id || project?.template_id || "",
+    template_name: template?.name || project?.template_name || "",
+    style_id: style?.id || project?.style_id || "",
+    style_name: style?.name || project?.style_name || "",
+    device_type: style?.device_type || project?.device_type || "",
+    canvas_w: cw,
+    canvas_h: ch,
+    sprite_w: frameW,
+    sprite_h: frameH,
+    has_slot: !!slotConfig,
+    slot_config: slotConfig,
+    preview_url: style?.preview_url || project?.preview_url || "",
+    frame_colors: style?.frame_colors || project?.frame_colors || [],
+    frame_color:
+      frameColor ||
+      project?.frame_color ||
+      (style?.frame_colors?.length ? String(style.frame_colors[0].i) : ""),
+    bg_mode: bgMode,
+    bg_fill: bgFill,
+    bg_scale: bgScale,
+    bg_rot: bgRot,
+    bg_dx: bgDx,
+    bg_dy: bgDy,
+    bg_blur: bgBlur,
+    bg_darken: bgDarken,
+    bg_flip_x: bgFlipX,
+    bg_flip_y: bgFlipY,
+    created_at: project?.created_at || Math.floor(Date.now() / 1000),
+    watchface_id: project?.watchface_id,
+    job_id: project?.job_id,
+    job_status: project?.job_status,
+    result_size: project?.result_size,
+    ...(extra || {}),
+  });
+
   const saveVideo = async (file: File) => {
     if (!invoke) return;
     if (file.size > MAX_VIDEO_BYTES) {
@@ -1289,30 +1627,10 @@ export default function VideoWatchface({
       const b64 = bytesToB64(new Uint8Array(buf));
       const isNew = !projectId;
       const id = projectId || newProjectId();
-      const now = Math.floor(Date.now() / 1000);
-      const meta = {
-        id,
+      const meta = buildDraftMeta(id, {
         title: project?.title || videoName || file.name.replace(/\.[^.]+$/, "") || "我的视频表盘",
-        template_id: template?.id || project?.template_id || "",
-        template_name: template?.name || project?.template_name || "",
-        style_id: style?.id || project?.style_id || "",
-        style_name: style?.name || project?.style_name || "",
-        device_type: style?.device_type || project?.device_type || "",
-        canvas_w: cw,
-        canvas_h: ch,
-        preview_url: style?.preview_url || project?.preview_url || "",
-        frame_colors: style?.frame_colors || project?.frame_colors || [],
-        frame_color:
-          project?.frame_color ||
-          (style?.frame_colors?.length ? String(style.frame_colors[0].i) : ""),
         video_name: file.name,
-        created_at: project?.created_at || now,
-        // 换视频时保留旧成品的身份：管理页的「视频」角标还要能对上已经装在表上的那张
-        watchface_id: project?.watchface_id,
-        job_id: project?.job_id,
-        job_status: project?.job_status,
-        result_size: project?.result_size,
-      };
+      });
       await invoke("video_project_create", {
         metaJson: JSON.stringify(meta),
         videoB64: b64,
@@ -1328,6 +1646,7 @@ export default function VideoWatchface({
       const url = URL.createObjectURL(file);
       videoUrlRef.current = url;
       setVideoUrl(url);
+      if (slotConfig) setDragTarget("video");
       setVideoDim(null);
       setDuration(0);
       setPlayhead(0);
@@ -1346,22 +1665,156 @@ export default function VideoWatchface({
     if (f) void saveVideo(f);
   };
 
+  /** 落盘一张底图（照片或视频首帧共用）：建草稿 → 存照片 → 重置底图视图 */
+  const commitBgPhotoDataUrl = async (durl: string) => {
+    if (!invoke) return;
+    const b64 = durl.slice(durl.indexOf(",") + 1);
+    const isNew = !projectId;
+    const id = projectId || newProjectId();
+    if (isNew) {
+      await invoke("video_project_create", {
+        metaJson: JSON.stringify(buildDraftMeta(id, { bg_mode: "photo" })),
+        videoB64: null,
+      });
+      setProjectId(id);
+      draftCreatedRef.current = true;
+      setDraftDirty(true);
+    }
+    await invoke("video_bg_photo_put", { projectId: id, photoB64: b64 });
+    const prevIm = new Image();
+    prevIm.onload = () => drawBgPreview();
+    prevIm.src = durl;
+    bgImgRef.current = prevIm;
+    setBgMode("photo");
+    setBgPhotoB64(b64);
+    setBgPhotoUrl(durl);
+    setBgScale(1);
+    setBgRot(0);
+    setBgDx(0);
+    setBgDy(0);
+    setBgFlipX(false);
+    setBgFlipY(false);
+    setBgBlur(slotConfig?.bg_defaults?.blur ?? 8);
+    setBgDarken(slotConfig?.bg_defaults?.darken ?? 0.3);
+    if (!videoUrl) setDragTarget("bg");
+  };
+
+  /** 选底层照片：前端先缩到 ≤ 2048px，再去 Rust 加密留档 */
+  const saveBgPhoto = async (file: File) => {
+    if (!invoke) return;
+    setBusy("正在处理底图照片…");
+    let objUrl = "";
+    try {
+      objUrl = URL.createObjectURL(file);
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(new Error("这张图片打不开，请换一张"));
+        im.src = objUrl;
+      });
+      const maxEdge = 2048;
+      const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth || 1, img.naturalHeight || 1));
+      const tw = Math.max(1, Math.round(img.naturalWidth * scale));
+      const th = Math.max(1, Math.round(img.naturalHeight * scale));
+      const cv = document.createElement("canvas");
+      cv.width = tw;
+      cv.height = th;
+      const ctx = cv.getContext("2d");
+      if (!ctx) throw new Error("画布不可用");
+      ctx.drawImage(img, 0, 0, tw, th);
+      const durl = cv.toDataURL("image/jpeg", 0.92);
+      await commitBgPhotoDataUrl(durl);
+    } catch (e) {
+      showToast(String(e), "error");
+    } finally {
+      if (objUrl) URL.revokeObjectURL(objUrl);
+      setBusy("");
+    }
+  };
+
+  /** 把视频当前帧截成底图：优先片段起点，没有偏移时取 0.05s 避免黑屏首帧 */
+  const extractVideoFirstFrameAsBg = async () => {
+    if (!invoke || !videoUrl || !videoDim) {
+      showToast("请先选择视频", "error");
+      return;
+    }
+    setBusy("正在提取视频首帧…");
+    const v = document.createElement("video");
+    try {
+      v.muted = true;
+      v.playsInline = true;
+      v.preload = "auto";
+      v.src = videoUrl;
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        let timer: number | undefined;
+        const done = (ok: boolean, err?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (timer !== undefined) window.clearTimeout(timer);
+          v.removeEventListener("loadeddata", onLoaded);
+          v.removeEventListener("error", onError);
+          if (ok) resolve();
+          else reject(err || new Error("视频首帧读取失败"));
+        };
+        const onLoaded = () => done(true);
+        const onError = () => done(false);
+        timer = window.setTimeout(() => done(false, new Error("视频加载超时")), 6000);
+        v.addEventListener("loadeddata", onLoaded);
+        v.addEventListener("error", onError);
+      });
+      const targetTime =
+        trimStart > 0.05 ? trimStart : Math.min(duration || 0, 0.05);
+      await seek(v, targetTime);
+      const vw = v.videoWidth || videoDim.w;
+      const vh = v.videoHeight || videoDim.h;
+      const maxEdge = 2048;
+      const k = Math.min(1, maxEdge / Math.max(vw, vh));
+      const cv = document.createElement("canvas");
+      cv.width = Math.max(1, Math.round(vw * k));
+      cv.height = Math.max(1, Math.round(vh * k));
+      const ctx = cv.getContext("2d");
+      if (!ctx) throw new Error("画布不可用");
+      ctx.drawImage(v, 0, 0, cv.width, cv.height);
+      const durl = cv.toDataURL("image/jpeg", 0.92);
+      await commitBgPhotoDataUrl(durl);
+    } catch (e) {
+      showToast(String(e), "error");
+    } finally {
+      try {
+        v.removeAttribute("src");
+        v.load();
+      } catch {
+        /* 忽略 */
+      }
+      setBusy("");
+    }
+  };
+
+  const onPickBgFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (f) void saveBgPhoto(f);
+  };
+
   const videoBox = useMemo(() => {
     if (!videoDim) return { left: 0, top: 0, width: 100, height: 100 };
-    const cover = Math.max(cw / videoDim.w, ch / videoDim.h) * zoom;
+    const rw = slotConfig ? slotConfig.window.w : cw;
+    const rh = slotConfig ? slotConfig.window.h : ch;
+    const cover = Math.max(rw / videoDim.w, rh / videoDim.h) * zoom;
     const dw = videoDim.w * cover;
     const dh = videoDim.h * cover;
-    const maxX = Math.max(1, (dw - cw) / 2);
-    const maxY = Math.max(1, (dh - ch) / 2);
-    const dx = (cw - dw) / 2 + panX * maxX;
-    const dy = (ch - dh) / 2 + panY * maxY;
+    const maxX = Math.max(1, (dw - rw) / 2);
+    const maxY = Math.max(1, (dh - rh) / 2);
+    const dx = (rw - dw) / 2 + panX * maxX;
+    const dy = (rh - dh) / 2 + panY * maxY;
     return {
-      left: (dx / cw) * 100,
-      top: (dy / ch) * 100,
-      width: (dw / cw) * 100,
-      height: (dh / ch) * 100,
+      left: (dx / rw) * 100,
+      top: (dy / rh) * 100,
+      width: (dw / rw) * 100,
+      height: (dh / rh) * 100,
     };
-  }, [videoDim, cw, ch, zoom, panX, panY]);
+  }, [videoDim, cw, ch, slotConfig, zoom, panX, panY]);
 
   /** 预览框：按画布比例等比，最大 168×210（与表盘编辑页同一个 frameSizeFor） */
   const previewFrame = useMemo(() => {
@@ -1694,32 +2147,63 @@ export default function VideoWatchface({
   };
 
   const onCropDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!videoDim) return;
-    // 点播放按钮不算拖拽，否则 pointer capture 会把 click 吞掉
+    // 点播放/选视频按钮不算拖拽，否则 pointer capture 会把 click 吞掉
     if ((e.target as HTMLElement).closest("button")) return;
+    const useBg = slotConfig && dragTarget === "bg" && bgMode === "photo" && !!bgPhotoUrl;
+    if (!useBg && !videoDim) {
+      if (slotConfig && !bgReady) {
+        bgCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+      return;
+    }
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    dragRef.current = { x: e.clientX, y: e.clientY, px: panX, py: panY };
+    if (useBg) {
+      dragRef.current = { x: e.clientX, y: e.clientY, px: bgDx, py: bgDy, target: "bg" };
+    } else {
+      dragRef.current = { x: e.clientX, y: e.clientY, px: panX, py: panY, target: "video" };
+    }
   };
 
   const onCropMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
     const box = cropRef.current;
-    if (!d || !box || !videoDim) return;
+    if (!d || !box) return;
     const rect = box.getBoundingClientRect();
-    const cover = Math.max(cw / videoDim.w, ch / videoDim.h) * zoom;
+    if (d.target === "bg") {
+      const kX = cw / Math.max(1, rect.width);
+      const kY = ch / Math.max(1, rect.height);
+      bgLiveDragRef.current = {
+        dx: d.px + (e.clientX - d.x) * kX,
+        dy: d.py + (e.clientY - d.y) * kY,
+      };
+      drawBgPreview();
+      return;
+    }
+    if (!videoDim) return;
+    const rw = slotConfig ? slotConfig.window.w : cw;
+    const rh = slotConfig ? slotConfig.window.h : ch;
+    const rot = slotConfig ? slotConfig.window.rot || 0 : 0;
+    const cover = Math.max(rw / videoDim.w, rh / videoDim.h) * zoom;
     const dw = videoDim.w * cover;
     const dh = videoDim.h * cover;
-    const maxX = Math.max(1, (dw - cw) / 2);
-    const maxY = Math.max(1, (dh - ch) / 2);
-    const dxCanvas = ((e.clientX - d.x) / Math.max(1, rect.width)) * cw;
-    const dyCanvas = ((e.clientY - d.y) / Math.max(1, rect.height)) * ch;
-    const nx = Math.max(-1, Math.min(1, d.px + dxCanvas / maxX));
-    const ny = Math.max(-1, Math.min(1, d.py + dyCanvas / maxY));
+    const maxX = Math.max(1, (dw - rw) / 2);
+    const maxY = Math.max(1, (dh - rh) / 2);
+    const rawX = ((e.clientX - d.x) / Math.max(1, rect.width)) * cw;
+    const rawY = ((e.clientY - d.y) / Math.max(1, rect.height)) * ch;
+    const delta = rot ? rotateVec(rawX, rawY, -rot) : { x: rawX, y: rawY };
+    const nx = Math.max(-1, Math.min(1, d.px + delta.x / maxX));
+    const ny = Math.max(-1, Math.min(1, d.py + delta.y / maxY));
     setPanX(nx);
     setPanY(ny);
   };
 
   const onCropUp = () => {
+    if (bgLiveDragRef.current) {
+      const live = bgLiveDragRef.current;
+      bgLiveDragRef.current = null;
+      setBgDx(live.dx);
+      setBgDy(live.dy);
+    }
     dragRef.current = null;
   };
 
@@ -1787,7 +2271,11 @@ export default function VideoWatchface({
       showToast("播放时长不能超过 5 秒", "error");
       return;
     }
-    setBusy("正在抽帧…");
+    if (slotConfig && !bgReady) {
+      showToast("请先在「底部背景」选择照片或纯色", "error");
+      return;
+    }
+    setBusy(slotConfig ? "正在合成底层背景…" : "正在抽帧…");
     setProgress(0);
     setKeepScreenOn(true);
     setInstallBackLock(true);
@@ -1796,6 +2284,38 @@ export default function VideoWatchface({
       seekTimerRef.current = undefined;
     }
     try {
+      await inv("video_project_update_meta", {
+        projectId,
+        patchJson: JSON.stringify({
+          sprite_w: frameW,
+          sprite_h: frameH,
+          has_slot: !!slotConfig,
+          slot_config: slotConfig,
+        }),
+      });
+      if (slotConfig) {
+        const bgParams =
+          bgMode === "solid"
+            ? { fill: bgFill }
+            : {
+                scale: bgScale,
+                rotation: bgRot,
+                darken: bgDarken,
+                blur: bgBlur,
+                flipX: bgFlipX,
+                flipY: bgFlipY,
+                dx: bgDx,
+                dy: bgDy,
+              };
+        await inv("video_compose_bg", {
+          projectId,
+          canvasW: cw,
+          canvasH: ch,
+          photoB64: bgMode === "photo" ? bgPhotoB64 || null : null,
+          paramsJson: JSON.stringify(bgParams),
+        });
+        setBusy("正在抽帧…");
+      }
       await inv("video_frame_reset", { projectId });
       const total = count;
       let sent = 0;
@@ -1828,8 +2348,8 @@ export default function VideoWatchface({
       };
       await captureByPlaying(
         v,
-        cw,
-        ch,
+        frameW,
+        frameH,
         total,
         trimStart,
         clipLen,
@@ -1840,7 +2360,8 @@ export default function VideoWatchface({
           pending.push(b64);
           if (pending.length >= 6) flush();
         },
-        (n) => setProgress(Math.round((n / total) * 100))
+        (n) => setProgress(Math.round((n / total) * 100)),
+        slotConfig ? { win: slotConfig.window, box: slotConfig.sprite_box } : undefined
       );
       flush();
       await Promise.all(slots);
@@ -1852,6 +2373,7 @@ export default function VideoWatchface({
         count,
         fps,
         mode,
+        dualSlot: !!slotConfig,
       };
       if (frameColor) jobArgs.frameColor = frameColor;
       const v2 = (await inv("video_job_create", jobArgs)) as any;
@@ -1865,6 +2387,20 @@ export default function VideoWatchface({
           pan_y: panY,
           frame_color: frameColor || "",
           frame_colors: frameColors,
+          sprite_w: frameW,
+          sprite_h: frameH,
+          has_slot: !!slotConfig,
+          slot_config: slotConfig,
+          bg_mode: bgMode,
+          bg_fill: bgFill,
+          bg_scale: bgScale,
+          bg_rot: bgRot,
+          bg_dx: bgDx,
+          bg_dy: bgDy,
+          bg_blur: bgBlur,
+          bg_darken: bgDarken,
+          bg_flip_x: bgFlipX,
+          bg_flip_y: bgFlipY,
         }),
       });
       const jobId = v2?.job?.id || "";
@@ -2048,6 +2584,60 @@ export default function VideoWatchface({
     }
   };
 
+  /** 批量管理：完全删除所选项目（进行中的任务已在勾选时排除） */
+  const batchDeleteAll = async () => {
+    if (!invoke) return;
+    setBatchDeleteAsk(false);
+    setBusy("正在删除…");
+    try {
+      const targets = projects
+        .filter(
+          (p) => selectedIds.includes(p.id) && !["queued", "running"].includes(p.job_status || "")
+        )
+        .map((p) => p.id);
+      for (const pid of targets) {
+        try {
+          await invoke("video_job_delete", { projectId: pid });
+        } catch {
+          /* 没有任务/任务已结束都不影响本地删除 */
+        }
+        await invoke("video_project_delete", { projectId: pid });
+      }
+      if (project?.id && targets.includes(project.id)) setProject(null);
+      setManageMode(false);
+      setSelectedIds([]);
+      await loadProjects();
+      showToast(`已删除 ${targets.length} 个项目`);
+    } catch (e) {
+      showToast(String(e), "error");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** 批量管理：只清视频/帧包/底图，保留表盘文件以便安装 */
+  const batchKeepBin = async () => {
+    if (!invoke) return;
+    setBatchDeleteAsk(false);
+    setBusy("正在清理…");
+    try {
+      for (const pid of selectedIds) {
+        await invoke("video_project_clear", {
+          projectId: pid,
+          kinds: ["video", "frames", "bg", "bg_photo"],
+        });
+      }
+      setManageMode(false);
+      setSelectedIds([]);
+      await loadProjects();
+      showToast("已清理，保留了表盘文件");
+    } catch (e) {
+      showToast(String(e), "error");
+    } finally {
+      setBusy("");
+    }
+  };
+
   /** 保存当前草稿到历史记录（视频选的时候已经落盘，这里补参数） */
   const saveDraft = async (): Promise<boolean> => {
     const inv = invoke;
@@ -2068,6 +2658,22 @@ export default function VideoWatchface({
           zoom,
           pan_x: panX,
           pan_y: panY,
+          frame_color: frameColor || "",
+          frame_colors: frameColors,
+          sprite_w: frameW,
+          sprite_h: frameH,
+          has_slot: !!slotConfig,
+          slot_config: slotConfig,
+          bg_mode: bgMode,
+          bg_fill: bgFill,
+          bg_scale: bgScale,
+          bg_rot: bgRot,
+          bg_dx: bgDx,
+          bg_dy: bgDy,
+          bg_blur: bgBlur,
+          bg_darken: bgDarken,
+          bg_flip_x: bgFlipX,
+          bg_flip_y: bgFlipY,
         }),
       });
       draftCreatedRef.current = false;
@@ -2109,12 +2715,15 @@ export default function VideoWatchface({
     }
   };
 
-  /** 编辑页的返回：有未保存草稿先问 */
+  /** 编辑页的返回：有未保存草稿先问；只选了底图没选视频时静默清理空草稿 */
   const requestLeaveEdit = () => {
     if (videoUrl && draftDirty) {
       exitPoppedHistoryRef.current = false;
       setExitAsk(true);
       return;
+    }
+    if (!videoUrl && draftDirty && draftCreatedRef.current) {
+      void discardDraft();
     }
     backFromScreen();
   };
@@ -2217,14 +2826,20 @@ export default function VideoWatchface({
       !!latestJob && seenJobs[latestJob.id] === `${latestStatus}:${latestJob.job_id || ""}`;
     const showJobBadge = latestActive || (latestTerminal && !latestSeen);
     return (
-      <div
-        data-rb="y"
-        data-rb-always="1"
-        className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim select-none"
-      >
-        <Header title="视频表盘" onBackPress={onBack} />
+      <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
+        <div className="px-6 safe-top pb-1 shrink-0 z-20 bg-[var(--pf-page)]">
+          <Header title="视频表盘" onBackPress={onBack} />
+        </div>
 
-        <div className="flex-1 flex flex-col justify-center gap-3">
+        <div className="flex-1 min-h-0 overflow-hidden relative">
+          <div
+            ref={homeScroll.ref}
+            onScroll={homeScroll.onScroll}
+            data-rb="y"
+            data-rb-always="1"
+            className="h-full overflow-y-auto no-scrollbar px-6 pt-1 pb-10"
+          >
+            <div className="min-h-full flex flex-col justify-center gap-3">
           <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5">
             <div className="w-12 h-12 rounded-2xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center">
               <VideoCamera className="w-6 h-6" />
@@ -2281,6 +2896,8 @@ export default function VideoWatchface({
               <CaretRight className="w-5 h-5 text-[var(--pf-i-25)] stroke-[2]" />
             </div>
           </button>
+            </div>
+          </div>
         </div>
 
         {busy && (
@@ -2298,101 +2915,272 @@ export default function VideoWatchface({
   // ---------------------------------------------------------------- 历史记录
 
   if (screen === "projects") {
+    const allSelected =
+      selectableIds.length > 0 && selectableIds.every((id) => selectedIds.includes(id));
+    const selectedBytes = projects
+      .filter((p) => selectedIds.includes(p.id))
+      .reduce(
+        (n, p) => n + (p.video_size || 0) + (p.frames_size || 0) + (p.bin_size || 0),
+        0
+      );
     return (
-      <div
-        data-rb="y"
-        data-rb-always="1"
-        className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim select-none"
-      >
-        <Header title="历史记录" onBackPress={backFromScreen} />
-
-        {loadingProjects ? (
-          <Empty text="正在读取历史记录…" />
-        ) : projects.length === 0 ? (
-          <Empty text="还没有历史记录" />
-        ) : (
-          <div className="flex flex-col gap-3">
-            {projects.map((p) => {
-              const active = ["queued", "running"].includes(p.job_status || "");
-              const done = p.has_bin || p.job_status === "done";
-              const failed = p.job_status === "failed";
-              const total =
-                (p.video_size || 0) + (p.frames_size || 0) + (p.bin_size || 0);
-              // 有用户首帧预览（preview_b64）时叠上布局层；纯样式预览本身已带时间，不再叠
-              const overlaySrc =
-                p.preview_b64 && p.style_id ? overlayByStyle[p.style_id] || "" : "";
-              return (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => openProject(p)}
-                  className="w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex items-center gap-3 active:scale-[0.98] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
-                >
-                  <div
-                    className="relative rounded-xl bg-[var(--pf-bg-5)] overflow-hidden shrink-0"
-                    style={thumbBox(p.canvas_w, p.canvas_h, 64)}
+      <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
+        <div className="px-6 safe-top pb-1 shrink-0 z-20 bg-[var(--pf-page)]">
+          <Header
+            title="历史记录"
+            onBackPress={backFromScreen}
+            right={
+              !loadingProjects && projects.length > 0 ? (
+                !manageMode ? (
+                  <button
+                    type="button"
+                    aria-label="管理"
+                    title="管理"
+                    onClick={() => {
+                      setSelectedIds(selectableIds);
+                      setManageMode(true);
+                    }}
+                    className="w-11 h-11 rounded-full flex items-center justify-center text-[var(--pf-i-80)] active:scale-95 transition-all cursor-pointer"
                   >
-                    {previewSrc(p) ? (
-                      <img
-                        src={previewSrc(p)}
-                        alt=""
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center text-[var(--pf-i-20)]">
-                        <FilmStrip className="w-5 h-5" />
+                    <ListChecks className="w-5 h-5" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setManageMode(false);
+                      setSelectedIds([]);
+                    }}
+                    className="h-8 px-3 rounded-full bg-[var(--pf-bg-5)] pf-fs-12 font-bold text-[var(--pf-ink)] whitespace-nowrap cursor-pointer active:scale-95"
+                  >
+                    完成
+                  </button>
+                )
+              ) : undefined
+            }
+          />
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-hidden relative">
+          <div
+            ref={projectsScroll.ref}
+            onScroll={projectsScroll.onScroll}
+            data-rb="y"
+            data-rb-always="1"
+            className="h-full overflow-y-auto no-scrollbar px-6 pt-1 pb-6"
+          >
+          {loadingProjects ? (
+            <Empty text="正在读取历史记录…" />
+          ) : projects.length === 0 ? (
+            <Empty text="还没有历史记录" />
+          ) : (
+            <div className="flex flex-col gap-3">
+              {projects.map((p) => {
+                const active = ["queued", "running"].includes(p.job_status || "");
+                const done = p.has_bin || p.job_status === "done";
+                const failed = p.job_status === "failed";
+                const total =
+                  (p.video_size || 0) + (p.frames_size || 0) + (p.bin_size || 0);
+                // 有用户首帧预览（preview_b64）时叠上布局层；纯样式预览本身已带时间，不再叠
+                const overlaySrc =
+                  p.preview_b64 && p.style_id ? overlayByStyle[p.style_id] || "" : "";
+                const thumb = thumbSize(p.canvas_w, p.canvas_h, 64);
+                const thumbScreen: [number, number] = [p.canvas_w || cw, p.canvas_h || ch];
+                const thumbScale = previewImageScale(thumbScreen);
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => {
+                      if (!manageMode) {
+                        openProject(p);
+                        return;
+                      }
+                      if (active) {
+                        showToast("制作中的项目暂不支持删除", "error");
+                        return;
+                      }
+                      setSelectedIds((prev) =>
+                        prev.includes(p.id)
+                          ? prev.filter((id) => id !== p.id)
+                          : [...prev, p.id]
+                      );
+                    }}
+                    className="w-full text-left bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex items-center gap-3 active:scale-[0.98] transition-all cursor-pointer shadow-[0_1px_3px_rgba(0,0,0,0.02)]"
+                  >
+                    <DialPreviewFrame
+                      screen={thumbScreen}
+                      width={thumb.w}
+                      height={thumb.h}
+                      className="shrink-0"
+                    >
+                      {previewSrc(p) ? (
+                        <img
+                          src={previewSrc(p)}
+                          alt=""
+                          style={
+                            thumbScale > 1
+                              ? { transform: `scale(${thumbScale})` }
+                              : undefined
+                          }
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-[var(--pf-i-20)]">
+                          <FilmStrip className="w-5 h-5" />
+                        </div>
+                      )}
+                      {overlaySrc && (
+                        <img
+                          src={`${API_BASE}${overlaySrc}`}
+                          alt=""
+                          draggable={false}
+                          onError={(e) => {
+                            e.currentTarget.style.display = "none";
+                          }}
+                          className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
+                        />
+                      )}
+                    </DialPreviewFrame>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] truncate">
+                          {p.title || "视频表盘"}
+                        </h4>
+                        {active && (
+                          <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-amber)] bg-[var(--pf-amber-10)] px-2 py-0.5 rounded-full flex items-center gap-1">
+                            <ArrowClockwise className="w-3 h-3 animate-spin" />
+                            {statusLabel(p.job_status)}
+                          </span>
+                        )}
+                        {done && !active && (
+                          <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-ok)] bg-[var(--pf-ok-12)] px-2 py-0.5 rounded-full">
+                            已完成
+                          </span>
+                        )}
+                        {failed && !active && (
+                          <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-danger)] bg-[var(--pf-danger-10)] px-2 py-0.5 rounded-full">
+                            制作失败
+                          </span>
+                        )}
                       </div>
-                    )}
-                    {overlaySrc && (
-                      <img
-                        src={`${API_BASE}${overlaySrc}`}
-                        alt=""
-                        draggable={false}
-                        onError={(e) => {
-                          e.currentTarget.style.display = "none";
-                        }}
-                        className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
-                      />
-                    )}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <h4 className="pf-fs-16 font-bold text-[var(--pf-ink)] truncate">
-                        {p.title || "视频表盘"}
-                      </h4>
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-1 truncate">
+                        {p.style_name || "样式"}，{p.frame_count || 0} 帧
+                      </p>
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-0.5">
+                        {fmtDate(p.updated_at || p.created_at)}，{fmtSize(total)}
+                      </p>
                       {active && (
-                        <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-amber)] bg-[var(--pf-amber-10)] px-2 py-0.5 rounded-full flex items-center gap-1">
-                          <ArrowClockwise className="w-3 h-3 animate-spin" />
-                          {statusLabel(p.job_status)}
-                        </span>
-                      )}
-                      {done && !active && (
-                        <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-ok)] bg-[var(--pf-ok-12)] px-2 py-0.5 rounded-full">
-                          已完成
-                        </span>
-                      )}
-                      {failed && !active && (
-                        <span className="shrink-0 pf-fs-11 font-bold text-[var(--pf-danger)] bg-[var(--pf-danger-10)] px-2 py-0.5 rounded-full">
-                          制作失败
-                        </span>
+                        <div className="mt-2 h-1 rounded-full bg-[var(--pf-amber-15)] overflow-hidden">
+                          <div className="wf-indeterminate h-full w-1/3 rounded-full bg-[var(--pf-amber-solid)]" />
+                        </div>
                       )}
                     </div>
-                    <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-1 truncate">
-                      {p.style_name || "样式"}，{p.frame_count || 0} 帧
-                    </p>
-                    <p className="pf-fs-12 font-medium text-[var(--pf-i-30)] mt-0.5">
-                      {fmtDate(p.updated_at || p.created_at)}，{fmtSize(total)}
-                    </p>
-                    {active && (
-                      <div className="mt-2 h-1 rounded-full bg-[var(--pf-amber-15)] overflow-hidden">
-                        <div className="wf-indeterminate h-full w-1/3 rounded-full bg-[var(--pf-amber-solid)]" />
-                      </div>
+                    {!manageMode ? (
+                      <CaretRight className="w-5 h-5 text-[var(--pf-i-20)] shrink-0" />
+                    ) : active ? (
+                      <span className="w-5 h-5 mr-0.5 rounded-full border border-[var(--pf-bd-10)] opacity-30 shrink-0" />
+                    ) : selectedIds.includes(p.id) ? (
+                      <CheckCircle
+                        weight="fill"
+                        className="w-6 h-6 text-[var(--pf-primary)] shrink-0"
+                      />
+                    ) : (
+                      <span className="w-5 h-5 mr-0.5 rounded-full border-2 border-[var(--pf-bd-20)] shrink-0" />
                     )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          </div>
+        </div>
+
+        {manageMode && !loadingProjects && projects.length > 0 && (
+          <div
+            data-pf-bottombar
+            className="px-6 pt-2.5 safe-bottom-panel bg-[var(--pf-card)] border-t border-[var(--pf-bd-5)] shrink-0 z-30 flex flex-col gap-2.5"
+          >
+            <div className="flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setSelectedIds(allSelected ? [] : selectableIds)}
+                className="h-8 px-3 rounded-full bg-[var(--pf-bg-5)] pf-fs-12 font-bold text-[var(--pf-ink)] cursor-pointer active:scale-95"
+              >
+                {allSelected ? "取消全选" : "全选"}
+              </button>
+              <span className="pf-fs-12 font-medium text-[var(--pf-i-45)]">
+                {`已选 ${selectedIds.length} 项${
+                  selectedBytes > 0 ? `，${fmtSize(selectedBytes)}` : ""
+                }`}
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={selectedIds.length === 0}
+              onClick={() => setBatchDeleteAsk(true)}
+              className={`w-full h-12 rounded-2xl pf-fs-16 font-bold transition-all ${
+                selectedIds.length === 0
+                  ? "bg-[var(--pf-bg-10)] text-[var(--pf-i-25)]"
+                  : "bg-[var(--pf-danger-solid)] text-white cursor-pointer active:scale-[0.99]"
+              }`}
+            >
+              {selectedIds.length > 0 ? `删除（${selectedIds.length}）` : "删除"}
+            </button>
+          </div>
+        )}
+
+        {batchDeleteAsk && selectedIds.length > 0 && (
+          <div
+            className="fixed inset-0 z-[90] bg-[var(--pf-mask)] flex items-end justify-center px-4 pb-6"
+            onClick={() => setBatchDeleteAsk(false)}
+          >
+            <div
+              className="w-full max-w-sm bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 text-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="pf-fs-18 font-bold text-[var(--pf-ink)]">
+                删除 {selectedIds.length} 个项目
+              </h3>
+              <div className="flex flex-col gap-2.5 mt-4">
+                <button
+                  type="button"
+                  onClick={() => void batchDeleteAll()}
+                  className="rounded-2xl py-3 px-4 bg-[var(--pf-danger-solid)] text-white cursor-pointer active:scale-[0.99]"
+                >
+                  <div className="pf-fs-15 font-bold">完全删除</div>
+                  <div className="pf-fs-11 opacity-85 mt-0.5">
+                    删除视频、序列帧包与表盘文件
                   </div>
-                  <CaretRight className="w-5 h-5 text-[var(--pf-i-20)] shrink-0" />
                 </button>
-              );
-            })}
+                <button
+                  type="button"
+                  onClick={() => void batchKeepBin()}
+                  className="rounded-2xl py-3 px-4 bg-[var(--pf-primary-10)] text-[var(--pf-primary)] cursor-pointer active:scale-[0.99]"
+                >
+                  <div className="pf-fs-15 font-bold">仅保留表盘文件</div>
+                  <div className="pf-fs-11 opacity-80 mt-0.5">
+                    删除视频与序列帧包，保留表盘文件以便安装
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBatchDeleteAsk(false)}
+                  className="h-11 rounded-2xl bg-[var(--pf-bg-5)] pf-fs-14 font-bold text-[var(--pf-i-65)] cursor-pointer"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {busy && (
+          <div className="fixed inset-0 z-[80] bg-[var(--pf-mask-soft)] flex items-center justify-center px-8">
+            <div className="bg-[var(--pf-card)] pf-card-border rounded-2xl px-5 py-4 flex items-center gap-3 shadow-xl">
+              <ArrowClockwise className="w-5 h-5 text-[var(--pf-primary)] animate-spin" />
+              <span className="pf-fs-14 font-bold text-[var(--pf-ink)]">{busy}</span>
+            </div>
           </div>
         )}
       </div>
@@ -2417,12 +3205,18 @@ export default function VideoWatchface({
     const allLocked = shownTemplates.length > 0 && shownTemplates.every((t) => !t.unlocked);
     const buyUrl = shownTemplates.find((t) => !t.unlocked)?.buy_url || "https://afdian.com/a/Hobjl";
     return (
-      <div
-        data-rb="y"
-        data-rb-always="1"
-        className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim select-none"
-      >
-        <Header title="选择模板" onBackPress={backFromScreen} />
+      <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
+        <div className="px-6 safe-top pb-1 shrink-0 z-20 bg-[var(--pf-page)]">
+          <Header title="选择模板" onBackPress={backFromScreen} />
+        </div>
+        <div className="flex-1 min-h-0 overflow-hidden relative">
+          <div
+            ref={templatesScroll.ref}
+            onScroll={templatesScroll.onScroll}
+            data-rb="y"
+            data-rb-always="1"
+            className="h-full overflow-y-auto no-scrollbar px-6 pt-1 pb-10"
+          >
         {loadingTemplates ? (
           <Empty text="正在读取模板…" />
         ) : templatesError ? (
@@ -2464,79 +3258,117 @@ export default function VideoWatchface({
                 </button>
               </div>
             )}
-            {shownTemplates.map((tpl) => (
-              <div key={tpl.id} className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)]">{tpl.name}</h3>
-                    {!allLocked && (
-                      <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5">
-                        {tpl.unlocked ? "已解锁全部样式" : "购买后解锁这个模板包的全部样式"}
+            {shownTemplates.map((tpl) => {
+              const expanded = !!expandedTemplates[tpl.id];
+              const visibleStyles = expanded ? tpl.styles : tpl.styles.slice(0, 6);
+              const hiddenCount = tpl.styles.length - 6;
+              return (
+                <div
+                  key={tpl.id}
+                  className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex flex-col gap-3"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <h3 className="pf-fs-17 font-bold text-[var(--pf-ink)] truncate">
+                        {tpl.name}
+                      </h3>
+                      <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
+                        {tpl.styles.length} 种样式
                       </p>
+                    </div>
+                    {tpl.unlocked ? (
+                      <CheckCircle className="w-5 h-5 shrink-0 text-[var(--pf-ok)]" />
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          invoke &&
+                          void invoke("open_external", { url: tpl.buy_url || buyUrl })
+                        }
+                        className="h-8 px-3.5 shrink-0 rounded-full bg-[var(--pf-primary-solid)] text-white pf-fs-12 font-bold active:scale-95 transition-all cursor-pointer"
+                      >
+                        去解锁
+                      </button>
                     )}
                   </div>
-                  {tpl.unlocked ? (
-                    <CheckCircle className="w-5 h-5 text-[var(--pf-ok)]" />
-                  ) : (
-                    <LockSimple className="w-5 h-5 text-[var(--pf-i-25)]" />
+                  <div className="grid grid-cols-3 gap-x-3 gap-y-4">
+                    {visibleStyles.map((st) => {
+                      const thumb = styleThumbSize(st.canvas_w, st.canvas_h);
+                      const imgScale = previewImageScale([st.canvas_w, st.canvas_h]);
+                      return (
+                        <button
+                          key={st.id}
+                          type="button"
+                          onClick={() => {
+                            if (tpl.unlocked) {
+                              startNew(tpl, st);
+                            } else if (invoke) {
+                              void invoke("open_external", { url: tpl.buy_url || buyUrl });
+                            }
+                          }}
+                          className="min-w-0 flex flex-col items-center gap-1.5 active:scale-[0.97] transition-transform cursor-pointer"
+                        >
+                          <span className="flex h-[116px] w-full items-center justify-center">
+                            <span className="relative inline-flex">
+                              <DialPreviewFrame
+                                screen={[st.canvas_w, st.canvas_h]}
+                                width={thumb.w}
+                                height={thumb.h}
+                              >
+                                {st.preview_url ? (
+                                  <img
+                                    src={`${API_BASE}${st.preview_url}`}
+                                    alt=""
+                                    loading="lazy"
+                                    decoding="async"
+                                    style={
+                                      imgScale > 1
+                                        ? { transform: `scale(${imgScale})` }
+                                        : undefined
+                                    }
+                                    className="w-full h-full object-cover"
+                                  />
+                                ) : (
+                                  <div className="w-full h-full flex items-center justify-center text-[var(--pf-i-20)]">
+                                    <FilmStrip className="w-4 h-4" />
+                                  </div>
+                                )}
+                              </DialPreviewFrame>
+                              {!tpl.unlocked && (
+                                <span className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-[var(--pf-card)] pf-card-border shadow-[0_1px_3px_rgba(0,0,0,0.12)] text-[var(--pf-i-45)] flex items-center justify-center z-10">
+                                  <LockSimple className="w-3 h-3" />
+                                </span>
+                              )}
+                            </span>
+                          </span>
+                          <span className="w-full text-center pf-fs-12 font-semibold text-[var(--pf-ink)] truncate">
+                            {st.name}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {hiddenCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setExpandedTemplates((prev) => ({
+                          ...prev,
+                          [tpl.id]: !prev[tpl.id],
+                        }))
+                      }
+                      className="self-center h-8 px-3 rounded-full text-[var(--pf-primary)] pf-fs-12 font-semibold active:opacity-60 transition-opacity cursor-pointer"
+                    >
+                      {expanded ? "收起" : `展开其余 ${hiddenCount} 个样式`}
+                    </button>
                   )}
                 </div>
-                <div className="flex flex-col gap-2">
-                  {tpl.styles.map((st) => (
-                    <button
-                      key={st.id}
-                      type="button"
-                      onClick={() => startNew(tpl, st)}
-                      className={`flex items-center gap-3 rounded-2xl p-2.5 text-left active:scale-[0.99] transition-all cursor-pointer ${
-                        tpl.unlocked ? "bg-[var(--pf-bg-3)]" : "bg-[var(--pf-bg-2)] opacity-70"
-                      }`}
-                    >
-                      <div
-                        className="rounded-lg bg-[var(--pf-bg-5)] overflow-hidden shrink-0"
-                        style={thumbBox(st.canvas_w, st.canvas_h, 56)}
-                      >
-                        {st.preview_url ? (
-                          <img
-                            src={`${API_BASE}${st.preview_url}`}
-                            alt=""
-                            className="w-full h-full object-cover"
-                          />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center text-[var(--pf-i-20)]">
-                            <FilmStrip className="w-4 h-4" />
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="pf-fs-14 font-bold text-[var(--pf-ink)] truncate">{st.name}</p>
-                        <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5">
-                          {st.canvas_w}×{st.canvas_h} 画布
-                          {st.frame_colors?.length
-                            ? `，相框 ${st.frame_colors.length} 色`
-                            : ""}
-                        </p>
-                      </div>
-                      {tpl.unlocked ? (
-                        <CaretRight className="w-4 h-4 text-[var(--pf-i-20)]" />
-                      ) : (
-                        <LockSimple className="w-4 h-4 text-[var(--pf-i-25)]" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-                {!allLocked && !tpl.unlocked && (
-                  <button
-                    type="button"
-                    onClick={() => invoke && void invoke("open_external", { url: tpl.buy_url })}
-                    className="h-11 rounded-xl bg-[var(--pf-primary-solid)] text-white pf-fs-14 font-bold active:scale-[0.99] transition-all cursor-pointer"
-                  >
-                    去爱发电解锁
-                  </button>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
+          </div>
+        </div>
       </div>
     );
   }
@@ -2546,7 +3378,7 @@ export default function VideoWatchface({
   if (screen === "edit") {
     return (
       <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
-        <div className="px-4 safe-top pb-1 shrink-0 z-20">
+        <div className="px-4 safe-top pb-1 shrink-0 z-20 bg-[var(--pf-page)]">
           <Header
             title={project ? "继续制作" : "制作视频表盘"}
             onBackPress={requestLeaveEdit}
@@ -2569,21 +3401,88 @@ export default function VideoWatchface({
 
         {/* 顶部固定：设备预览（往下滚不会把画布带走） */}
         <div className="shrink-0 px-4 pb-1 relative z-10 bg-[var(--pf-page)]">
-          <div
-            ref={cropRef}
-            className="relative mx-auto overflow-hidden bg-black shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
-            style={{
-              width: `${previewFrame.w}px`,
-              height: `${previewFrame.h}px`,
-              borderRadius: `${previewFrame.radius}px`,
-              touchAction: "none",
-            }}
+          <DialPreviewFrame
+            frameRef={cropRef}
+            screen={[cw, ch]}
+            width={previewFrame.w}
+            height={previewFrame.h}
+            className="mx-auto"
+            innerClassName={slotConfig && !bgReady ? "" : "bg-black"}
+            innerStyle={
+              slotConfig && !bgReady
+                ? {
+                    backgroundColor: "#e5e7eb",
+                    backgroundImage:
+                      "linear-gradient(45deg, #d1d5db 25%, transparent 25%), linear-gradient(-45deg, #d1d5db 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #d1d5db 75%), linear-gradient(-45deg, transparent 75%, #d1d5db 75%)",
+                    backgroundSize: "16px 16px",
+                    backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0",
+                  }
+                : undefined
+            }
+            style={{ touchAction: "none" }}
             onPointerDown={onCropDown}
             onPointerMove={onCropMove}
             onPointerUp={onCropUp}
             onPointerCancel={onCropUp}
           >
-            {videoUrl ? (
+            {slotConfig && (
+              <canvas
+                ref={bgCanvasRef}
+                width={cw}
+                height={ch}
+                className="absolute inset-0 w-full h-full pointer-events-none select-none"
+              />
+            )}
+            {slotConfig ? (
+              <div
+                className="absolute overflow-hidden"
+                style={{
+                  left: `${(slotConfig.window.x / cw) * 100}%`,
+                  top: `${(slotConfig.window.y / ch) * 100}%`,
+                  width: `${(slotConfig.window.w / cw) * 100}%`,
+                  height: `${(slotConfig.window.h / ch) * 100}%`,
+                  borderRadius: `${((slotConfig.window.radius || 0) / cw) * previewFrame.w}px`,
+                  transform: slotConfig.window.rot
+                    ? `rotate(${slotConfig.window.rot}deg)`
+                    : undefined,
+                  transformOrigin: "center center",
+                }}
+              >
+                {videoUrl ? (
+                  <video
+                    ref={videoRef}
+                    src={videoUrl}
+                    playsInline
+                    muted
+                    preload="auto"
+                    onLoadedMetadata={onLoadedMeta}
+                    onTimeUpdate={onTimeUpdate}
+                    onEnded={() => setPlaying(false)}
+                    onError={() =>
+                      toastRef.current("这个视频手机解不了，请换一段 MP4 视频", "error")
+                    }
+                    className="absolute max-w-none select-none"
+                    style={{
+                      left: `${videoBox.left}%`,
+                      top: `${videoBox.top}%`,
+                      width: `${videoBox.width}%`,
+                      height: `${videoBox.height}%`,
+                      objectFit: "fill",
+                    }}
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => fileRef.current?.click()}
+                    className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-1.5 text-white/80 bg-black/35 cursor-pointer"
+                  >
+                    <VideoCamera className="w-7 h-7" />
+                    <span className="pf-fs-13 font-bold">选择框内视频</span>
+                    <span className="pf-fs-10 font-medium text-white/60">5 秒以内</span>
+                  </button>
+                )}
+              </div>
+            ) : videoUrl ? (
               <video
                 ref={videoRef}
                 src={videoUrl}
@@ -2616,7 +3515,7 @@ export default function VideoWatchface({
                 <span className="pf-fs-11 font-medium text-white/40">5 秒以内，最大 80MB</span>
               </button>
             )}
-            {videoUrl && framePreviewUrl && (
+            {(videoUrl || slotConfig) && framePreviewUrl && (
               <img
                 src={framePreviewUrl}
                 alt=""
@@ -2624,7 +3523,7 @@ export default function VideoWatchface({
                 className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
               />
             )}
-            {videoUrl && overlayUrl && (
+            {(videoUrl || slotConfig) && overlayUrl && (
               <img
                 src={overlayUrl}
                 alt=""
@@ -2635,13 +3534,45 @@ export default function VideoWatchface({
                 className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
               />
             )}
-          </div>
+          </DialPreviewFrame>
 
-          <p className="mt-1.5 text-center pf-fs-11 font-medium text-[var(--pf-i-35)]">
-            {frameColors.length > 0
-              ? "拖动画面调整位置（相框外的画面会被遮住）"
-              : "拖动画面调整位置"}
-          </p>
+          {slotConfig ? (
+            <div className="mt-1.5 flex items-center justify-center gap-2">
+              <div className="inline-flex rounded-full bg-[var(--pf-bg-5)] p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setDragTarget("video")}
+                  className={`h-6 px-3 rounded-full pf-fs-11 font-semibold transition-all cursor-pointer ${
+                    dragTarget === "video"
+                      ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-sm"
+                      : "text-[var(--pf-i-50)]"
+                  }`}
+                >
+                  拖动视频
+                </button>
+                <button
+                  type="button"
+                  disabled={bgMode !== "photo" || !bgPhotoUrl}
+                  onClick={() => setDragTarget("bg")}
+                  className={`h-6 px-3 rounded-full pf-fs-11 font-semibold transition-all ${
+                    bgMode !== "photo" || !bgPhotoUrl
+                      ? "text-[var(--pf-i-25)]"
+                      : dragTarget === "bg"
+                      ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-sm cursor-pointer"
+                      : "text-[var(--pf-i-50)] cursor-pointer"
+                  }`}
+                >
+                  拖动底图
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="mt-1.5 text-center pf-fs-11 font-medium text-[var(--pf-i-35)]">
+              {frameColors.length > 0
+                ? "拖动画面调整位置（相框外的画面会被遮住）"
+                : "拖动画面调整位置"}
+            </p>
+          )}
         </div>
 
         <input
@@ -2650,6 +3581,13 @@ export default function VideoWatchface({
           accept="video/*"
           className="hidden"
           onChange={onPickFile}
+        />
+        <input
+          ref={bgFileRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={onPickBgFile}
         />
 
         <div className="flex-1 min-h-0 overflow-hidden relative">
@@ -2660,7 +3598,7 @@ export default function VideoWatchface({
             style={{ touchAction: "pan-y" }}
           >
             <div className="flex flex-col gap-3">
-              {videoUrl && (
+              {(slotConfig || videoUrl) && (
                 <button
                   type="button"
                   onClick={() => fileRef.current?.click()}
@@ -2670,15 +3608,240 @@ export default function VideoWatchface({
                     <div className="w-10 h-10 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] flex items-center justify-center shrink-0">
                       <VideoCamera className="w-5 h-5" />
                     </div>
-                    <div className="min-w-0 text-left">
-                      <p className="pf-fs-15 font-bold text-[var(--pf-ink)]">更换视频</p>
-                      <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
-                        {videoName || "已选视频"}
-                      </p>
-                    </div>
+                    {videoUrl ? (
+                      <div className="min-w-0 text-left">
+                        <p className="pf-fs-15 font-bold text-[var(--pf-ink)]">更换视频</p>
+                        <p className="pf-fs-12 font-medium text-[var(--pf-i-40)] mt-0.5 truncate">
+                          {videoName || "已选视频"}
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="pf-fs-15 font-bold text-[var(--pf-ink)]">选择框内视频</p>
+                    )}
                   </div>
                   <CaretRight className="w-5 h-5 text-[var(--pf-i-20)] shrink-0" />
                 </button>
+              )}
+
+              {slotConfig && (
+                <section
+                  ref={bgCardRef}
+                  className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] flex items-center gap-2">
+                      <ImageIcon className="w-4 h-4 text-[var(--pf-primary)]" />
+                      底部背景
+                    </h3>
+                    <span
+                      className={`px-2.5 py-0.5 rounded-full pf-fs-11 font-bold ${
+                        bgReady
+                          ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
+                          : "bg-[var(--pf-amber-10)] text-[var(--pf-amber)]"
+                      }`}
+                    >
+                      {bgReady ? (bgMode === "solid" ? "纯色已选" : "照片已选") : "必选"}
+                    </span>
+                  </div>
+
+                  <div className="flex rounded-full bg-[var(--pf-bg-5)] p-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBgMode("photo");
+                        if (bgPhotoUrl) setDragTarget("bg");
+                      }}
+                      className={`flex-1 h-9 rounded-full pf-fs-13 font-semibold transition-all cursor-pointer ${
+                        bgMode === "photo"
+                          ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-sm"
+                          : "text-[var(--pf-i-50)]"
+                      }`}
+                    >
+                      选照片
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBgMode("solid");
+                        setDragTarget("video");
+                      }}
+                      className={`flex-1 h-9 rounded-full pf-fs-13 font-semibold transition-all cursor-pointer ${
+                        bgMode === "solid"
+                          ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-sm"
+                          : "text-[var(--pf-i-50)]"
+                      }`}
+                    >
+                      纯色背景
+                    </button>
+                  </div>
+
+                  {bgMode === "photo" &&
+                    (bgPhotoUrl ? (
+                      <div className="flex flex-col gap-2">
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void extractVideoFirstFrameAsBg()}
+                            className={`flex-1 h-11 rounded-xl pf-fs-13 font-bold transition-all cursor-pointer ${
+                              videoReady
+                                ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)] active:scale-[0.98]"
+                                : "bg-[var(--pf-bg-4)] text-[var(--pf-i-30)]"
+                            }`}
+                          >
+                            提取视频首帧
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => bgFileRef.current?.click()}
+                            className="flex-1 h-11 rounded-xl bg-[var(--pf-bg-4)] hover:bg-[var(--pf-bg-8)] pf-fs-13 font-bold text-[var(--pf-ink)] active:scale-[0.98] transition-all cursor-pointer"
+                          >
+                            更换底图
+                          </button>
+                        </div>
+                        <GenSlider
+                          icon={<ArrowsOutSimple className="w-4 h-4" />}
+                          label="缩放"
+                          value={bgScale}
+                          ctl={{ default: 1, min: 0.2, max: 3, step: 0.01, adjustable: true }}
+                          text={`${bgScale.toFixed(2)}x`}
+                          onChange={setBgScale}
+                        />
+                        <GenSlider
+                          icon={<ArrowClockwise className="w-4 h-4" />}
+                          label="旋转"
+                          value={bgRot}
+                          ctl={{ default: 0, min: -180, max: 180, step: 1, adjustable: true }}
+                          text={`${bgRot > 0 ? "+" : ""}${Math.round(bgRot)}°`}
+                          onChange={setBgRot}
+                        />
+                        <GenSlider
+                          icon={<SunDim className="w-4 h-4" />}
+                          label="压暗"
+                          value={bgDarken}
+                          ctl={{
+                            default: slotConfig.bg_defaults?.darken ?? 0.3,
+                            min: 0,
+                            max: 1,
+                            step: 0.01,
+                            adjustable: true,
+                          }}
+                          text={`${Math.round(bgDarken * 100)}%`}
+                          onChange={setBgDarken}
+                        />
+                        <GenSlider
+                          icon={<Drop className="w-4 h-4" />}
+                          label="模糊"
+                          value={bgBlur}
+                          ctl={{
+                            default: slotConfig.bg_defaults?.blur ?? 8,
+                            min: 0,
+                            max: 40,
+                            step: 1,
+                            adjustable: true,
+                          }}
+                          text={`${Math.round(bgBlur)}`}
+                          onChange={setBgBlur}
+                        />
+                        <div className="flex items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => setBgFlipX((v) => !v)}
+                            className={`flex-1 h-9 rounded-xl pf-fs-12 font-semibold transition-all cursor-pointer ${
+                              bgFlipX
+                                ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
+                                : "bg-[var(--pf-bg-4)] text-[var(--pf-i-55)]"
+                            }`}
+                          >
+                            水平翻转
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setBgFlipY((v) => !v)}
+                            className={`flex-1 h-9 rounded-xl pf-fs-12 font-semibold transition-all cursor-pointer ${
+                              bgFlipY
+                                ? "bg-[var(--pf-primary-10)] text-[var(--pf-primary)]"
+                                : "bg-[var(--pf-bg-4)] text-[var(--pf-i-55)]"
+                            }`}
+                          >
+                            垂直翻转
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBgScale(1);
+                            setBgRot(0);
+                            setBgDx(0);
+                            setBgDy(0);
+                            setBgBlur(slotConfig.bg_defaults?.blur ?? 8);
+                            setBgDarken(slotConfig.bg_defaults?.darken ?? 0.3);
+                            setBgFlipX(false);
+                            setBgFlipY(false);
+                          }}
+                          className="w-full h-10 rounded-xl bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-[0.99] transition-all pf-fs-13 font-semibold text-[var(--pf-i-55)] cursor-pointer flex items-center justify-center gap-1.5"
+                        >
+                          <ArrowCounterClockwise className="w-4 h-4" />
+                          恢复默认
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2.5">
+                        <button
+                          type="button"
+                          onClick={() => void extractVideoFirstFrameAsBg()}
+                          className={`h-24 rounded-2xl flex flex-col items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                            videoReady
+                              ? "border border-[var(--pf-primary-25)] bg-[var(--pf-primary-10)] text-[var(--pf-primary)] active:scale-[0.98]"
+                              : "border border-[var(--pf-bd-10)] bg-[var(--pf-bg-3)] text-[var(--pf-i-30)]"
+                          }`}
+                        >
+                          <FilmStrip className="w-6 h-6" />
+                          <span className="pf-fs-13 font-semibold">提取视频首帧</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => bgFileRef.current?.click()}
+                          className="h-24 rounded-2xl border border-dashed border-[var(--pf-bd-15)] bg-[var(--pf-bg-2)] flex flex-col items-center justify-center gap-1.5 text-[var(--pf-i-45)] active:scale-[0.98] transition-transform cursor-pointer"
+                        >
+                          <Plus className="w-6 h-6" />
+                          <span className="pf-fs-13 font-semibold">选择照片</span>
+                        </button>
+                      </div>
+                    ))}
+
+                  {bgMode === "solid" && (
+                    <div className="flex flex-col gap-3">
+                      {slotConfig.solid_colors && slotConfig.solid_colors.length > 0 && (
+                        <div className="grid grid-cols-6 gap-x-3 gap-y-3 justify-items-center px-1 py-1">
+                          {slotConfig.solid_colors.map((hex) => {
+                            const active = bgFill.toLowerCase() === hex.toLowerCase();
+                            return (
+                              <button
+                                key={hex}
+                                type="button"
+                                title={hex}
+                                onClick={() => setBgFill(hex.toUpperCase())}
+                                className={`w-9 h-9 rounded-full transition-all cursor-pointer ${
+                                  active
+                                    ? "ring-2 ring-[var(--pf-primary)] ring-offset-2 ring-offset-[var(--pf-card)]"
+                                    : "ring-1 ring-[var(--pf-bd-10)]"
+                                }`}
+                                style={{ background: hex }}
+                              />
+                            );
+                          })}
+                        </div>
+                      )}
+                      <div className="rounded-2xl bg-[var(--pf-bg-3)] p-3">
+                        <GenCustomColorPanel
+                          value={bgFill}
+                          onChange={(hex) => setBgFill(hex)}
+                          placeholder="自定义颜色"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </section>
               )}
 
               <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3 overflow-hidden">
@@ -2831,7 +3994,7 @@ export default function VideoWatchface({
                 />
               </section>
 
-              {frameColors.length > 0 && (
+              {frameColors.length > 1 && (
                 <section className="bg-[var(--pf-card)] pf-card-border rounded-2xl p-4 flex flex-col gap-3">
                   <h3 className="pf-fs-16 font-bold text-[var(--pf-ink)] flex items-center gap-2">
                     <Palette className="w-4 h-4 text-[var(--pf-primary)]" />
@@ -2982,14 +4145,19 @@ export default function VideoWatchface({
           data-pf-bottombar
           className="px-4 pt-2 safe-bottom-panel bg-[var(--pf-card)] border-t border-[var(--pf-bd-5)] shrink-0 z-30"
         >
+          {slotConfig && videoReady && !bgReady && !busy && (
+            <p className="mb-1.5 text-center pf-fs-11 font-medium text-[var(--pf-amber)]">
+              请先在上方「底部背景」选择照片或纯色
+            </p>
+          )}
           <button
             type="button"
-            disabled={!videoReady || !projectId || fpsBad || durationBad || !!busy}
+            disabled={!videoReady || !projectId || fpsBad || durationBad || (!!slotConfig && !bgReady) || !!busy}
             onClick={triggerGenerate}
             onPointerDown={onGenDown}
             onPointerUp={onGenUp}
             className={`w-full h-12 rounded-2xl pf-fs-16 font-bold active:scale-[0.99] transition-all ${
-              !videoReady || !projectId || fpsBad || durationBad || busy
+              !videoReady || !projectId || fpsBad || durationBad || (!!slotConfig && !bgReady) || busy
                 ? "bg-[var(--pf-bg-6)] text-[var(--pf-i-25)]"
                 : "bg-[var(--pf-primary-solid)] text-white cursor-pointer"
             }`}
@@ -3065,10 +4233,11 @@ export default function VideoWatchface({
     const failed = st === "failed";
     return (
       <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none">
-        <div className="px-4 safe-top pb-1 shrink-0">
+        <div className="px-4 safe-top pb-1 shrink-0 z-20 bg-[var(--pf-page)]">
           <Header title="制作进度" onBackPress={backFromScreen} />
         </div>
-        <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-6 pb-[116px] flex flex-col items-center justify-center">
+        <div className="flex-1 min-h-0 overflow-hidden relative">
+          <div className="h-full overflow-y-auto no-scrollbar px-6 pb-[116px] flex flex-col items-center justify-center">
           <div className="w-full flex flex-col items-center">
             <div
               className={`w-16 h-16 rounded-full flex items-center justify-center ${
@@ -3107,6 +4276,10 @@ export default function VideoWatchface({
               <button
                 type="button"
                 onClick={() => {
+                  if (done) {
+                    openTemplates();
+                    return;
+                  }
                   const p = projects.find((x) => x.id === projectId) || project;
                   if (p) void editExisting(p, "replace");
                   else backFromScreen();
@@ -3117,6 +4290,7 @@ export default function VideoWatchface({
               </button>
             )}
           </div>
+        </div>
         </div>
         {busy && (
           <div className="fixed inset-0 z-[80] bg-[var(--pf-mask-soft)] flex items-center justify-center px-8">
@@ -3137,25 +4311,43 @@ export default function VideoWatchface({
   const jobActive = ["queued", "running"].includes(p?.job_status || "");
   const detailOverlaySrc =
     p?.preview_b64 && p?.style_id ? overlayByStyle[p.style_id] || "" : "";
+  const detailThumb = thumbSize(p?.canvas_w, p?.canvas_h, 112);
+  const detailScreen: [number, number] = [p?.canvas_w || cw, p?.canvas_h || ch];
+  const detailScale = previewImageScale(detailScreen);
   return (
-    <div
-      data-rb="y"
-      data-rb-always="1"
-      className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top pb-10 page-enter-anim select-none"
-    >
-      <Header title="作品详情" onBackPress={backFromScreen} />
+    <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
+      <div className="px-6 safe-top pb-1 shrink-0 z-20 bg-[var(--pf-page)]">
+        <Header title="作品详情" onBackPress={backFromScreen} />
+      </div>
 
+      <div className="flex-1 min-h-0 overflow-hidden relative">
+        <div
+          ref={projectScroll.ref}
+          onScroll={projectScroll.onScroll}
+          data-rb="y"
+          data-rb-always="1"
+          className="h-full overflow-y-auto no-scrollbar px-6 pt-1 pb-10"
+        >
       {!p ? (
         <Empty text={loadingProjects ? "正在读取作品…" : "作品不存在"} />
       ) : (
         <div className="flex flex-col gap-3">
           <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-4 flex gap-4">
-            <div
-              className="relative rounded-2xl bg-[var(--pf-bg-5)] overflow-hidden shrink-0"
-              style={thumbBox(p.canvas_w, p.canvas_h, 112)}
+            <DialPreviewFrame
+              screen={detailScreen}
+              width={detailThumb.w}
+              height={detailThumb.h}
+              className="shrink-0"
             >
               {previewSrc(p) ? (
-                <img src={previewSrc(p)} alt="" className="w-full h-full object-cover" />
+                <img
+                  src={previewSrc(p)}
+                  alt=""
+                  style={
+                    detailScale > 1 ? { transform: `scale(${detailScale})` } : undefined
+                  }
+                  className="w-full h-full object-cover"
+                />
               ) : (
                 <div className="w-full h-full flex items-center justify-center text-[var(--pf-i-20)]">
                   <FilmStrip className="w-6 h-6" />
@@ -3172,7 +4364,7 @@ export default function VideoWatchface({
                   className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none"
                 />
               )}
-            </div>
+            </DialPreviewFrame>
             <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
               <div className="min-w-0">
                 <h2 className="pf-fs-19 font-bold text-[var(--pf-ink)] leading-tight truncate">
@@ -3297,6 +4489,9 @@ export default function VideoWatchface({
           </div>
         </div>
       )}
+
+        </div>
+      </div>
 
       {confirmDelete && p && (
         <div className="fixed inset-0 z-[90] bg-[var(--pf-mask)] flex items-end justify-center px-4 pb-6">

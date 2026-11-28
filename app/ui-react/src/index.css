@@ -49,6 +49,20 @@ body {
 .pf-list-item {
   contain: layout style paint;
 }
+/* 集市卡片不能带 paint：预览屏面的柔和外投影会被裁掉 */
+.pf-market-item {
+  contain: layout style;
+}
+
+/* 集市表盘预览的屏框：只留一层柔和外投影，边缘线交给贴合 Squircle 路径的 SVG */
+.pf-market-dial {
+  box-shadow: var(--pf-dial-shadow);
+}
+
+/* 盖板玻璃：纯斜向反光（描边高光由 SVG 沿平滑圆角路径绘制） */
+.pf-market-dial-sheen {
+  background: var(--pf-dial-glare);
+}
 
 /* 隐藏滚动条 */
 .no-scrollbar::-webkit-scrollbar {

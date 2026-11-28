@@ -133,6 +133,11 @@ fn summary(dir: &Path, meta: &Value) -> Value {
         obj.insert("has_video".into(), json!(dir.join("video.enc").exists()));
         obj.insert("has_frames".into(), json!(dir.join("frames.enc").exists()));
         obj.insert("has_bin".into(), json!(dir.join("bin.enc").exists()));
+        obj.insert(
+            "has_bg_photo".into(),
+            json!(dir.join("bg_photo.enc").exists()),
+        );
+        obj.insert("has_bg".into(), json!(dir.join("bg.enc").exists()));
         // 成品 bin 里官方工具自带的预览图（首帧 + 表盘布局）：历史记录用它当真实缩略图
         if let Ok(png) = std::fs::read(dir.join("preview.png")) {
             obj.insert(
@@ -392,17 +397,22 @@ pub async fn video_project_get(
     project_id: String,
     kind: String,
 ) -> Result<Value, String> {
-    if kind != "video" {
+    if kind != "video" && kind != "bg_photo" {
         return Err("成品表盘与帧包不允许直接导出".into());
     }
     let dir = project_dir(&state, &project_id)?;
     let paid_dir = paid::paid_dir(&app_data(&state)?);
+    let file_name = if kind == "bg_photo" {
+        "bg_photo.enc"
+    } else {
+        "video.enc"
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        let raw = std::fs::read(dir.join("video.enc")).map_err(|_| "本地没有这份留档".to_string())?;
+        let raw = std::fs::read(dir.join(file_name)).map_err(|_| "本地没有这份留档".to_string())?;
         let plain = paid::open_archive(&paid_dir, &raw)
             .map_err(|e| format!("留档解密失败: {e:#}"))?;
         Ok(json!({
-            "kind": "video",
+            "kind": kind,
             "size": plain.len(),
             "data_b64": base64::engine::general_purpose::STANDARD.encode(plain),
         }))
@@ -445,6 +455,8 @@ pub async fn video_project_clear(
         let file = match k.as_str() {
             "video" => "video.enc",
             "frames" => "frames.enc",
+            "bg" => "bg.enc",
+            "bg_photo" => "bg_photo.enc",
             "bin" => {
                 clear_bin = true;
                 "bin.enc"
@@ -499,6 +511,121 @@ pub async fn video_project_update_meta(
     Ok(summary(&dir, &meta))
 }
 
+/// 保存/清除项目底图原始照片（加密存为 bg_photo.enc，供再次编辑恢复）。
+#[tauri::command]
+pub async fn video_bg_photo_put(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    photo_b64: Option<String>,
+) -> Result<Value, String> {
+    let dir = project_dir(&state, &project_id)?;
+    let meta = read_meta(&dir)?;
+    let dst = dir.join("bg_photo.enc");
+    if let Some(b) = photo_b64.filter(|s| !s.trim().is_empty()) {
+        let raw = b64d(&b)?;
+        if raw.len() > 16 * 1024 * 1024 {
+            return Err("底图照片过大，请换一张再试".into());
+        }
+        let dims = image::ImageReader::new(std::io::Cursor::new(&raw))
+            .with_guessed_format()
+            .map_err(|e| format!("照片读不出来: {e}"))?
+            .into_dimensions()
+            .map_err(|e| format!("照片解码失败: {e}"))?;
+        if dims.0 as u64 * dims.1 as u64 > 24_000_000 {
+            return Err("照片像素过大，请换一张再试".into());
+        }
+        let sealed = paid::seal_archive(&paid::paid_dir(&app_data(&state)?), &raw)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(&dst, sealed).map_err(|e| format!("保存底图照片失败: {e}"))?;
+    } else {
+        let _ = std::fs::remove_file(&dst);
+    }
+    Ok(summary(&dir, &meta))
+}
+
+/// 用壁纸生成器引擎把底图（照片 + 模糊/压暗/旋转/翻转，或纯色）合成为整画布 PNG 并加密落盘 `bg.enc`。
+#[tauri::command]
+pub async fn video_compose_bg(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    canvas_w: u32,
+    canvas_h: u32,
+    photo_b64: Option<String>,
+    params_json: String,
+) -> Result<Value, String> {
+    use crate::wallpaper_gen as wgen;
+    if canvas_w < 16 || canvas_h < 16 || canvas_w > 4096 || canvas_h > 4096 {
+        return Err(format!("画布尺寸异常: {canvas_w}x{canvas_h}"));
+    }
+    let dir = project_dir(&state, &project_id)?;
+    let params: wgen::GenParams =
+        serde_json::from_str(&params_json).map_err(|e| format!("底图参数损坏: {e}"))?;
+    let paid_dir = paid::paid_dir(&app_data(&state)?);
+
+    let decoded_photo: Option<(Vec<u8>, u32, u32)> = if params.fill.is_some() {
+        None
+    } else {
+        let raw = if let Some(b) = photo_b64.filter(|s| !s.trim().is_empty()) {
+            b64d(&b)?
+        } else {
+            let enc = std::fs::read(dir.join("bg_photo.enc"))
+                .map_err(|_| "请先选择底图照片或纯色".to_string())?;
+            paid::open_archive(&paid_dir, &enc)
+                .map_err(|e| format!("读取底图照片失败: {e:#}"))?
+        };
+        let dims = image::ImageReader::new(std::io::Cursor::new(&raw))
+            .with_guessed_format()
+            .map_err(|e| format!("底图照片读不出来: {e}"))?
+            .into_dimensions()
+            .map_err(|e| format!("底图照片解码失败: {e}"))?;
+        if dims.0 as u64 * dims.1 as u64 > 24_000_000 {
+            return Err("底图照片太大了，请换一张再试".into());
+        }
+        let im = image::load_from_memory(&raw).map_err(|e| format!("底图照片解码失败: {e}"))?;
+        let rgba = im.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        Some((rgba.into_raw(), w, h))
+    };
+
+    let cfg = wgen::GenConfig {
+        version: 1,
+        canvas: wgen::GenCanvas {
+            w: canvas_w,
+            h: canvas_h,
+            radius: 0.0,
+        },
+        photos: vec![wgen::GenPhoto {
+            id: "bg".into(),
+            label: "背景".into(),
+            base: "canvas".into(),
+            controls: wgen::GenControls::default(),
+        }],
+        frame: None,
+        solid_colors: vec![],
+    };
+
+    let png_b64 = tauri::async_runtime::spawn_blocking(move || {
+        let inputs = vec![wgen::PhotoInput {
+            rgba: decoded_photo
+                .as_ref()
+                .map(|(d, w, h)| (d.as_slice(), *w, *h)),
+            params,
+        }];
+        let (rgba, w, h) = wgen::compose(&cfg, &inputs, None)?;
+        crate::watchface_bin::encode_png_pub(&rgba, w, h)
+    })
+    .await
+    .map_err(|e| format!("底图合成任务失败: {e}"))?
+    .map_err(|e| format!("底图合成失败: {e:#}"))?;
+
+    let png_bytes = b64d(&png_b64)?;
+    let size = png_bytes.len();
+    let sealed = paid::seal_archive(&paid_dir, &png_bytes).map_err(|e| e.to_string())?;
+    paid::atomic_write(&dir.join("bg.enc"), &sealed)
+        .map_err(|e| format!("保存底图成品失败: {e}"))?;
+    Ok(json!({ "ok": true, "size": size }))
+}
+
 // ---------------------------------------------------------------- 抽帧临时目录
 
 #[tauri::command]
@@ -524,6 +651,14 @@ pub async fn video_frame_put(
     let meta = read_meta(&pdir)?;
     let cw = meta["canvas_w"].as_u64().unwrap_or(0) as u32;
     let ch = meta["canvas_h"].as_u64().unwrap_or(0) as u32;
+    let fw = meta["sprite_w"]
+        .as_u64()
+        .filter(|&v| v > 0)
+        .unwrap_or(cw as u64) as u32;
+    let fh = meta["sprite_h"]
+        .as_u64()
+        .filter(|&v| v > 0)
+        .unwrap_or(ch as u64) as u32;
     let paid_dir = paid::paid_dir(&app_data(&state)?);
     for (i, s) in frames_b64.iter().enumerate() {
         let idx = start_index + i;
@@ -535,8 +670,8 @@ pub async fn video_frame_put(
             return Err("单帧图片过大".into());
         }
         let (w, h) = png_size(&bytes).ok_or_else(|| "帧不是有效 PNG".to_string())?;
-        if cw > 0 && ch > 0 && (w != cw || h != ch) {
-            return Err(format!("帧尺寸 {w}×{h} 与模板 {cw}×{ch} 不一致"));
+        if fw > 0 && fh > 0 && (w != fw || h != fh) {
+            return Err(format!("帧尺寸 {w}×{h} 与模板 {fw}×{fh} 不一致"));
         }
         // 临时帧也不落明文：每帧单独用设备密钥加密，提交时在内存里解开再打 zip。
         let sealed = paid::seal_archive(&paid_dir, &bytes).map_err(|e| e.to_string())?;
@@ -568,6 +703,7 @@ pub async fn video_job_create(
     fps: f64,
     mode: String,
     frame_color: Option<String>,
+    dual_slot: Option<bool>,
 ) -> Result<Value, String> {
     if count == 0 || count > MAX_FRAMES {
         return Err(format!("帧数需在 1~{MAX_FRAMES}"));
@@ -665,6 +801,24 @@ pub async fn video_job_create(
     }
     if let Some(c) = &frame_color {
         form = form.text("frame_color", c.clone());
+    }
+    let is_dual = dual_slot.unwrap_or_else(|| meta["has_slot"].as_bool().unwrap_or(false));
+    if is_dual {
+        let enc_bg = std::fs::read(pdir.join("bg.enc"))
+            .map_err(|_| "还没有合成底层背景，请先在编辑页选择背景".to_string())?;
+        let bg_bytes = paid::open_archive(&paid_dir, &enc_bg)
+            .map_err(|e| format!("读取底层背景失败: {e:#}"))?;
+        let (bw, bh) = png_size(&bg_bytes).ok_or_else(|| "底图不是有效 PNG".to_string())?;
+        if cw > 0 && ch > 0 && (bw != cw || bh != ch) {
+            return Err(format!("底图尺寸 {bw}×{bh} 与画布 {cw}×{ch} 不一致"));
+        }
+        form = form.part(
+            "bg_image",
+            reqwest::multipart::Part::bytes(bg_bytes)
+                .file_name("bg.png")
+                .mime_str("image/png")
+                .map_err(|e| e.to_string())?,
+        );
     }
     let form = form.part(
             "file",

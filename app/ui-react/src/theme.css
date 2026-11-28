@@ -105,6 +105,15 @@
   --pf-warn-weak: #fff7e8;
   --pf-warn-ink: #8a5a12;
 
+  /* 集市表盘预览：柔和外投影 / 玻璃外缘 / 盖板高光 / 玻璃反光 */
+  --pf-dial-shadow: 0 6px 16px rgba(15, 23, 42, 0.09), 0 1px 3px rgba(15, 23, 42, 0.05);
+  --pf-dial-rim: rgba(15, 23, 42, 0.09);
+  --pf-dial-sheen-top: rgba(255, 255, 255, 0.52);
+  --pf-dial-sheen-mid: rgba(255, 255, 255, 0.16);
+  --pf-dial-sheen-bot: rgba(255, 255, 255, 0.04);
+  --pf-dial-glare: linear-gradient(155deg, rgba(255, 255, 255, 0.14) 0%, rgba(255, 255, 255, 0.035) 34%, rgba(255, 255, 255, 0) 56%);
+  --pf-popover-shadow: 0 10px 28px rgba(15, 23, 42, 0.10), 0 2px 6px rgba(15, 23, 42, 0.05);
+
   /* 胶囊 / Toast / 媒体黑底 / 遮罩 / 反相面 */
   --pf-toast: #0c0d0e;
   --pf-media: #1c1c1e;
@@ -207,6 +216,14 @@
   --pf-amber-15: rgba(232, 180, 92, 0.2);
   --pf-warn-weak: #2a2316;
   --pf-warn-ink: #e8c07a;
+
+  --pf-dial-shadow: 0 8px 20px rgba(0, 0, 0, 0.44), 0 1px 4px rgba(0, 0, 0, 0.30);
+  --pf-dial-rim: rgba(255, 255, 255, 0.16);
+  --pf-dial-sheen-top: rgba(255, 255, 255, 0.34);
+  --pf-dial-sheen-mid: rgba(255, 255, 255, 0.11);
+  --pf-dial-sheen-bot: rgba(255, 255, 255, 0.03);
+  --pf-dial-glare: linear-gradient(155deg, rgba(255, 255, 255, 0.10) 0%, rgba(255, 255, 255, 0.024) 34%, rgba(255, 255, 255, 0) 56%);
+  --pf-popover-shadow: 0 12px 32px rgba(0, 0, 0, 0.52), 0 2px 8px rgba(0, 0, 0, 0.32);
 
   --pf-toast: #2a2f36;
   --pf-media: #1c1c1e;

@@ -136,3 +136,141 @@ export function GenSlider(props: {
     </div>
   );
 }
+
+/** #RRGGBB → 色相（0~360）+ 深浅（0~1，用 HSL 亮度近似；滑杆位置只是起点，颜色以预览为准） */
+export function hexToHueShade(hex: string): { hue: number; shade: number } {
+  const h = hex.replace("#", "");
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return { hue: 0, shade: 0.5 };
+  const r = parseInt(h.slice(0, 2), 16) / 255;
+  const g = parseInt(h.slice(2, 4), 16) / 255;
+  const b = parseInt(h.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  const d = max - min;
+  let hue = 0;
+  if (d > 1e-6) {
+    if (max === r) hue = ((g - b) / d + 6) % 6;
+    else if (max === g) hue = (b - r) / d + 2;
+    else hue = (r - g) / d + 4;
+    hue *= 60;
+  }
+  return { hue, shade: l };
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = (((h % 360) + 360) % 360) / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (hp < 1) [r, g, b] = [c, x, 0];
+  else if (hp < 2) [r, g, b] = [x, c, 0];
+  else if (hp < 3) [r, g, b] = [0, c, x];
+  else if (hp < 4) [r, g, b] = [0, x, c];
+  else if (hp < 5) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  const m = l - c / 2;
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+}
+
+/**
+ * 色相 + 深浅 → #RRGGBB。
+ * 深浅 0 = 黑，0.5 = 当前色相的标准色，1 = 白；中间线性过渡。
+ */
+export function hueShadeToHex(hue: number, shade: number): string {
+  const [r, g, b] = hslToRgb(hue, 1, 0.5);
+  const t = Math.max(0, Math.min(1, shade));
+  let rr: number;
+  let gg: number;
+  let bb: number;
+  if (t <= 0.5) {
+    const k = t * 2;
+    rr = r * k;
+    gg = g * k;
+    bb = b * k;
+  } else {
+    const k = (t - 0.5) * 2;
+    rr = r + (255 - r) * k;
+    gg = g + (255 - g) * k;
+    bb = b + (255 - b) * k;
+  }
+  const to2 = (v: number) => Math.round(v).toString(16).padStart(2, "0");
+  return `#${to2(rr)}${to2(gg)}${to2(bb)}`.toUpperCase();
+}
+
+/**
+ * 纯色自定义面板：只有两根滑杆（颜色 / 深浅），不做二维色板、HEX、RGB。
+ * 支持空值状态（placeholder）：未选颜色前展示提示框，避免误以为已默认选中。
+ */
+export function GenCustomColorPanel(props: {
+  value: string;
+  onChange: (hex: string) => void;
+  placeholder?: string;
+}) {
+  const { value, onChange, placeholder } = props;
+  const hasVal = /^#[0-9a-fA-F]{6}$/.test(value);
+  const init = useRef(hexToHueShade(hasVal ? value : "#3B82F6"));
+  const [hue, setHue] = useState(init.current.hue);
+  const [shade, setShade] = useState(init.current.shade);
+
+  const setHueAndKeepVisible = (v: number) => {
+    const nextShade = shade <= 0.02 || shade >= 0.98 ? 0.5 : shade;
+    setHue(v);
+    setShade(nextShade);
+    onChange(hueShadeToHex(v, nextShade));
+  };
+  const setShadeAndApply = (v: number) => {
+    setShade(v);
+    onChange(hueShadeToHex(hue, v));
+  };
+
+  const hueTrack =
+    "linear-gradient(to right, #ff0000 0%, #ffff00 16.66%, #00ff00 33.33%, #00ffff 50%, #0000ff 66.66%, #ff00ff 83.33%, #ff0000 100%)";
+  const shadeTrack = `linear-gradient(to right, #000000, hsl(${Math.round(hue)}, 100%, 50%), #ffffff)`;
+
+  return (
+    <div>
+      {hasVal ? (
+        <div className="h-12 rounded-2xl border border-[var(--pf-bd-5)] mb-3" style={{ background: value }} />
+      ) : (
+        <div className="h-12 rounded-2xl border border-dashed border-[var(--pf-bd-15)] mb-3 flex items-center justify-center pf-fs-12 font-medium text-[var(--pf-i-40)]">
+          {placeholder || "拖动下方滑杆选择颜色"}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2.5 h-10">
+        <span className="pf-fs-12 font-medium text-[var(--pf-i-45)] w-[52px] shrink-0 whitespace-nowrap">
+          颜色
+        </span>
+        <DragSlider
+          value={hue}
+          min={0}
+          max={360}
+          step={1}
+          onChange={setHueAndKeepVisible}
+          trackStyle={{ background: hueTrack }}
+        />
+      </div>
+
+      <div className="flex items-center gap-2.5 h-10">
+        <span className="pf-fs-12 font-medium text-[var(--pf-i-45)] w-[52px] shrink-0 whitespace-nowrap">
+          深浅
+        </span>
+        <DragSlider
+          value={Math.round(shade * 100)}
+          min={0}
+          max={100}
+          step={1}
+          onChange={v => setShadeAndApply(v / 100)}
+          trackStyle={{ background: shadeTrack }}
+        />
+      </div>
+      <div className="flex justify-between pf-fs-10 font-medium text-[var(--pf-i-35)] px-1 -mt-1">
+        <span className="w-[52px]">黑</span>
+        <span>白</span>
+      </div>
+    </div>
+  );
+}

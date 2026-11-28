@@ -14,6 +14,7 @@ import wp09 from "./assets/wallpapers/wp-09.svg";
 import wp10 from "./assets/wallpapers/wp-10.svg";
 import wp11 from "./assets/wallpapers/wp-11.svg";
 import wp12 from "./assets/wallpapers/wp-12.svg";
+import DialPreviewFrame, { previewImageScale } from "./DialPreviewFrame";
 import {
   invoke,
   listen,
@@ -65,8 +66,9 @@ import {
   type MarketBanner,
   type MarketList
 } from "./tauri";
-import { DragSlider, GenSlider } from "./Slider";
+import { DragSlider, GenCustomColorPanel, GenSlider } from "./Slider";
 import VideoWatchface from "./VideoWatchface";
+import { readScroll, resetScroll, useScrollMemory } from "./useScrollMemory";
 import {
   applyTheme,
   readThemeMode,
@@ -87,40 +89,76 @@ import {
   Info, ShieldCheck, FileText, Scroll, Code, DotsThree, ArrowClockwise,
   ArrowCounterClockwise, MagnifyingGlassPlus, MagnifyingGlass, SunDim, Palette, Drop, IconContext,
   LockSimple, VideoCamera, Ticket,
-  User, Storefront, Copy
+  User, Storefront, Copy, CopySimple
 } from "@phosphor-icons/react";
 
-/**
- * 集市封面的裁剪圆角：**按设备的真实物理圆角**裁，而不是一刀切某个比例。
- *
- * 与 Rust 的 `screen_info_for_size` 同一套数值（那是权威来源）：
- *   212×520 → 104（两端半圆）、192×490 → 280（半圆）、336×480 → 45、432×514 → 104。
- * 半径按**画布像素**算再等比缩到预览尺寸，所以同一张图在列表和详情页圆角一致。
- *
- * 为什么不用固定比例：作者导出时烤的圆角深浅不一（实测有 13.5% / 24.3% / 47% 三档），
- * 固定比例要么盖不住、要么把作者做好的大圆角裁成小角。按物理圆角裁才是设备真实的形状。
- */
-function previewCornerRadius(screen: [number, number], displayW: number): number {
-  const [w, h] = screen;
-  const r = (() => {
-    if (w === h) return w / 2;
-    switch (`${w}x${h}`) {
-      case "212x520": return 104;
-      case "192x490": return 280;
-      case "336x480": return 45;
-      case "432x514": return 104;
-      case "390x450": return 90;
-      case "320x385": return 82;
-      case "410x502": return 116;
-      case "280x456": return 36;
-      default: return Math.round(Math.min(w, h) * 0.13);
+/** 已购列表的设备型号简写：避免长设备名或双设备并排时挤占空间（如 小米手环 9 Pro / 10 Pro → Mi9P/Mi10P） */
+function formatShortDeviceLabel(raw: string): string {
+  const parts = raw
+    .split(/[/、|｜,+]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return raw;
+
+  let lastSeries: "Mi" | "RW" | "MiS" | "vW" | "" = "";
+
+  const shortenOne = (name: string): string => {
+    const s = name.replace(/\s+/g, " ").trim();
+    let m: RegExpMatchArray | null;
+    if ((m = s.match(/(?:小米|Xiaomi)?\s*(?:智能)?(?:手环|Smart\s*Band|Band)\s*(\d+)\s*Pro/i))) {
+      lastSeries = "Mi";
+      return `Mi${m[1]}P`;
     }
-  })();
-  // 半径不能超过宽的一半；再按「画布宽 → 预览宽」等比缩放
-  return Math.max(1, Math.round(Math.min(r, w / 2) * (displayW / w)));
+    if ((m = s.match(/(?:小米|Xiaomi)?\s*(?:智能)?(?:手环|Smart\s*Band|Band)\s*(\d+)/i))) {
+      lastSeries = "Mi";
+      return `Mi${m[1]}`;
+    }
+    if ((m = s.match(/(?:红米|REDMI|Redmi)\s*(?:手表|Watch)\s*(\d+)\s*(?:青春版|Lite)/i))) {
+      lastSeries = "RW";
+      return `RW${m[1]}L`;
+    }
+    if ((m = s.match(/(?:红米|REDMI|Redmi)\s*(?:手表|Watch)\s*(\d+)/i))) {
+      lastSeries = "RW";
+      return `RW${m[1]}`;
+    }
+    if ((m = s.match(/(?:小米|Xiaomi)\s*(?:手表|Watch)\s*S(\d+)/i))) {
+      lastSeries = "MiS";
+      return `MiS${m[1]}`;
+    }
+    if (/iQOO\s*WATCH\s*GT\s*2/i.test(s)) return "iQGT2";
+    if (/iQOO\s*WATCH\s*GT/i.test(s)) return "iQGT";
+    if (/iQOO\s*WATCH/i.test(s)) return "iQW";
+    if (/vivo\s*WATCH\s*GT\s*2/i.test(s)) return "vGT2";
+    if (/vivo\s*WATCH\s*GT/i.test(s)) return "vGT";
+    if ((m = s.match(/vivo\s*WATCH\s*(\d+)/i))) {
+      lastSeries = "vW";
+      return `vW${m[1]}`;
+    }
+    // 组合名称后半段省略系列名时的兜底（如 "小米手环 9 Pro / 10 Pro"、"红米手表 5 / 6"）
+    if ((m = s.match(/^(\d+)\s*Pro$/i))) {
+      const prefix = lastSeries || "Mi";
+      return `${prefix}${m[1]}P`;
+    }
+    if ((m = s.match(/^(\d+)\s*(?:青春版|Lite)$/i))) {
+      const prefix = lastSeries || "RW";
+      return `${prefix}${m[1]}L`;
+    }
+    if ((m = s.match(/^(\d+)$/)) && lastSeries) {
+      return `${lastSeries}${m[1]}`;
+    }
+    if ((m = s.match(/^S(\d+)$/i))) {
+      lastSeries = "MiS";
+      return `MiS${m[1]}`;
+    }
+    return s;
+  };
+
+  return Array.from(new Set(parts.map(shortenOne))).join("/");
 }
 
-/** 画一条圆角矩形路径（预览画布用；`roundRect` 是 Chrome 99+，旧内核走这条兜底） */
+/**
+ * 画一条圆角矩形路径（预览画布用；`roundRect` 是 Chrome 99+，旧内核走这条兜底）
+ */
 function roundRectPath(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -162,71 +200,6 @@ function sameHexColor(a: string, b: string) {
   return a.toLowerCase() === b.toLowerCase();
 }
 
-/** #RRGGBB → 色相（0~360）+ 深浅（0~1，用 HSL 亮度近似；滑杆位置只是起点，颜色以预览为准） */
-function hexToHueShade(hex: string): { hue: number; shade: number } {
-  const h = hex.replace("#", "");
-  if (!/^[0-9a-fA-F]{6}$/.test(h)) return { hue: 0, shade: 1 };
-  const r = parseInt(h.slice(0, 2), 16) / 255;
-  const g = parseInt(h.slice(2, 4), 16) / 255;
-  const b = parseInt(h.slice(4, 6), 16) / 255;
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const l = (max + min) / 2;
-  const d = max - min;
-  let hue = 0;
-  if (d > 1e-6) {
-    if (max === r) hue = ((g - b) / d + 6) % 6;
-    else if (max === g) hue = (b - r) / d + 2;
-    else hue = (r - g) / d + 4;
-    hue *= 60;
-  }
-  return { hue, shade: l };
-}
-
-/** HSL → RGB（0~255） */
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const hp = (((h % 360) + 360) % 360) / 60;
-  const x = c * (1 - Math.abs((hp % 2) - 1));
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  if (hp < 1) [r, g, b] = [c, x, 0];
-  else if (hp < 2) [r, g, b] = [x, c, 0];
-  else if (hp < 3) [r, g, b] = [0, c, x];
-  else if (hp < 4) [r, g, b] = [0, x, c];
-  else if (hp < 5) [r, g, b] = [x, 0, c];
-  else [r, g, b] = [c, 0, x];
-  const m = l - c / 2;
-  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
-}
-
-/**
- * 色相 + 深浅 → #RRGGBB。
- * 深浅 0 = 黑，0.5 = 当前色相的标准色，1 = 白；中间线性过渡。
- * 比二维色板少两个维度，但覆盖纯黑、纯白和常用深浅色，用户只需要理解两个词。
- */
-function hueShadeToHex(hue: number, shade: number): string {
-  const [r, g, b] = hslToRgb(hue, 1, 0.5);
-  const t = Math.max(0, Math.min(1, shade));
-  let rr: number;
-  let gg: number;
-  let bb: number;
-  if (t <= 0.5) {
-    const k = t * 2;
-    rr = r * k;
-    gg = g * k;
-    bb = b * k;
-  } else {
-    const k = (t - 0.5) * 2;
-    rr = r + (255 - r) * k;
-    gg = g + (255 - g) * k;
-    bb = b + (255 - b) * k;
-  }
-  const to2 = (v: number) => Math.round(v).toString(16).padStart(2, "0");
-  return `#${to2(rr)}${to2(gg)}${to2(bb)}`.toUpperCase();
-}
-
 /** 层卡片/浮层上的短标签：背景照片 → 背景，相框内照片 → 相框内 */
 function genSlotLabel(photo: GenPhoto, count: number) {
   const s = (photo.label || "").replace(/照片|图片/g, "").trim();
@@ -265,76 +238,6 @@ function GenSwatchGrid(props: {
             style={{ background: it.color }}
           />
         ))}
-      </div>
-    </div>
-  );
-}
-
-/**
- * 纯色自定义面板：只有两根滑杆（颜色 / 深浅），不做二维色板、HEX、RGB。
- * **内联**在纯色分区里展开，不再是一层浮层，所以没有自己的标题栏和返回/完成按钮
- * （开合由上面那颗「自定义颜色 / 收起自定义颜色」按钮负责）。
- */
-function GenCustomColorPanel(props: {
-  value: string;
-  onChange: (hex: string) => void;
-}) {
-  const { value, onChange } = props;
-  // 只在打开时从当前颜色估一个起点；之后以滑杆为准（value 会被父层实时更新）
-  const init = useRef(hexToHueShade(value));
-  const [hue, setHue] = useState(init.current.hue);
-  const [shade, setShade] = useState(init.current.shade);
-
-  const setHueAndKeepVisible = (v: number) => {
-    // 起点是纯黑/纯白时，单拖色相看不到变化 → 自动回到标准色，避免「滑了没反应」
-    const nextShade = shade <= 0.02 || shade >= 0.98 ? 0.5 : shade;
-    setHue(v);
-    setShade(nextShade);
-    onChange(hueShadeToHex(v, nextShade));
-  };
-  const setShadeAndApply = (v: number) => {
-    setShade(v);
-    onChange(hueShadeToHex(hue, v));
-  };
-
-  const hueTrack =
-    "linear-gradient(to right, #ff0000 0%, #ffff00 16.66%, #00ff00 33.33%, #00ffff 50%, #0000ff 66.66%, #ff00ff 83.33%, #ff0000 100%)";
-  const shadeTrack = `linear-gradient(to right, #000000, hsl(${Math.round(hue)}, 100%, 50%), #ffffff)`;
-
-  return (
-    <div>
-      <div className="h-12 rounded-2xl border border-[var(--pf-bd-5)] mb-3" style={{ background: value }} />
-
-      <div className="flex items-center gap-2.5 h-10">
-        <span className="pf-fs-12 font-medium text-[var(--pf-i-45)] w-[52px] shrink-0 whitespace-nowrap">
-          颜色
-        </span>
-        <DragSlider
-          value={hue}
-          min={0}
-          max={360}
-          step={1}
-          onChange={setHueAndKeepVisible}
-          trackStyle={{ background: hueTrack }}
-        />
-      </div>
-
-      <div className="flex items-center gap-2.5 h-10">
-        <span className="pf-fs-12 font-medium text-[var(--pf-i-45)] w-[52px] shrink-0 whitespace-nowrap">
-          深浅
-        </span>
-        <DragSlider
-          value={Math.round(shade * 100)}
-          min={0}
-          max={100}
-          step={1}
-          onChange={v => setShadeAndApply(v / 100)}
-          trackStyle={{ background: shadeTrack }}
-        />
-      </div>
-      <div className="flex justify-between pf-fs-10 font-medium text-[var(--pf-i-35)] px-1 -mt-1">
-        <span className="w-[52px]">黑</span>
-        <span>白</span>
       </div>
     </div>
   );
@@ -990,7 +893,6 @@ function marketTagOptions(faces: MarketFace[]): string[] {
     for (const t of f.tags || []) counts.set(t, (counts.get(t) || 0) + 1);
   }
   // 前三颗固定：付费/免费是资源性质，照片表盘按用户要求紧跟其后
-  //（菜单是三列网格：第一排 全部/付费/免费，照片表盘正好落在第二排第一个）
   const head = ["付费", "免费", "照片表盘"];
   const rank = (t: string) => {
     const i = head.indexOf(t);
@@ -1103,15 +1005,16 @@ function marketGroup(f: MarketFace): number {
 }
 
 /**
- * 按标签 + 搜索词筛（null/空 = 全部），再按「自家付费 → 自家免费 → 第三方免费」分组，
+ * 按标签 + 搜索词筛（空选 = 全部），再按「自家付费 → 自家免费 → 第三方免费」分组，
  * 组内按当前窗口的种子洗牌。
+ * 多选标签按交集（AND）过滤：表盘必须同时包含所有已选标签。
  * 筛选在本地做，集市条目只有几十个。
  * 搜索匹配表盘名与标签（关键字），不分大小写。
  */
-function filterMarketFaces(faces: MarketFace[], tag: string | null, query = ""): MarketFace[] {
+function filterMarketFaces(faces: MarketFace[], selectedTags: string[], query = ""): MarketFace[] {
   const q = query.trim().toLowerCase();
   const hit = faces.filter(f => {
-    if (tag && !(f.tags || []).includes(tag)) return false;
+    if (selectedTags.length > 0 && !selectedTags.every(t => (f.tags || []).includes(t))) return false;
     if (!q) return true;
     const hay = [f.name || "", ...(f.tags || [])].join(" ").toLowerCase();
     return hay.includes(q);
@@ -1509,10 +1412,10 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
       );
       if (initMax <= 2) return;
 
-      // 松手瞬间已贴死边界且余速可观：直接转化为边界溢出弹性回弹
-      if ((flingDir > 0 && initPos <= 1) || (flingDir < 0 && initPos >= initMax - 1)) {
+      // 松手瞬间已贴死边界且余速足够大：直接转化为边界溢出弹性回弹
+      if ((flingDir > 0 && initPos <= 0.5) || (flingDir < 0 && initPos >= initMax - 1.5)) {
         const impactVel = Math.min(1800, Math.abs(fingerVel) * 0.45);
-        if (impactVel >= 200) {
+        if (Math.abs(fingerVel) > 450 && impactVel >= 200) {
           startSpring(el, 0, flingDir * impactVel, ax);
         }
         return;
@@ -1532,8 +1435,11 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
         if (flingCleanup === finish) flingCleanup = null;
       };
 
-      const checkEdge = (cur: number, realMax: number, now: number) => {
-        if ((flingDir > 0 && cur <= 1) || (flingDir < 0 && realMax > 2 && cur >= realMax - 1)) {
+      const checkEdge = (cur: number, now: number) => {
+        if (
+          sampleCount >= 1 &&
+          ((flingDir > 0 && cur <= 0.5) || (flingDir < 0 && initMax > 2 && cur >= initMax - 1.5))
+        ) {
           const sinceSample = Math.max(0, (now - prevTs) / 1000);
           const sinceStart = Math.max(0, (now - startTs) / 1000);
           const rawRemain =
@@ -1562,13 +1468,8 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
         }
         const now = performance.now();
         const cur = ax === "y" ? el.scrollTop : el.scrollLeft;
-        const realMax = Math.max(
-          0,
-          ax === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth
-        );
         const dt = (now - prevTs) / 1000;
         const moved = cur - prevPos;
-        // flingDir > 0 (手指向下) => scrollTop 减小 (moved < 0)；反之亦然
         if (dt > 0.004 && moved * flingDir < 0) {
           const inst = Math.min(6000, Math.abs(moved) / dt);
           scrollSpeed = sampleCount === 0 ? inst : scrollSpeed * 0.4 + inst * 0.6;
@@ -1576,23 +1477,18 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
           prevPos = cur;
           prevTs = now;
         }
-        if (checkEdge(cur, realMax, now)) return;
+        if (checkEdge(cur, now)) return;
         resetIdle();
       };
 
       flingCleanup = finish;
       el.addEventListener("scroll", onFlingScroll, { passive: true });
       resetIdle();
-      // 下一帧兜底检查：防止离边仅剩数像素、首帧直接滑到头却尚未派发 scroll 时漏触发
       rafCheck = requestAnimationFrame(() => {
         rafCheck = 0;
         if (flingCleanup !== finish || !el.isConnected) return;
         const cur = ax === "y" ? el.scrollTop : el.scrollLeft;
-        const realMax = Math.max(
-          0,
-          ax === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth
-        );
-        checkEdge(cur, realMax, performance.now());
+        checkEdge(cur, performance.now());
       });
     };
 
@@ -1619,7 +1515,6 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
         return;
       }
 
-      // 若命中的滚动容器仍在回弹中（>= 4px），立即停止弹簧并用反函数无缝接手
       let box: HTMLElement | null = target;
       let resuming: { el: HTMLElement; spring: SpringState } | null = null;
       let rbContainer: HTMLElement | null = null;
@@ -1629,7 +1524,16 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
           const sp = activeSprings.get(box);
           if (sp) {
             const curSpringPos = evalSpringPos(sp);
-            if (Math.abs(curSpringPos) < 4) {
+            const spPos = sp.axis === "y" ? box.scrollTop : box.scrollLeft;
+            const spMax = Math.max(
+              0,
+              sp.axis === "y" ? box.scrollHeight - box.clientHeight : box.scrollWidth - box.clientWidth
+            );
+            const atSpringEdge =
+              spMax <= 2 ||
+              (curSpringPos > 0 && spPos <= 1) ||
+              (curSpringPos < 0 && spPos >= spMax - 1.5);
+            if (Math.abs(curSpringPos) < 4 || !atSpringEdge) {
               stopSpring(box);
               box.style.transition = "";
               box.style.transform = "";
@@ -1710,7 +1614,11 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
         cachedRange = rangeOf(el, axis);
         prevScrollPos = axis === "y" ? el.scrollTop : el.scrollLeft;
         prevCur = axis === "y" ? startY : startX;
-        if (sp && Math.abs(sp.pos) >= 4) {
+        const atSpringEdge =
+          !cachedScrollable ||
+          (sp && sp.pos > 0 && prevScrollPos <= 1) ||
+          (sp && sp.pos < 0 && prevScrollPos >= cachedMax - 1.5);
+        if (sp && Math.abs(sp.pos) >= 4 && atSpringEdge) {
           currentPos = sp.pos;
           rawDrag = miuixTouchDistance(sp.pos, cachedRange);
           overscrollSign = sp.pos >= 0 ? 1 : -1;
@@ -1742,8 +1650,11 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
           overscrollSign = step >= 0 ? 1 : -1;
           rawDrag = step;
         } else {
-          const atTop = pos <= 1;
-          const atBottom = pos >= cachedMax - 1;
+          const atTop = pos <= 0.5 && prevScrollPos <= 0.5;
+          const atBottom =
+            pos >= cachedMax - 1.5 &&
+            prevScrollPos >= cachedMax - 1.5 &&
+            Math.abs(pos - prevScrollPos) < 0.5;
           if (atTop && step > 0) {
             const consumed = Math.max(0, prevScrollPos - pos);
             const excess = step - consumed;
@@ -1757,16 +1668,6 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
             overscrollSign = 1;
             rawDrag = baseRaw + excess;
           } else if (atBottom && step < 0) {
-            const realMax = Math.max(
-              0,
-              axis === "y" ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth
-            );
-            cachedMax = realMax;
-            cachedScrollable = cachedMax > 2;
-            if (pos < cachedMax - 1) {
-              prevScrollPos = pos;
-              return;
-            }
             const consumed = Math.max(0, pos - prevScrollPos);
             const excess = step + consumed;
             if (excess >= 0) {
@@ -1791,12 +1692,11 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
         if (cachedScrollable && step * overscrollSign < 0) {
           const leftEdge = overscrollSign > 0 ? pos > 2 : pos < cachedMax - 2;
           if (leftEdge) {
-            if (Math.abs(currentPos) > 1) {
-              startSpring(el, currentPos, 0, axis);
-            } else {
-              el.style.transform = "";
-              if (el.dataset.rbTab === "1" && axis === "y") notifyTabOffset(0);
-            }
+            stopSpring(el);
+            el.style.transition =
+              Math.abs(currentPos) > 1 ? "transform 140ms cubic-bezier(0.22, 1, 0.36, 1)" : "";
+            el.style.transform = "";
+            if (el.dataset.rbTab === "1" && axis === "y") notifyTabOffset(0);
             rawDrag = 0;
             currentPos = 0;
             releaseVel = 0;
@@ -1809,6 +1709,7 @@ function useRubberBand(onTabOverscroll: (offsetY: number) => void) {
           rawDrag = 0;
           currentPos = 0;
           releaseVel = 0;
+          el.style.transition = "";
           el.style.transform = "";
           if (el.dataset.rbTab === "1" && axis === "y") notifyTabOffset(0);
           prevScrollPos = pos;
@@ -2351,6 +2252,20 @@ export default function App() {
     } else if (raw.includes("NEED_INSTALL_PERMISSION")) {
       code = "update_permission";
       msg = "请先允许盘坊安装应用，然后回来再点一次更新";
+    } else if (raw.includes("APK_SIGNATURE_MISMATCH") || raw.includes("签名或包名校验不通过")) {
+      // 手机上的盘坊不是官方安装包（老密钥、测试包或改版）→ 系统不允许覆盖安装。
+      // 重试多少遍都没用，只能卸载重装，所以别让它落到「操作失败，请重试」。
+      code = "update_signature";
+      msg = "这个更新包装不上：手机上的盘坊和官方包不一致，请卸载后重新安装";
+    } else if (raw.includes("更新服务正忙")) {
+      code = "update_busy";
+      msg = "更新服务正忙，请稍后重试";
+    } else if (raw.includes("更新服务器返回 HTTP")) {
+      code = "update_http";
+      msg = "更新服务暂时不可用，请稍后重试";
+    } else if (raw.includes("更新信息解析失败")) {
+      code = "update_parse";
+      msg = "更新信息读取失败，请稍后重试";
     } else if (raw.includes("error sending request") || raw.includes("error decoding response body")) {
       // 传输层偶发失败（DNS/连接/TLS 抖动；本 App 每次调用都新建连接，更易撞上）——重试通常就好
       code = "network";
@@ -2477,6 +2392,8 @@ export default function App() {
   /** 本机安装记录（纯本地读）：管理页把「设备上的表盘」对上资源、标「可更新」用 */
   const [paidInstalls, setPaidInstalls] = useState<PaidInstallRecord[]>([]);
   const [paidLoaded, setPaidLoaded] = useState(false);
+  /** 「暂不支持当前设备」折叠组：默认收起，别挤占首屏 */
+  const [paidUnsupportedOpen, setPaidUnsupportedOpen] = useState(false);
   const [paidBusy, setPaidBusy] = useState(false);
   /** 付费安装失败后「重试安装」用：重试装的就是上次勾的那几个包体（fileIds=null = 整组装） */
   const paidTarget = useRef<{
@@ -2527,39 +2444,14 @@ export default function App() {
     updateTabHeader();
   };
 
-  // 切 Tab / 回到主界面：大小标题复位到顶部初态
+  // 切 Tab / 回到主界面：大小标题按该 Tab 记住的滚动位置复位（列表回到原位后标题也保持折叠态）
   useEffect(() => {
     if (currentStep !== "main") return;
-    collapseScrollRef.current = 0;
-    rbOffsetYRef.current = 0;
-    collapseCollapsedRef.current = false;
-    const big = collapseTitleRef.current;
-    const small = collapseSmallRef.current;
-    if (big) big.dataset.hide = "0";
-    if (small) small.dataset.show = "0";
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, currentStep]);
-
-
-  /**
-   * 从集市详情返回：把列表滚回进去之前的位置。
-   * 详情是独立 step（market_detail），整个 Tab 容器会卸载重挂，滚动位置本来必丢；
-   * 这里在重挂后的第一次布局里补回来（内容来自内存里的 marketFaces，不会等数据）。
-   */
-  useLayoutEffect(() => {
-    if (currentStep !== "main" || activeTab !== "market") return;
-    if (!restoreMarketScrollRef.current) return;
-    restoreMarketScrollRef.current = false;
-    const el = marketListRef.current;
-    if (!el) return;
-    const top = marketScrollTopRef.current;
-    el.scrollTop = top;
-    // 顶栏大小标题状态也跟着回到原样（上面那个 effect 刚把它复位成 0）
-    collapseScrollRef.current = top;
+    collapseScrollRef.current = readScroll(`main/${activeTab}`);
     rbOffsetYRef.current = 0;
     updateTabHeader();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentStep, activeTab]);
+  }, [activeTab, currentStep]);
 
   const installBusyRef = useRef(false);
   /** 这次本地安装装的是什么：表盘有「设为当前」那一步，快应用没有 → 进度文案要分开 */
@@ -2620,18 +2512,16 @@ export default function App() {
   const [marketScreen, setMarketScreen] = useState<[number, number] | null>(null);
   /** 当前设备是不是小米手环 9 Pro（服务端判定后回传；用于把屏蔽项按钮置灰） */
   const [marketNinePro, setMarketNinePro] = useState(false);
-  /** 标签筛选（null = 全部）；付费/免费也在这里筛 */
-  const [marketTag, setMarketTag] = useState<string | null>(null);
-  /** 标签菜单展开状态：标签多，收起来只占一行，展开后全部铺开 */
+  /** 标签筛选（空数组 = 全部）；多选按交集过滤，付费/免费互斥 */
+  const [marketTagsSelected, setMarketTagsSelected] = useState<string[]>([]);
+  /** 标签菜单展开状态：标签多，收起来只占一行，展开后流式铺开 */
   const [marketTagMenu, setMarketTagMenu] = useState(false);
+  /** 设备胶囊 + 标签胶囊那一行：点浮层外部时用于判断 */
+  const marketTagWrapRef = useRef<HTMLDivElement | null>(null);
   /** 搜索框：按表盘名 / 标签关键字过滤（与标签筛选叠加） */
   const [marketQuery, setMarketQuery] = useState("");
   const [marketBannerIndex, setMarketBannerIndex] = useState(0);
   const marketBannerRef = useRef<HTMLDivElement | null>(null);
-  /** 集市列表滚动容器与上次位置：进详情页时整个列表会卸载，回来要滚回原位 */
-  const marketListRef = useRef<HTMLDivElement | null>(null);
-  const marketScrollTopRef = useRef(0);
-  const restoreMarketScrollRef = useRef(false);
   /** 集市卡片网格与实测可用的图片宽度（一排 3 个，宽画布要等比缩） */
   const marketGridRef = useRef<HTMLDivElement | null>(null);
   const [marketCardInnerW, setMarketCardInnerW] = useState(0);
@@ -2656,6 +2546,33 @@ export default function App() {
   }, [currentStep, activeTab, marketLoaded]);
   /** 集市安装失败后「重试安装」用 */
   const marketTarget = useRef<{ face: MarketFace; addr: string } | null>(null);
+
+  /** 标签浮层：点胶囊行外部关闭（只有展开时才挂监听） */
+  useEffect(() => {
+    if (!marketTagMenu) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const wrap = marketTagWrapRef.current;
+      if (wrap && !wrap.contains(e.target as Node)) setMarketTagMenu(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [marketTagMenu]);
+
+  /**
+   * 切换一个筛选标签：null = 清空全部；已选中则移除，未选中则加入。
+   * 「付费 / 免费」是资源性质，互斥：选一个就自动取消另一个。
+   */
+  const toggleMarketTag = (tag: string | null) => {
+    if (tag === null) {
+      setMarketTagsSelected([]);
+      return;
+    }
+    setMarketTagsSelected(prev => {
+      if (prev.includes(tag)) return prev.filter(t => t !== tag);
+      const next = tag === "付费" ? prev.filter(t => t !== "免费") : tag === "免费" ? prev.filter(t => t !== "付费") : prev;
+      return [...next, tag];
+    });
+  };
 
   /** 本地安装确认页：选完文件先停在这里（显示文件信息 + 可选的「复写表盘 ID」） */
   const [pendingLocal, setPendingLocal] = useState<{
@@ -2688,6 +2605,59 @@ export default function App() {
   /** 从管理页点开某个已装视频表盘时，交给视频表盘页直接打开的作品 ID */
   const [videoOpenId, setVideoOpenId] = useState("");
   const [editingDial, setEditingDial] = useState<InstalledDial | null>(boot.editingDial);
+
+  // —— 页面滚动位置记忆 ——
+  // 一级 Tab：切 Tab / 进二级页都保留各自位置（前进进入别的页面不会动它们）。
+  // 二级列表：前进进入时由 applyRoute 里的 resetScroll 清零，返回时由 hook 恢复。
+  const tabHomeScroll = useScrollMemory("main/home", {
+    active: currentStep === "main" && activeTab === "home"
+  });
+  const tabMarketScroll = useScrollMemory("main/market", {
+    active: currentStep === "main" && activeTab === "market",
+    ready: marketLoaded,
+    itemCount: marketFaces.length
+  });
+  const tabManageScroll = useScrollMemory("main/manage", {
+    active: currentStep === "main" && activeTab === "manage",
+    itemCount: dials.length
+  });
+  const tabSettingsScroll = useScrollMemory("main/settings", {
+    active: currentStep === "main" && activeTab === "settings"
+  });
+  /** 已购表盘列表：点安装会往下走一层（进度页），返回要回到原来的位置 */
+  const paidDialsScroll = useScrollMemory("paid/dials", {
+    active: currentStep === "paid_dials",
+    ready: paidLoaded,
+    itemCount: paidProducts.length
+  });
+  /** 集市详情：从详情里点安装再返回，也要回到原位置 */
+  const marketDetailScroll = useScrollMemory("market/item", {
+    active: currentStep === "market_detail" && !!marketDetail
+  });
+  /** 设置 › 账号：会压一层登录页；设置 › 设备：会压 vivo 扫描 / 连接帮助 */
+  const settingsAccountScroll = useScrollMemory("settings/account", {
+    active: currentStep === "settings_account"
+  });
+  const settingsDeviceScroll = useScrollMemory("settings/device", {
+    active: currentStep === "settings_device"
+  });
+  /** 关于页：可以继续进开发者 / 开源许可 */
+  const aboutScroll = useScrollMemory("about", { active: currentStep === "about_app" });
+  /** 选择设备：切换小米账号会压一层登录页 */
+  const deviceSelectScroll = useScrollMemory("devices", {
+    active: currentStep === "device_select"
+  });
+
+  /** 换设备 = 各 Tab 的列表内容整个变了：记住的位置作废，下次进入从顶部开始 */
+  const scrollMemoryDeviceId = useRef(selectedDevice.id);
+  useEffect(() => {
+    if (scrollMemoryDeviceId.current === selectedDevice.id) return;
+    scrollMemoryDeviceId.current = selectedDevice.id;
+    resetScroll("main/home");
+    resetScroll("main/market");
+    resetScroll("main/manage");
+    resetScroll("main/settings");
+  }, [selectedDevice.id]);
 
   // 动作表（Action Sheet）状态
   const [activeActionSheetDial, setActiveActionSheetDial] = useState<InstalledDial | null>(null);
@@ -2919,9 +2889,15 @@ export default function App() {
   /** 栈顶路由（当前页面） */
   const currentRoute = () => navStack.current[navStack.current.length - 1] || "login";
 
-  /** 路由 → 界面状态（所有换页的唯一出口） */
-  const applyRoute = (route: string) => {
+  /**
+   * 路由 → 界面状态（所有换页的唯一出口）。
+   * direction：forward = 前进进入（目标页从顶部开始，清掉上次离开时的位置）；
+   *            back = 返回（保留目标页记住的位置，由页面里的 useScrollMemory 恢复）。
+   * 一级 Tab 之间切换不吃 reset：各 Tab 都保留自己的位置。
+   */
+  const applyRoute = (route: string, direction: "forward" | "back" = "forward") => {
     const { step, tab } = parseRoute(route);
+    if (direction === "forward" && step !== "main") resetScroll(route);
     setActiveTab(tab);
     setCurrentStep(step);
     // 换页时顺手收掉页面上的临时浮层：返回键切页后不该把「⋯」菜单/弹层留在新页面上
@@ -2933,6 +2909,7 @@ export default function App() {
     setShowConnectHelpPrompt(false);
     setDeviceMenu(null);
     setGenExitAsk(false);
+    setMarketTagMenu(false);
     // 从「怎么连上手环」返回 → 把设备浮窗还回去（它才是上一级界面，用户 2026-10-07 要求）
     if (helpFromDrawer.current && step !== "connect_help") {
       helpFromDrawer.current = false;
@@ -3012,6 +2989,7 @@ export default function App() {
    * 这样返回键/侧滑只会关掉浮窗、页面停在本页（用户 2026-10-07 要求）。
    */
   const openDeviceDrawer = () => {
+    setMarketTagMenu(false);
     setIsDeviceDrawerOpen(true);
     navDepth.current += 1;
     topIsOverlay.current = true;
@@ -3083,7 +3061,7 @@ export default function App() {
       return;
     }
     navStack.current = navStack.current.slice(0, -1);
-    applyRoute(currentRoute());
+    applyRoute(currentRoute(), "back");
     if (navDepth.current > 0) {
       // 历史里确实还有一层：同步退回一格，并忽略它带来的这次 popstate
       navDepth.current -= 1;
@@ -3321,6 +3299,8 @@ export default function App() {
       : null;
   /** 演示/无渲染图时，设计稿那层 mock 内容按 208×248 基准等比缩放进设备框 */
   const mockScale = Math.min(canvasFrame.w / 208, canvasFrame.h / 248);
+  /** 胶囊屏真图微放大裁黑边；mock 装饰层保持原比例，不跟着放大 */
+  const canvasImgScale = previewImageScale([canvasScreen.width, canvasScreen.height]);
 
   const showToast = (msg: string, kind: "success" | "error" = "success") => {
     setToast({ msg, kind });
@@ -4381,7 +4361,7 @@ export default function App() {
       if (navStack.current.length > 1) {
         navStack.current = navStack.current.slice(0, -1);
         navDepth.current = Math.max(0, navDepth.current - 1);
-        applyRoute(currentRoute());
+        applyRoute(currentRoute(), "back");
       }
     };
     window.addEventListener("popstate", onPop);
@@ -6033,9 +6013,9 @@ export default function App() {
       const faces = Array.isArray(d?.faces) ? d.faces : [];
       setMarketNinePro(!!d?.ninePro);
       setMarketFaces(faces);
-      // 换设备后原来筛的标签可能一个都没有了：留着会看到空白页，直接退回「全部」
-      setMarketTag(prev =>
-        prev && faces.some(f => (f.tags || []).includes(prev)) ? prev : null
+      // 换设备后原来筛的标签可能一个都没有了：留着会看到空白页，直接剔除
+      setMarketTagsSelected(prev =>
+        prev.filter(t => faces.some(f => (f.tags || []).includes(t)))
       );
       setMarketUpdateCount(faces.filter(f => f.has_update).length);
       // 详情页开着时，把它也换成最新那份（更新/已安装标记跟着走）；
@@ -6062,10 +6042,27 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentStep, activeTab, isDeviceConnected, selectedDevice.id, memberTier]);
 
+  /**
+   * 进「我的表盘」时静默补一次集市列表：卡片封面、点卡片看详情都复用集市数据。
+   * 用户没点过「集市」Tab 直接进来时 marketFaces 还是空的 —— 这里补一次，
+   * 失败也不打扰（卡片退回手表占位图标）；每次进入只试一次。
+   */
+  const paidMarketBootstrapRef = useRef(false);
+  useEffect(() => {
+    if (currentStep !== "paid_dials") {
+      paidMarketBootstrapRef.current = false;
+      return;
+    }
+    if (paidMarketBootstrapRef.current) return;
+    if (marketFaces.length > 0 || marketLoading) return;
+    paidMarketBootstrapRef.current = true;
+    void loadMarket(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStep, marketFaces.length, marketLoading]);
+
   /** 点表盘卡 → 详情页（详情对象在内存里；重启后回到集市列表） */
   const openMarketFace = (face: MarketFace) => {
-    // 记一笔：从详情返回时把列表滚回原位（列表容器在详情页会卸载）
-    restoreMarketScrollRef.current = true;
+    setMarketTagMenu(false);
     setMarketDetail(face);
     pushRoute("market/item");
   };
@@ -6271,6 +6268,38 @@ export default function App() {
         variantMatchesVendor(v, vendor)
     );
     return { variant: hit ?? null, screenKnown: true };
+  };
+
+  /**
+   * 已购资源对应的集市条目：卡片封面与「点卡片看详情」都复用集市数据。
+   * 优先按 paidProductId 匹配；服务端没给 id 时按同名兜底。
+   * 同一个资源有多条（多屏/多品牌）时，先挑和当前设备行（或本机屏幕）一致的那条。
+   */
+  const findMarketFaceForPaid = (
+    p: PaidProduct,
+    variant?: PaidVariant | null
+  ): MarketFace | undefined => {
+    let screen: [number, number] | null = paidScreen;
+    const vs = variant?.screen;
+    if (vs && vs[0] && vs[1]) screen = [vs[0], vs[1]];
+    const pick = (list: MarketFace[]) => {
+      if (screen) {
+        const hit = list.find(
+          f => f.screen[0] === screen[0] && f.screen[1] === screen[1]
+        );
+        if (hit) return hit;
+      }
+      return list[0];
+    };
+    const byId = marketFaces.filter(
+      f => !!f.paidProductId && f.paidProductId === p.product_id
+    );
+    if (byId.length > 0) return pick(byId);
+    // 老服务端可能没带 paidProductId：按同名兜底（只认付费条目，别误伤免费表盘）
+    const name = p.name.trim();
+    if (!name) return undefined;
+    const byName = marketFaces.filter(f => f.kind !== "free" && f.name.trim() === name);
+    return byName.length > 0 ? pick(byName) : undefined;
   };
 
   /**
@@ -6763,7 +6792,10 @@ export default function App() {
       setGenParams(cfg.photos.map(ph => defaultGenParams(ph)));
       setGenLayers(cfg.photos.map(() => ({ prev: "", full: "" })));
       setGenColor(cfg.frame?.colors?.[0]?.i ?? null);
-      setGenActive(0);
+      {
+        const frameIdx = cfg.photos.findIndex(ph => ph.base === "frame");
+        setGenActive(frameIdx >= 0 ? frameIdx : 0);
+      }
       genImgs.current = new Map();
       genFrame.current = { key: "", img: null };
       genLastFill.current = {};
@@ -7199,7 +7231,10 @@ export default function App() {
   const resetGenEditing = (cfg: GenConfig) => {
     setGenLayers(cfg.photos.map(() => ({ prev: "", full: "" })));
     setGenParams(cfg.photos.map(ph => defaultGenParams(ph)));
-    setGenActive(0);
+    {
+      const frameIdx = cfg.photos.findIndex(ph => ph.base === "frame");
+      setGenActive(frameIdx >= 0 ? frameIdx : 0);
+    }
     genImgs.current = new Map();
     genLiveDrag.current = null;
     genLastFill.current = {};
@@ -7272,7 +7307,7 @@ export default function App() {
         resetStackTo("main/manage");
       } else {
         navStack.current = navStack.current.slice(0, -1);
-        applyRoute(currentRoute());
+        applyRoute(currentRoute(), "back");
       }
     } else {
       goBackOr("main/manage");
@@ -7853,6 +7888,8 @@ export default function App() {
 
               <div className="flex-1 min-h-0 overflow-hidden mt-6 -mx-1">
                 <div
+                  ref={deviceSelectScroll.ref}
+                  onScroll={deviceSelectScroll.onScroll}
                   data-rb="y" data-rb-always="1"
                  
                   className="h-full overflow-y-auto no-scrollbar px-1"
@@ -7964,7 +8001,10 @@ export default function App() {
               
               {/* Tab 1: 首页 */}
               {activeTab === "home" && (
-                <div key="tab-home" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-home" ref={tabHomeScroll.ref} onScroll={e => {
+                  tabHomeScroll.onScroll(e);
+                  handleTabScroll(e);
+                }} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   {/* 首屏没有大标题：内容从 68px 起点开始 */}
                   <div>
                     <div className="flex justify-center">
@@ -8152,13 +8192,17 @@ export default function App() {
               {/* Tab 2: 集市（免费表盘） */}
               {activeTab === "market" && (() => {
                 const marketTags = marketTagOptions(marketFaces);
-                const filteredMarketFaces = filterMarketFaces(marketFaces, marketTag, marketQuery);
+                const filteredMarketFaces = filterMarketFaces(marketFaces, marketTagsSelected, marketQuery);
+                const tagLabel =
+                  marketTagsSelected.length === 0
+                    ? "全部"
+                    : marketTagsSelected.length === 1
+                      ? marketTagsSelected[0]
+                      : `已选 ${marketTagsSelected.length}`;
                 return (
-                <div key="tab-market" ref={marketListRef} onScroll={e => {
-                  const top = e.currentTarget.scrollTop;
-                  marketScrollTopRef.current = top;
-                  collapseScrollRef.current = top;
-                  updateTabHeader();
+                <div key="tab-market" ref={tabMarketScroll.ref} onScroll={e => {
+                  tabMarketScroll.onScroll(e);
+                  handleTabScroll(e);
                 }} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   {/* 大标题回归滚动流：1:1 跟手滚出顶栏，短页不折叠 */}
                   <h1
@@ -8191,62 +8235,92 @@ export default function App() {
                       )}
                     </div>
 
-                    <div className="flex items-center gap-3">
-                      <button
-                        type="button"
-                        onClick={openDeviceDrawer}
-                        className={`flex-1 min-w-0 flex items-center justify-center gap-2 h-11 px-4 bg-[var(--pf-card)] rounded-full cursor-pointer active:scale-[0.98] transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-[var(--pf-bd-5)] ${
-                          isDeviceSwitchingAnim ? "ring-2 ring-[var(--pf-primary)]" : ""
-                        }`}
-                      >
-                        <span className={`w-2 h-2 rounded-full shrink-0 ${isDeviceConnected ? "bg-[var(--pf-ok-solid)]" : linkRetrying ? "bg-[var(--pf-amber-solid)]" : "bg-[var(--pf-danger-solid)]"}`} />
-                        <span className="pf-fs-13 font-bold text-[var(--pf-ink)] tracking-tight truncate">
-                          {isDeviceConnected ? selectedDevice.name : linkRetrying ? "重连中…" : "未连接设备"}
-                        </span>
-                        <CaretRight className="w-3.5 h-3.5 text-[var(--pf-i-25)] stroke-[2] shrink-0" />
-                      </button>
-
-                      {!marketError && marketLoaded && marketTags.length > 0 && (
+                    <div ref={marketTagWrapRef} className="relative z-30">
+                      <div className="flex items-center gap-3">
                         <button
                           type="button"
-                          onClick={() => setMarketTagMenu(v => !v)}
-                          className="shrink-0 min-w-[76px] h-11 px-2.5 rounded-full bg-[var(--pf-card)] border border-[var(--pf-bd-5)] flex items-center justify-center gap-1.5 pf-fs-13 font-bold text-[var(--pf-ink)] tracking-tight shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.98] transition-all cursor-pointer"
+                          onClick={openDeviceDrawer}
+                          className={`flex-1 min-w-0 flex items-center justify-center gap-2 h-11 px-4 bg-[var(--pf-card)] rounded-full cursor-pointer active:scale-[0.98] transition-all shadow-[0_1px_3px_rgba(0,0,0,0.02)] border border-[var(--pf-bd-5)] ${
+                            isDeviceSwitchingAnim ? "ring-2 ring-[var(--pf-primary)]" : ""
+                          }`}
                         >
-                          <span className="truncate">{marketTag ?? "全部"}</span>
-                          <CaretDown
-                            className={`w-3.5 h-3.5 text-[var(--pf-i-30)] stroke-[2] shrink-0 transition-transform duration-200 ${
-                              marketTagMenu ? "rotate-180" : ""
-                            }`}
-                          />
+                          <span className={`w-2 h-2 rounded-full shrink-0 ${isDeviceConnected ? "bg-[var(--pf-ok-solid)]" : linkRetrying ? "bg-[var(--pf-amber-solid)]" : "bg-[var(--pf-danger-solid)]"}`} />
+                          <span className="pf-fs-13 font-bold text-[var(--pf-ink)] tracking-tight truncate">
+                            {isDeviceConnected ? selectedDevice.name : linkRetrying ? "重连中…" : "未连接设备"}
+                          </span>
+                          <CaretRight className="w-3.5 h-3.5 text-[var(--pf-i-25)] stroke-[2] shrink-0" />
                         </button>
-                      )}
-                    </div>
 
-                    {/* 展开的标签菜单：整行宽度铺在卡片下面，三列网格 */}
-                    {!marketError && marketLoaded && marketTagMenu && marketTags.length > 0 && (
-                      <div className="mt-3 bg-[var(--pf-card)] pf-card-border rounded-2xl p-3.5 grid grid-cols-3 gap-2 page-enter-anim">
-                        {[null as string | null, ...marketTags].map(tag => {
-                          const active = marketTag === tag;
-                          return (
+                        {!marketError && marketLoaded && marketTags.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setMarketTagMenu(v => !v)}
+                            className={`shrink-0 min-w-[76px] max-w-[116px] h-11 px-2.5 rounded-full border flex items-center justify-center gap-1.5 pf-fs-13 font-bold tracking-tight shadow-[0_1px_3px_rgba(0,0,0,0.02)] active:scale-[0.98] transition-all cursor-pointer ${
+                              marketTagsSelected.length > 0
+                                ? "border-[var(--pf-primary-25)] bg-[var(--pf-primary-5)] text-[var(--pf-primary)]"
+                                : "border-[var(--pf-bd-5)] bg-[var(--pf-card)] text-[var(--pf-ink)]"
+                            }`}
+                          >
+                            <span className="truncate">{tagLabel}</span>
+                            <CaretDown
+                              className={`w-3.5 h-3.5 stroke-[2] shrink-0 transition-transform duration-200 ${
+                                marketTagsSelected.length > 0
+                                  ? "text-[var(--pf-primary)]"
+                                  : "text-[var(--pf-i-30)]"
+                              } ${marketTagMenu ? "rotate-180" : ""}`}
+                            />
+                          </button>
+                        )}
+                      </div>
+
+                      {/* 展开的标签浮层：绝对定位盖在 Banner / 列表上方，不撑高页面 */}
+                      {!marketError && marketLoaded && marketTagMenu && marketTags.length > 0 && (
+                        <div
+                          className="absolute top-full left-0 right-0 mt-2 z-30 bg-[var(--pf-card)] pf-card-border rounded-2xl p-2.5 page-enter-anim"
+                          style={{ boxShadow: "var(--pf-popover-shadow)" }}
+                        >
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <button
-                              key={tag ?? "all"}
                               type="button"
-                              onClick={() => {
-                                setMarketTag(tag);
-                                setMarketTagMenu(false);
-                              }}
-                              className={`h-9 w-full rounded-full pf-fs-13 font-bold transition-colors active:scale-95 cursor-pointer ${
-                                active
+                              onClick={() => toggleMarketTag(null)}
+                              className={`h-8 px-3 rounded-full pf-fs-12 font-bold whitespace-nowrap transition-colors active:scale-95 cursor-pointer ${
+                                marketTagsSelected.length === 0
                                   ? "bg-[var(--pf-primary-solid)] text-white"
                                   : "bg-[var(--pf-bg-4)] text-[var(--pf-i-60)]"
                               }`}
                             >
-                              {tag ?? "全部"}
+                              全部
                             </button>
-                          );
-                        })}
-                      </div>
-                    )}
+                            {marketTags.map(tag => {
+                              const active = marketTagsSelected.includes(tag);
+                              return (
+                                <button
+                                  key={tag}
+                                  type="button"
+                                  onClick={() => toggleMarketTag(tag)}
+                                  className={`h-8 px-3 rounded-full pf-fs-12 font-bold whitespace-nowrap transition-colors active:scale-95 cursor-pointer ${
+                                    active
+                                      ? "bg-[var(--pf-primary-solid)] text-white"
+                                      : "bg-[var(--pf-bg-4)] text-[var(--pf-i-60)]"
+                                  }`}
+                                >
+                                  {tag}
+                                </button>
+                              );
+                            })}
+                            {marketTagsSelected.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => toggleMarketTag(null)}
+                                className="h-8 px-3 rounded-full pf-fs-12 font-bold whitespace-nowrap border border-[var(--pf-bd-10)] text-[var(--pf-i-55)] transition-colors active:scale-95 cursor-pointer"
+                              >
+                                重置
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   {/* Banner：后台配置，滑动切换；点它去付费表盘（或后台填的链接） */}
@@ -8319,67 +8393,71 @@ export default function App() {
                       <p className="pf-fs-16 font-medium text-[var(--pf-i-40)]">
                         {marketQuery.trim()
                           ? "没有找到相关表盘"
-                          : marketTag
-                            ? "这个标签下还没有表盘"
-                            : "还没有适配这台设备的表盘"}
+                          : marketTagsSelected.length >= 2
+                            ? "所选标签下还没有表盘"
+                            : marketTagsSelected.length === 1
+                              ? "这个标签下还没有表盘"
+                              : "还没有适配这台设备的表盘"}
                       </p>
                     </div>
                   )}
 
                   {!marketError && filteredMarketFaces.length > 0 && (
-                    <div ref={marketGridRef} className="grid grid-cols-3 gap-x-3 gap-y-5">
-                      {filteredMarketFaces.map(face => {
-                        // 一排 3 个、没有白卡：预览按「高 200 的自然宽度」算，列宽放不下就等比缩
-                        const naturalW = Math.max(
-                          1,
-                          Math.round((face.screen[0] * PREVIEW_MAX_H) / face.screen[1])
-                        );
-                        const previewW =
-                          marketCardInnerW > 0 ? Math.min(naturalW, marketCardInnerW) : naturalW;
-                        const previewH = Math.max(
-                          1,
-                          Math.round((previewW * face.screen[1]) / face.screen[0])
-                        );
-                        return (
-                          <button
-                            key={face.id}
-                            type="button"
-                            onClick={() => openMarketFace(face)}
-                            className="pf-list-item min-w-0 flex flex-col items-center text-center cursor-pointer active:scale-[0.97] transition-transform"
-                          >
-                            <div
-                              className="relative overflow-hidden shrink-0"
-                              style={{
-                                width: previewW,
-                                height: previewH,
-                                borderRadius: previewCornerRadius(face.screen, previewW)
-                              }}
+                    <>
+                      <div ref={marketGridRef} className="grid grid-cols-3 gap-x-3 gap-y-5">
+                        {filteredMarketFaces.map(face => {
+                          // 一排 3 个、没有白卡：预览按「高 200 的自然宽度」算，列宽放不下就等比缩
+                          const naturalW = Math.max(
+                            1,
+                            Math.round((face.screen[0] * PREVIEW_MAX_H) / face.screen[1])
+                          );
+                          const previewW =
+                            marketCardInnerW > 0 ? Math.min(naturalW, marketCardInnerW) : naturalW;
+                          const previewH = Math.max(
+                            1,
+                            Math.round((previewW * face.screen[1]) / face.screen[0])
+                          );
+                          const imgScale = previewImageScale(face.screen);
+                          return (
+                            <button
+                              key={face.id}
+                              type="button"
+                              onClick={() => openMarketFace(face)}
+                              className="pf-market-item min-w-0 flex flex-col items-center text-center cursor-pointer active:scale-[0.97] transition-transform"
                             >
-                              <img
-                                src={face.coverUrl}
-                                alt=""
+                              <DialPreviewFrame
+                                screen={face.screen}
                                 width={previewW}
                                 height={previewH}
-                                loading="lazy"
-                                decoding="async"
-                                className="w-full h-full block"
-                              />
-                              {face.has_update && (
-                                <span className="absolute top-1 right-1 h-5 px-1.5 rounded-full bg-[var(--pf-card)] pf-card-border pf-fs-10 font-bold text-[var(--pf-amber)] shadow-[0_1px_3px_rgba(0,0,0,0.10)] flex items-center">
-                                  可更新
-                                </span>
-                              )}
-                            </div>
-                            <div className="mt-1.5 w-full pf-fs-14 font-semibold text-[var(--pf-ink)] leading-snug truncate">
-                              {face.name}
-                            </div>
-                            <div className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
-                              {marketPriceLabel(face)}
-                            </div>
-                          </button>
-                        );
-                      })}
-                    </div>
+                                className="shrink-0"
+                              >
+                                <img
+                                  src={face.coverUrl}
+                                  alt=""
+                                  width={previewW}
+                                  height={previewH}
+                                  loading="lazy"
+                                  decoding="async"
+                                  style={imgScale > 1 ? { transform: `scale(${imgScale})` } : undefined}
+                                  className="w-full h-full block"
+                                />
+                                {face.has_update && (
+                                  <span className="absolute top-1 right-1 h-5 px-1.5 rounded-full bg-[var(--pf-card)] pf-card-border pf-fs-10 font-bold text-[var(--pf-amber)] shadow-[0_1px_3px_rgba(0,0,0,0.10)] flex items-center z-10">
+                                    可更新
+                                  </span>
+                                )}
+                              </DialPreviewFrame>
+                              <div className="mt-2 w-full pf-fs-14 font-semibold text-[var(--pf-ink)] leading-snug truncate">
+                                {face.name}
+                              </div>
+                              <div className="pf-fs-13 font-medium text-[var(--pf-i-40)]">
+                                {marketPriceLabel(face)}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </>
                   )}
                 </div>
                 );
@@ -8387,7 +8465,10 @@ export default function App() {
 
               {/* Tab 3: 管理 */}
               {activeTab === "manage" && (
-                <div key="tab-manage" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-manage" ref={tabManageScroll.ref} onScroll={e => {
+                  tabManageScroll.onScroll(e);
+                  handleTabScroll(e);
+                }} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   {/* 大标题回归滚动流：1:1 跟手滚出顶栏，短页不折叠 */}
                   <h1
                     ref={collapseTitleRef}
@@ -8660,7 +8741,10 @@ export default function App() {
 
               {/* Tab 3: 设置（极简纯列表页） */}
               {activeTab === "settings" && (
-                <div key="tab-settings" onScroll={handleTabScroll} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
+                <div key="tab-settings" ref={tabSettingsScroll.ref} onScroll={e => {
+                  tabSettingsScroll.onScroll(e);
+                  handleTabScroll(e);
+                }} data-rb="y" data-rb-always="1" data-rb-tab="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 safe-top-tab pb-24 page-enter-anim">
                   <div>
                     {/* 大标题回归滚动流：1:1 跟手滚出顶栏，短页不折叠 */}
                     <h1
@@ -8932,7 +9016,7 @@ export default function App() {
 
           {/* 3.4 设置 › 账号（二级页）：爱发电账号 / 小米账号 / 退出登录 */}
           {currentStep === "settings_account" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
+            <div ref={settingsAccountScroll.ref} onScroll={settingsAccountScroll.onScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
               <div>
 
                 {/* ① 爱发电账号：所有用户都要绑，放在最上面、做得最醒目（用户 2026-11-15 要求）。
@@ -9098,7 +9182,7 @@ export default function App() {
 
           {/* 3.45 设置 › 设备与连接（二级页）：当前设备 / 重新导入 / 后台保持连接 */}
           {currentStep === "settings_device" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
+            <div ref={settingsDeviceScroll.ref} onScroll={settingsDeviceScroll.onScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-6 pb-10 page-enter-anim subpage-top">
               <div>
 
                 <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-4 divide-y divide-[var(--pf-bd-5)]">
@@ -9636,10 +9720,7 @@ export default function App() {
 
           {/* 4.5 我的表盘（已购资源列表） */}
           {currentStep === "paid_dials" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-7 pb-12 page-enter-anim subpage-top">
-              <div>
-              </div>
-
+            <div ref={paidDialsScroll.ref} onScroll={paidDialsScroll.onScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col overflow-y-auto no-scrollbar px-7 pb-12 page-enter-anim subpage-top">
               {paidError && (
                 <div className="bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
                   <p className="pf-fs-13 text-[var(--pf-danger)] font-bold">{paidError}</p>
@@ -9695,64 +9776,187 @@ export default function App() {
                 </div>
               )}
 
-              {!paidError && paidLoaded && paidProducts.length > 0 && (
-                <div className="pb-4">
-                  {paidProducts.map(p => {
-                    const m = matchPaidVariant(p);
-                    const v = m.variant;
-                    return (
-                      <div
-                        key={p.product_id}
-                        className="pf-list-item bg-[var(--pf-card)] pf-card-border rounded-3xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.02)] mb-3"
-                      >
-                        <div className="flex items-baseline justify-between">
-                          <div className="flex items-center gap-2 min-w-0">
-                            <h3 className={`pf-fs-17 font-bold tracking-tight ${v ? "text-[var(--pf-ink)]" : "text-[var(--pf-i-40)]"}`}>
-                              {p.name}
-                            </h3>
-                            {/* 有新版本：装过这行才可能标出来（没装过就是「安装」） */}
-                            {v?.has_update && (
-                              <span className="shrink-0 pf-fs-12 font-bold text-[var(--pf-amber)] bg-[var(--pf-amber-15)] rounded-full px-2 py-[3px] leading-none">
-                                可更新
-                              </span>
-                            )}
-                          </div>
-                          <span className="shrink-0 pf-fs-13 font-medium text-[var(--pf-i-40)]">
-                            {v?.latest_version ?? ""}
-                          </span>
-                        </div>
-                        <p className="pf-fs-13 font-medium text-[var(--pf-i-40)] mt-1">
-                          {v
-                            ? `适配 ${v.name}${v.installed && v.installed_version ? `，已装 ${v.installed_version}` : ""}`
-                            : m.screenKnown || isDeviceConnected
-                              ? "暂不支持你的设备"
-                              : "连接设备后安装"}
-                        </p>
-                        {v ? (
-                          <button
-                            type="button"
-                            disabled={installPreparing === p.product_id}
-                            onClick={() => runPaidInstall(p, v)}
-                            className={`mt-4 w-full h-[44px] rounded-full text-white font-bold pf-fs-16 active:scale-[0.98] transition-transform duration-150 cursor-pointer ${
-                              installPreparing === p.product_id ? "bg-[var(--pf-primary-60)]" : "bg-[var(--pf-primary-solid)]"
-                            }`}
-                          >
-                            {installPreparing === p.product_id
-                              ? "准备中…"
-                              : v.has_update
-                                ? "更新到最新版"
-                                : "安装"}
-                          </button>
+              {!paidError && paidLoaded && paidProducts.length > 0 && (() => {
+                const rows = paidProducts.map(p => {
+                  const m = matchPaidVariant(p);
+                  return { p, v: m.variant, face: findMarketFaceForPaid(p, m.variant) };
+                });
+                /** 当前可用：可更新的排最前，其次是未安装 / 已是最新 */
+                const supported = rows
+                  .filter(
+                    (r): r is { p: PaidProduct; v: PaidVariant; face: MarketFace | undefined } =>
+                      !!r.v
+                  )
+                  .sort((a, b) => Number(!!b.v.has_update) - Number(!!a.v.has_update));
+                const unsupported = rows.filter(r => !r.v);
+                const updateCount = supported.filter(r => r.v.has_update).length;
+
+                /** 一张紧凑卡：左封面 / 中间名称与适配信息 / 右操作按钮 */
+                const renderCard = (row: {
+                  p: PaidProduct;
+                  v: PaidVariant | null;
+                  face: MarketFace | undefined;
+                }) => {
+                  const { p, v, face } = row;
+                  const thumbH = 72;
+                  const thumbW = face
+                    ? Math.max(28, Math.round((thumbH * face.screen[0]) / face.screen[1]))
+                    : 48;
+                  const imgScale = face ? previewImageScale(face.screen) : 1;
+                  const versionText = !v
+                    ? ""
+                    : v.installed &&
+                        v.installed_version &&
+                        v.latest_version &&
+                        v.installed_version !== v.latest_version
+                      ? `${v.installed_version} → ${v.latest_version}`
+                      : v.latest_version
+                        ? `v${v.latest_version}`
+                        : "";
+                  const adaptText = v
+                    ? formatShortDeviceLabel(v.name)
+                    : isDeviceConnected
+                      ? "暂不支持当前设备"
+                      : "连接设备后可查看";
+                  const preparing = installPreparing === p.product_id;
+                  return (
+                    <div
+                      key={p.product_id}
+                      onClick={() => {
+                        // 准备安装时别让点卡片再压一层详情页，避免安装流程把栈带乱
+                        if (face && !preparing) openMarketFace(face);
+                      }}
+                      className={`pf-list-item bg-[var(--pf-card)] pf-card-border rounded-2xl px-3.5 py-3 mb-2.5 flex items-center gap-3.5 ${
+                        face ? "cursor-pointer active:scale-[0.995] transition-transform duration-150" : ""
+                      }`}
+                    >
+                      {/* 左：集市封面（认不出就退回手表占位） */}
+                      <div className="shrink-0 h-[72px] flex items-center justify-center">
+                        {face ? (
+                          <DialPreviewFrame screen={face.screen} width={thumbW} height={thumbH}>
+                            <img
+                              src={face.coverUrl}
+                              alt={face.name}
+                              draggable={false}
+                              style={
+                                imgScale > 1 ? { transform: `scale(${imgScale})` } : undefined
+                              }
+                              className="w-full h-full block"
+                            />
+                          </DialPreviewFrame>
                         ) : (
-                          <div className="mt-4 h-[44px] rounded-full bg-[var(--pf-bg-5)] text-[var(--pf-i-25)] font-bold pf-fs-16 flex items-center justify-center">
-                            {isDeviceConnected ? "暂不可安装" : "先连接设备"}
+                          <div className="w-12 h-[68px] rounded-xl bg-[var(--pf-bg-5)] text-[var(--pf-i-25)] flex items-center justify-center">
+                            <Watch className="w-6 h-6" />
                           </div>
                         )}
                       </div>
-                    );
-                  })}
-                </div>
-              )}
+
+                      {/* 中：名称独占上方空间；状态标签、版本、适配设备在下方自然换行 */}
+                      <div className="flex-1 min-w-0">
+                        <h3
+                          className={`pf-fs-15 font-bold tracking-tight leading-snug line-clamp-2 ${
+                            v ? "text-[var(--pf-ink)]" : "text-[var(--pf-i-40)]"
+                          }`}
+                        >
+                          {p.name}
+                        </h3>
+                        <div className="mt-1.5 flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                          {v?.has_update ? (
+                            <span className="shrink-0 pf-fs-12 font-bold text-[var(--pf-amber)] bg-[var(--pf-amber-15)] rounded-full px-2 py-[2px] leading-none">
+                              可更新
+                            </span>
+                          ) : v?.installed ? (
+                            <span className="shrink-0 pf-fs-12 font-bold text-[var(--pf-i-45)] bg-[var(--pf-bg-5)] rounded-full px-2 py-[2px] leading-none">
+                              已安装
+                            </span>
+                          ) : null}
+                          {versionText && (
+                            <span className="shrink-0 pf-fs-12 font-medium text-[var(--pf-i-45)] leading-snug">
+                              {versionText}
+                            </span>
+                          )}
+                          <span
+                            className={`pf-fs-12 font-medium leading-snug break-words ${
+                              v ? "text-[var(--pf-i-40)]" : "text-[var(--pf-i-30)]"
+                            }`}
+                          >
+                            {adaptText}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* 右：操作 */}
+                      {v ? (
+                        <button
+                          type="button"
+                          disabled={preparing}
+                          onClick={e => {
+                            e.stopPropagation();
+                            runPaidInstall(p, v);
+                          }}
+                          className={`shrink-0 h-9 px-4 rounded-full pf-fs-13 font-bold active:scale-95 transition-all cursor-pointer disabled:cursor-default ${
+                            v.has_update || !v.installed
+                              ? preparing
+                                ? "bg-[var(--pf-primary-60)] text-white"
+                                : "bg-[var(--pf-primary-solid)] text-white"
+                              : "bg-[var(--pf-bg-5)] text-[var(--pf-i-70)] border border-[var(--pf-bd-5)]"
+                          }`}
+                        >
+                          {preparing
+                            ? "准备中…"
+                            : v.has_update
+                              ? "更新"
+                              : v.installed
+                                ? "重装"
+                                : "安装"}
+                        </button>
+                      ) : (
+                        <span className="shrink-0 pf-fs-12 font-semibold text-[var(--pf-i-30)]">
+                          {isDeviceConnected ? "暂不支持" : "未连接"}
+                        </span>
+                      )}
+                    </div>
+                  );
+                };
+
+                return (
+                  <div className="pb-4">
+                    {updateCount > 0 && (
+                      <div className="flex items-center gap-2 rounded-xl bg-[var(--pf-amber-15)] px-3 py-2 mb-2.5">
+                        <ArrowClockwise className="w-4 h-4 shrink-0 text-[var(--pf-amber)]" weight="bold" />
+                        <span className="pf-fs-12 font-bold text-[var(--pf-amber)]">
+                          有 {updateCount} 个表盘可更新
+                        </span>
+                      </div>
+                    )}
+
+                    {supported.map(row => renderCard(row))}
+
+                    {unsupported.length > 0 && (
+                      <div className="mt-1">
+                        <button
+                          type="button"
+                          aria-expanded={paidUnsupportedOpen}
+                          onClick={() => setPaidUnsupportedOpen(open => !open)}
+                          className="w-full flex items-center justify-between gap-2 px-1 py-2.5 cursor-pointer text-[var(--pf-i-40)] hover:text-[var(--pf-i-60)] transition-colors"
+                        >
+                          <span className="pf-fs-13 font-semibold">
+                            暂不支持当前设备（{unsupported.length} 个）
+                          </span>
+                          <CaretDown
+                            className={`w-4 h-4 shrink-0 transition-transform duration-200 ${
+                              paidUnsupportedOpen ? "rotate-180" : ""
+                            }`}
+                          />
+                        </button>
+                        {paidUnsupportedOpen && (
+                          <div className="pt-0.5">{unsupported.map(row => renderCard(row))}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -9787,20 +9991,34 @@ export default function App() {
               1,
               Math.round((face.screen[0] * previewH) / face.screen[1])
             );
+            const detailScale = previewImageScale(face.screen);
             return (
-              <div className="relative flex-1 flex flex-col bg-[var(--pf-page)] overflow-hidden page-enter-anim">
-                <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto no-scrollbar px-6 pb-32 subpage-top">
+              <div className="relative flex-1 min-h-0 flex flex-col bg-[var(--pf-page)] overflow-hidden page-enter-anim">
+                <div
+                  ref={marketDetailScroll.ref}
+                  onScroll={marketDetailScroll.onScroll}
+                  data-rb="y"
+                  data-rb-always="1"
+                  className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-6 pb-32 subpage-top"
+                  style={{ contain: "layout style" }}
+                >
                   <div className="flex justify-center pt-2 pb-6">
-                    <img
-                      src={face.coverUrl}
-                      alt={face.name}
-                      style={{
-                        width: previewW,
-                        height: previewH,
-                        borderRadius: previewCornerRadius(face.screen, previewW)
-                      }}
-                      className="block drop-shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
-                    />
+                    <DialPreviewFrame
+                      screen={face.screen}
+                      width={previewW}
+                      height={previewH}
+                    >
+                      <img
+                        src={face.coverUrl}
+                        alt={face.name}
+                        style={
+                          detailScale > 1
+                            ? { transform: `scale(${detailScale})` }
+                            : undefined
+                        }
+                        className="w-full h-full block"
+                      />
+                    </DialPreviewFrame>
                   </div>
 
                   <h1 className="pf-fs-26 font-bold text-[var(--pf-ink)] tracking-tight leading-tight text-center">
@@ -10408,14 +10626,13 @@ export default function App() {
               </div>
 
               {/* 顶部固定：画布 + 设备行 —— 在滚动容器外面，卡片怎么滚都不会叠到画布上 */}
-              <div className="px-6 pt-1 pb-3 flex flex-col items-center shrink-0">
-                  <div 
-                    className="relative rounded-[30px] overflow-hidden flex flex-col justify-between p-3.5 bg-black select-none shadow-[0_8px_24px_rgba(0,0,0,0.10)]"
-                    style={{
-                      width: `${canvasFrame.w}px`,
-                      height: `${canvasFrame.h}px`,
-                      borderRadius: `${canvasFrame.radius}px`
-                    }}
+              <div className="px-6 pt-1 pb-3 flex flex-col items-center shrink-0 bg-[var(--pf-page)] z-10 relative">
+                  <DialPreviewFrame
+                    screen={[canvasScreen.width, canvasScreen.height]}
+                    width={canvasFrame.w}
+                    height={canvasFrame.h}
+                    className="select-none"
+                    innerClassName="bg-black flex flex-col justify-between p-3.5"
                   >
                     {renderPreviewUrl ? (
                       /* 真实渲染图：后端按设备像素出图，这里等比显示（contain 不拉伸），圆角由框裁切 */
@@ -10423,6 +10640,11 @@ export default function App() {
                         src={renderPreviewUrl}
                         alt="表盘预览"
                         className="absolute inset-0 w-full h-full object-contain transition-opacity duration-500"
+                        style={
+                          canvasImgScale > 1
+                            ? { transform: `scale(${canvasImgScale})` }
+                            : undefined
+                        }
                       />
                     ) : (
                       <>
@@ -10436,6 +10658,11 @@ export default function App() {
                             }
                             alt="表盘壁纸"
                             className="absolute inset-0 w-full h-full object-cover opacity-90 transition-all duration-300"
+                            style={
+                              canvasImgScale > 1
+                                ? { transform: `scale(${canvasImgScale})` }
+                                : undefined
+                            }
                           />
                         ) : (
                           <div 
@@ -10528,7 +10755,7 @@ export default function App() {
                       </>
                     )}
 
-                  </div>
+                  </DialPreviewFrame>
 
                   {/* 表盘与当前设备规格不一致时才给告警（正常情况不占位置） */}
                   {canvasSpecMismatch && (
@@ -10539,7 +10766,8 @@ export default function App() {
               </div>
 
               {/* 可滑动编辑主体区：只滚下面的配置卡片 */}
-              <div data-rb="y" data-rb-always="1" className="flex-1 overflow-y-auto no-scrollbar px-6 pb-32">
+              <div className="flex-1 min-h-0 overflow-hidden relative">
+                <div data-rb="y" data-rb-always="1" className="h-full overflow-y-auto no-scrollbar px-6 pb-32">
                 {/* 2. 手风琴式展开配置区（收紧版间距） */}
                 <div className="flex flex-col gap-2.5">
                   
@@ -10921,6 +11149,7 @@ export default function App() {
 
                 </div>
               </div>
+              </div>
 
               {/* 3. 底部固定主按钮「应用」（不透明纯色底 + 原有分隔线） */}
               <div data-pf-bottombar className="absolute bottom-0 left-0 right-0 p-5 safe-bottom-bar bg-[var(--pf-card)] border-t border-[var(--pf-bd-5)] flex flex-col pt-3 z-30">
@@ -10959,9 +11188,25 @@ export default function App() {
             const allReady = photos.every(
               (_, i) => !!genEffParams[i]?.fill || !!genLayers[i]?.full
             );
-            const nextEmpty = photos.findIndex(
-              (_, i) => !genEffParams[i]?.fill && !genLayers[i]?.full
+            const hasFrameLayer = photos.some(ph => ph.base === "frame");
+            const orderedPhotoIndices =
+              hasFrameLayer && photos.length > 1
+                ? [
+                    ...photos.map((_, i) => i).filter(i => photos[i].base === "frame"),
+                    ...photos.map((_, i) => i).filter(i => photos[i].base !== "frame")
+                  ]
+                : photos.map((_, i) => i);
+            const nextEmpty =
+              orderedPhotoIndices.find(
+                i => !genEffParams[i]?.fill && !genLayers[i]?.full
+              ) ?? -1;
+            const frameLayerIdx = photos.findIndex(
+              ph => ph.base === "frame" && !genLockFills[ph.id]
             );
+            const frameLayerReady =
+              frameLayerIdx >= 0 &&
+              !!genLayers[frameLayerIdx]?.full &&
+              !genEffParams[frameLayerIdx]?.fill;
             const activeIdx = Math.min(genActive, photos.length - 1);
             const activePhoto = photos[activeIdx];
             const activeParams = {
@@ -10970,6 +11215,26 @@ export default function App() {
             };
             const activeLayer = genLayers[activeIdx] || { prev: "", full: "" };
             const canDragPreview = !!activeLayer.full && !activeParams.fill;
+
+            /** 把相框内那张照片复制到背景层（保留各自的参数，纯色填充会被清掉） */
+            const syncFramePhotoToLayer = (targetIdx: number) => {
+              if (
+                frameLayerIdx < 0 ||
+                !genLayers[frameLayerIdx]?.full ||
+                genEffParams[frameLayerIdx]?.fill
+              ) {
+                showToast("请先选择相框内照片", "error");
+                return;
+              }
+              const src = genLayers[frameLayerIdx];
+              setGenLayers(prev => {
+                const next = [...prev];
+                next[targetIdx] = { prev: src.prev, full: src.full };
+                return next;
+              });
+              setGenParam(targetIdx, { fill: undefined });
+              setGenActive(targetIdx);
+            };
 
             /** 一层照片的分区：来源切换 + 照片/纯色内容 */
             const renderPhotoSection = (photo: typeof photos[number], i: number) => {
@@ -10980,6 +11245,9 @@ export default function App() {
               const fillColor = p.fill || "";
               // 方案给这个配色锁了这一层：整块只读，不给来源切换/上传/滑杆
               const lockFill = genLockFills[photo.id];
+              // 背景层可以复制相框内那张照片（纯色层不显示同步入口）
+              const canSyncFrame =
+                photo.base === "canvas" && frameLayerIdx >= 0 && frameLayerIdx !== i;
               if (lockFill) {
                 return (
                   <section
@@ -11074,13 +11342,32 @@ export default function App() {
                             alt=""
                             className="w-14 h-14 rounded-xl object-cover bg-[var(--pf-bg-5)] shrink-0"
                           />
-                          <button
-                            type="button"
-                            onClick={() => pickGenPhoto(i)}
-                            className="flex-1 h-14 rounded-xl bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-[0.99] transition-all pf-fs-13 font-semibold text-[var(--pf-i-70)] cursor-pointer"
-                          >
-                            更换照片
-                          </button>
+                          {canSyncFrame ? (
+                            <div className="flex-1 flex items-stretch gap-2">
+                              <button
+                                type="button"
+                                onClick={() => syncFramePhotoToLayer(i)}
+                                className="flex-1 h-14 rounded-xl bg-[var(--pf-primary-10)] text-[var(--pf-primary)] hover:bg-[var(--pf-primary-15)] active:scale-[0.99] transition-all pf-fs-13 font-bold cursor-pointer"
+                              >
+                                同步相框图
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => pickGenPhoto(i)}
+                                className="flex-1 h-14 rounded-xl bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-[0.99] transition-all pf-fs-13 font-semibold text-[var(--pf-i-70)] cursor-pointer"
+                              >
+                                更换照片
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => pickGenPhoto(i)}
+                              className="flex-1 h-14 rounded-xl bg-[var(--pf-bg-5)] hover:bg-[var(--pf-bg-10)] active:scale-[0.99] transition-all pf-fs-13 font-semibold text-[var(--pf-i-70)] cursor-pointer"
+                            >
+                              更换照片
+                            </button>
+                          )}
                         </div>
 
                         {ctl.scale.adjustable && (
@@ -11153,6 +11440,29 @@ export default function App() {
                           恢复默认
                         </button>
                       </>
+                    ) : canSyncFrame ? (
+                      <div className="grid grid-cols-2 gap-2.5">
+                        <button
+                          type="button"
+                          onClick={() => syncFramePhotoToLayer(i)}
+                          className={`h-24 rounded-2xl flex flex-col items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                            frameLayerReady
+                              ? "border border-[var(--pf-primary-25)] bg-[var(--pf-primary-10)] text-[var(--pf-primary)] active:scale-[0.99]"
+                              : "border border-[var(--pf-bd-10)] bg-[var(--pf-bg-3)] text-[var(--pf-i-30)]"
+                          }`}
+                        >
+                          <CopySimple className="w-6 h-6" />
+                          <span className="pf-fs-13 font-semibold">同步相框图</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => pickGenPhoto(i)}
+                          className="h-24 rounded-2xl border border-dashed border-[var(--pf-bd-15)] bg-[var(--pf-bg-2)] flex flex-col items-center justify-center gap-1.5 text-[var(--pf-i-45)] active:scale-[0.99] transition-transform cursor-pointer"
+                        >
+                          <Plus className="w-6 h-6" />
+                          <span className="pf-fs-13 font-semibold">选择照片</span>
+                        </button>
+                      </div>
                     ) : (
                       <button
                         type="button"
@@ -11183,7 +11493,7 @@ export default function App() {
             return (
               <div className="flex-1 flex flex-col overflow-hidden bg-[var(--pf-page)] page-enter-anim select-none relative">
                 {/* 顶部：返回（问是否保存）/ 标题 / 保存 */}
-                <div className="relative flex items-center justify-between px-4 safe-top pb-1 z-20 shrink-0">
+                <div className="relative flex items-center justify-between px-4 safe-top pb-1 z-20 shrink-0 bg-[var(--pf-page)]">
                   <button
                     type="button"
                     onClick={() => {
@@ -11212,7 +11522,7 @@ export default function App() {
 
                 {/* 预览：固定 30vh，永远露在上面；选中某层照片后可拖动平移 */}
                 <div
-                  className={`h-[30vh] shrink-0 relative flex items-center justify-center overflow-hidden touch-none px-6 py-2 ${
+                  className={`h-[30vh] shrink-0 relative flex items-center justify-center overflow-hidden touch-none px-6 py-2 bg-[var(--pf-page)] z-10 ${
                     canDragPreview ? "cursor-grab active:cursor-grabbing" : ""
                   }`}
                   onMouseDown={e => {
@@ -11278,9 +11588,40 @@ export default function App() {
                   )}
                 </div>
 
+                {photos.length > 1 && (
+                  <div className="mt-1.5 mb-0.5 flex items-center justify-center shrink-0 z-10 relative bg-[var(--pf-page)]">
+                    <div className="inline-flex rounded-full bg-[var(--pf-bg-5)] p-0.5">
+                      {orderedPhotoIndices.map(idx => {
+                        const ph = photos[idx];
+                        const p = { ...defaultGenParams(ph), ...(genEffParams[idx] || {}) };
+                        const disabled =
+                          !!genLockFills[ph.id] || !!p.fill || !genLayers[idx]?.full;
+                        return (
+                          <button
+                            key={ph.id}
+                            type="button"
+                            disabled={disabled}
+                            onClick={() => setGenActive(idx)}
+                            className={`h-6 px-3 rounded-full pf-fs-11 font-semibold transition-all ${
+                              disabled
+                                ? "text-[var(--pf-i-25)]"
+                                : genActive === idx
+                                  ? "bg-[var(--pf-card)] text-[var(--pf-ink)] shadow-sm cursor-pointer"
+                                  : "text-[var(--pf-i-50)] cursor-pointer"
+                            }`}
+                          >
+                            拖动{genSlotLabel(ph, photos.length)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 {/* 编辑区：固定占据下半屏，内部可滚 */}
-                <div data-rb="y" data-rb-always="1" className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-4 pt-1 pb-3 flex flex-col gap-3">
-                  {photos.map((ph, i) => renderPhotoSection(ph, i))}
+                <div className="flex-1 min-h-0 overflow-hidden relative">
+                  <div data-rb="y" data-rb-always="1" className="h-full overflow-y-auto no-scrollbar px-4 pt-1 pb-3 flex flex-col gap-3">
+                  {orderedPhotoIndices.map(i => renderPhotoSection(photos[i], i))}
 
                   {/* 相框颜色：直接铺在列表底部，不再需要点开浮层 */}
                   {colors.length > 1 && (
@@ -11302,6 +11643,7 @@ export default function App() {
                       />
                     </section>
                   )}
+                </div>
                 </div>
 
                 {/* 底部固定：已生成数量 + 生成按钮 */}
@@ -11391,7 +11733,7 @@ export default function App() {
 
           {/* 8. 关于应用主页（一级页面，简约清晰） */}
           {currentStep === "about_app" && (
-            <div data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 pb-4 page-enter-anim select-none subpage-top">
+            <div ref={aboutScroll.ref} onScroll={aboutScroll.onScroll} data-rb="y" data-rb-always="1" className="flex-1 flex flex-col justify-between overflow-y-auto no-scrollbar px-6 pb-4 page-enter-anim select-none subpage-top">
               <div>
                 {/* 顶部返回导航 */}
 
@@ -11446,7 +11788,7 @@ export default function App() {
                         >
                           {appUpdateKnown
                             ? `有新版本 v${appUpdateKnown}`
-                            : `当前版本 v${appVersion ?? "0.4.7"}`}
+                            : `当前版本 v${appVersion ?? "0.4.10"}`}
                         </p>
                       </div>
                     </div>
